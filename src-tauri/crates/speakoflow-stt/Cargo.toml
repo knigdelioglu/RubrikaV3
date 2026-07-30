@@ -1,0 +1,12 @@
+[package]
+name = "speakoflow-stt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+speakoflow-types = { path = "../speakoflow-types" }
+transcribe-rs = { version = "0.3.11", features = ["whisper-cpp"] }
+transcribe-cpp = { version = "0.1.2", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+transcribe-cpp = { version = "0.1.2", default-features = false, features = ["metal"] }

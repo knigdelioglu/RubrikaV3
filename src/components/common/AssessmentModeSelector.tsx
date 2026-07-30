@@ -1,0 +1,40 @@
+import { FileText, Mic2 } from 'lucide-react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { getAssessmentMode, getAssessmentModePath, type AssessmentMode } from '../../app/assessmentMode';
+import { useProjectContext } from '../../state/useProjectContext';
+
+export function AssessmentModeSelector() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { projectId } = useProjectContext();
+  const activeMode = getAssessmentMode(location.pathname);
+
+  const selectMode = (mode: AssessmentMode) => {
+    if (mode !== activeMode) navigate(getAssessmentModePath(mode, projectId));
+  };
+
+  return (
+    <div className="assessment-mode-selector" role="radiogroup" aria-label="Sınav türü">
+      <button
+        type="button"
+        className={activeMode === 'written' ? 'is-active' : ''}
+        role="radio"
+        aria-checked={activeMode === 'written'}
+        onClick={() => selectMode('written')}
+      >
+        <FileText size={15} aria-hidden="true" />
+        Yazılı Sınav
+      </button>
+      <button
+        type="button"
+        className={activeMode === 'speaking' ? 'is-active' : ''}
+        role="radio"
+        aria-checked={activeMode === 'speaking'}
+        onClick={() => selectMode('speaking')}
+      >
+        <Mic2 size={15} aria-hidden="true" />
+        Konuşma Sınavı
+      </button>
+    </div>
+  );
+}

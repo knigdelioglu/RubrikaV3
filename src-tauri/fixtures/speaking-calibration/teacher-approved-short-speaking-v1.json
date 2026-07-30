@@ -1,0 +1,59 @@
+{
+  "id": "teacher-approved-short-speaking-v1",
+  "teacherApproved": true,
+  "rawTranscript": "Konuşma sınavlarının gelmesiyle birlikte öğrenciler kendilerine ifade etme özgürlüğü kazanıyorlar. Bu konuşma sınavları sayesinde öğrencilerimiz fikirlerini, düşüncelerini topluluğun önünde rahatça dile getirme imkanına sahipler. Ezberci eğitim sisteminden uygulamaya dönük bir eğitim sistemine geçmenin avantajı aslında tam olarak konuşma sınavı diyebiliriz. Türkiye Yüzyılı Marif modeliyle birlikte konuşma sınavlarının da kapsamı sınavlara dahil olması ve %100'lik payının olması önemli.",
+  "cleanedTranscript": "Konuşma sınavlarının gelmesiyle birlikte öğrenciler kendilerine ifade etme özgürlüğü kazanıyorlar. Bu konuşma sınavları sayesinde öğrencilerimiz fikirlerini, düşüncelerini topluluğun önünde rahatça dile getirme imkanına sahipler. Ezberci eğitim sisteminden uygulamaya dönük bir eğitim sistemine geçmenin avantajı aslında tam olarak konuşma sınavı diyebiliriz. Türkiye Yüzyılı Maarif modeliyle birlikte konuşma sınavlarının da kapsamı sınavlara dahil olması ve %100'lük payının olması önemli.",
+  "segments": [
+    {
+      "segmentId": "segment-1",
+      "startMs": 0,
+      "endMs": 8000,
+      "rawText": "Konuşma sınavlarının gelmesiyle birlikte öğrenciler kendilerine ifade etme özgürlüğü kazanıyorlar.",
+      "cleanedText": "Konuşma sınavlarının gelmesiyle birlikte öğrenciler kendilerine ifade etme özgürlüğü kazanıyorlar."
+    },
+    {
+      "segmentId": "segment-2",
+      "startMs": 8000,
+      "endMs": 18000,
+      "rawText": "Bu konuşma sınavları sayesinde öğrencilerimiz fikirlerini, düşüncelerini topluluğun önünde rahatça dile getirme imkanına sahipler.",
+      "cleanedText": "Bu konuşma sınavları sayesinde öğrencilerimiz fikirlerini, düşüncelerini topluluğun önünde rahatça dile getirme imkanına sahipler."
+    },
+    {
+      "segmentId": "segment-3",
+      "startMs": 18000,
+      "endMs": 30000,
+      "rawText": "Ezberci eğitim sisteminden uygulamaya dönük bir eğitim sistemine geçmenin avantajı aslında tam olarak konuşma sınavı diyebiliriz.",
+      "cleanedText": "Ezberci eğitim sisteminden uygulamaya dönük bir eğitim sistemine geçmenin avantajı aslında tam olarak konuşma sınavı diyebiliriz."
+    },
+    {
+      "segmentId": "segment-4",
+      "startMs": 30000,
+      "endMs": 42000,
+      "rawText": "Türkiye Yüzyılı Marif modeliyle birlikte konuşma sınavlarının da kapsamı sınavlara dahil olması ve %100'lik payının olması önemli.",
+      "cleanedText": "Türkiye Yüzyılı Maarif modeliyle birlikte konuşma sınavlarının da kapsamı sınavlara dahil olması ve %100'lük payının olması önemli."
+    }
+  ],
+  "goldLevels": {
+    "task_relevance": "strong",
+    "main_idea": "strong",
+    "supporting_ideas": "adequate",
+    "examples_reasons": "adequate",
+    "content_depth": "adequate",
+    "opening": "adequate",
+    "idea_order": "strong",
+    "transitions": "adequate",
+    "coherence": "strong",
+    "conclusion": "limited",
+    "sentence_clarity": "strong",
+    "vocabulary_range": "adequate",
+    "contextual_word_use": "strong",
+    "connectors": "adequate",
+    "repetition_control": "limited"
+  },
+  "goldCriterionScores": {
+    "content_main_idea": 12,
+    "speech_structure": 11,
+    "turkish_language": 11
+  },
+  "goldAiTotal": 34
+}

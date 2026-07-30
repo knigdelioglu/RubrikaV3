@@ -1,0 +1,7 @@
+[package]
+name = "speakoflow-vad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+speakoflow-types = { path = "../speakoflow-types" }

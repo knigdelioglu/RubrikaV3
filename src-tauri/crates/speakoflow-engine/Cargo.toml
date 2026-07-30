@@ -1,0 +1,11 @@
+[package]
+name = "speakoflow-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+speakoflow-types = { path = "../speakoflow-types" }
+speakoflow-audio = { path = "../speakoflow-audio" }
+speakoflow-vad = { path = "../speakoflow-vad" }
+speakoflow-stt = { path = "../speakoflow-stt" }
+uuid = { version = "1.10", features = ["v4"] }

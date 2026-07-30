@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Rubrika P2A UI doğrulama fixture</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      const fixtureUrl = new URL(window.location.href);
+      const target = fixtureUrl.searchParams.get('target') || '/project/test-project/exam/documents';
+      const forwardedSearch = new URLSearchParams(fixtureUrl.search);
+      forwardedSearch.delete('target');
+      window.history.replaceState({}, '', `${target}${forwardedSearch.size ? `?${forwardedSearch}` : ''}`);
+
+      const fixtureMode = forwardedSearch.get('fixtureMode') || 'default';
+      const callbacks = new Map();
+      let callbackId = 1;
+      let listenerId = 1;
+      let documents = [
+        {
+          id: 'exam-1', role: 'exam_source', fileName: '2026-donem-sinavi.pdf', storedPath: '/fixture/exam.pdf',
+          pageCount: 3, addedAt: '2026-07-21T10:00:00Z', preview: { status: 'ready', pageCount: 3 },
+        },
+        {
+          id: 'answer-1', role: 'answer_key', fileName: 'cevap-anahtari-ve-rubrik.pdf', storedPath: '/fixture/answer.pdf',
+          pageCount: 2, addedAt: '2026-07-21T10:00:00Z', preview: { status: 'failed', pageCount: 2 },
+        },
+        {
+          id: 'student-1', role: 'student_scan', fileName: 'ogrenci-cevaplari.pdf', storedPath: '/fixture/student.pdf',
+          pageCount: 12, addedAt: '2026-07-21T10:00:00Z', preview: { status: 'running', pageCount: 12, jobId: 'preview-job-1' },
+        },
+      ];
+
+      const previewStatus = (documentId) => {
+        const document = documents.find((item) => item.id === documentId);
+        const status = document?.preview?.status || 'missing';
+        return {
+          documentId,
+          status,
+          pageCount: document?.pageCount || 0,
+          previewCount: status === 'ready' ? document.pageCount : 0,
+          jobId: document?.preview?.jobId,
+          message: status === 'running' ? '6 / 12 sayfa hazırlandı.' : status === 'failed' ? 'Önizleme tamamlanamadı.' : status === 'ready' ? 'Sayfalar hazır.' : 'Önizleme hazırlanmadı.',
+        };
+      };
+
+      const invoke = async (command, args = {}) => {
+        const input = args.input || {};
+        if (command === 'plugin:event|listen') return listenerId++;
+        if (command === 'plugin:event|unlisten') return undefined;
+        if (command === 'plugin:dialog|open') return '/fixture/yeni-belge.pdf';
+        if (command === 'get_project_snapshot') {
+          return {
+            id: 'test-project', name: 'P2A UI Doğrulama Projesi', createdAt: '2026-07-21T10:00:00Z', updatedAt: '2026-07-21T12:00:00Z',
+            rootPath: '/fixture', sections: [], students: [], studentSubmissions: [], studentAnswerOcrRecords: [], scoringRecords: [],
+            studentAnswerCropTemplate: { items: [] }, documents, questions: [], workflow: {},
+          };
+        }
+        if (command === 'get_workflow_snapshot') {
+          return {
+            currentStage: 'pdf_preview_missing', currentStageLabel: 'Belge hazırlığı', blockingReasons: [], nextActions: [],
+            summary: { text: 'Belge önizlemesi hazırlanıyor.', steps: [{ code: 'student_scan_preview_render', label: 'Öğrenci önizlemesi', status: 'running', message: '6 / 12 sayfa hazırlandı.', current: 6, total: 12 }], readiness: { examPackageFreeze: false, studentIntake: false, scoring: false } },
+          };
+        }
+        if (command === 'list_documents') {
+          if (fixtureMode === 'queryError') throw { code: 'PROJECT_LOAD_FAILED', message: 'fixture raw query error', recoverable: true, correlationId: 'fixture-query' };
+          return documents;
+        }
+        if (command === 'list_jobs') {
+          return [{
+            id: 'preview-job-1', projectId: 'test-project', kind: 'pdf_preview_render', status: 'running',
+            progress: { current: 6, total: 12, message: 'Öğrenci PDF’i: 6 / 12 sayfa hazırlandı.' },
+            createdAt: '2026-07-21T12:00:00Z', updatedAt: '2026-07-21T12:01:00Z',
+          }];
+        }
+        if (command === 'get_pdf_preview_status' || command === 'get_student_scan_preview_status') return previewStatus(input.documentId);
+        if (command === 'list_pdf_page_previews') {
+          const document = documents.find((item) => item.id === input.documentId);
+          return Array.from({ length: document?.pageCount || 0 }, (_, index) => ({
+            documentId: input.documentId,
+            pageNumber: index + 1,
+            imagePath: `http://127.0.0.1:4173/favicon.svg?page=${index + 1}`,
+            width: 720,
+            height: 1018,
+            renderedAt: '2026-07-21T12:00:00Z',
+          }));
+        }
+        if (command === 'start_pdf_preview_render' || command === 'start_student_scan_preview_render') {
+          const document = documents.find((item) => item.id === input.documentId);
+          if (document) {
+            document.preview = { status: 'queued', pageCount: document.pageCount, jobId: 'preview-job-new' };
+            window.setTimeout(() => {
+              document.preview = { status: 'ready', pageCount: document.pageCount };
+            }, 180);
+          }
+          return { jobId: 'preview-job-new', status: 'queued' };
+        }
+        if (command === 'remove_document') {
+          window.__P2A_REMOVE_CALLS__ = (window.__P2A_REMOVE_CALLS__ || 0) + 1;
+          if (fixtureMode === 'removeError') throw { code: 'DOCUMENT_REMOVE_FAILED', message: 'fixture raw error', recoverable: true, correlationId: 'fixture-remove' };
+          documents = documents.filter((document) => document.id !== input.documentId);
+          return undefined;
+        }
+        if (command === 'import_exam_source_pdf' || command === 'import_answer_key_pdf' || command === 'import_student_scan_pdf') {
+          window.__P2A_IMPORT_CALLS__ = (window.__P2A_IMPORT_CALLS__ || 0) + 1;
+          if (fixtureMode === 'importError') throw { code: 'DOCUMENT_IMPORT_FAILED', message: 'fixture raw import error', recoverable: true, correlationId: 'fixture-import' };
+          const role = command === 'import_exam_source_pdf' ? 'exam_source' : command === 'import_answer_key_pdf' ? 'answer_key' : 'student_scan';
+          const replacement = { id: `${role}-new`, role, fileName: 'yeni-belge.pdf', storedPath: '/fixture/yeni.pdf', pageCount: 1, addedAt: '2026-07-21T13:00:00Z', preview: { status: 'missing' } };
+          documents = [...documents, replacement];
+          return replacement;
+        }
+        throw new Error(`Fixture command not implemented: ${command}`);
+      };
+
+      window.__TAURI_INTERNALS__ = {
+        invoke,
+        transformCallback(callback, once = false) {
+          const id = callbackId++;
+          callbacks.set(id, { callback, once });
+          return id;
+        },
+        unregisterCallback(id) { callbacks.delete(id); },
+        convertFileSrc(path) { return path; },
+      };
+      window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

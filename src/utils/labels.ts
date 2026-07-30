@@ -1,0 +1,310 @@
+export const stageLabels: Record<string, string> = {
+  documents_missing: 'Belgeler eksik',
+  pdf_preview_missing: 'Sınav PDF önizlemesi eksik',
+  pdf_preview_ready: 'Sınav PDF önizlemesi hazır',
+  pdf_preview_ready_question_text_missing: 'Sınav PDF önizlemesi hazır, soru metni eksik',
+  exam_package_build_ready: 'Sınav paketi oluşturulabilir',
+  exam_package_build_running: 'Sınav paketi oluşturuluyor',
+  exam_package_review_needed: 'Sınav paketi inceleme bekliyor',
+  exam_package_incomplete: 'Sınav paketi eksik',
+  exam_package_ready_for_qep: 'Sınav paketi hazır',
+  question_text_missing: 'Soru metni eksik',
+  question_text_extraction_running: 'Soru metni çıkarılıyor',
+  question_text_suggested: 'Soru metni onay bekliyor',
+  question_text_confirmed: 'Soru metni onaylandı',
+  rubric_missing: 'Cevap anahtarı/rubrik eksik',
+  rubric_suggested: 'Rubrik onay bekliyor',
+  rubric_imported_needs_review: 'Rubrik içe aktarıldı, inceleme bekliyor',
+  rubric_invalid: 'Rubrik geçersiz',
+  rubric_confirmed: 'Rubrik onaylandı',
+  student_scans_missing: 'Öğrenci cevap PDF’leri eksik',
+  student_scan_preview_missing: 'Öğrenci PDF önizlemesi eksik',
+  student_grouping_missing: 'Öğrenci gruplaması eksik',
+  student_grouping_ready: 'Öğrenci gruplaması hazır',
+  student_scan_preview_running: 'Öğrenci PDF önizlemesi oluşturuluyor',
+  crop_missing: 'Kırpma alanı eksik',
+  ocr_ready: 'OCR hazır',
+  ocr_running: 'OCR çalışıyor',
+  review_required: 'Öğretmen kontrolü gerekli',
+  student_answer_ocr_running: 'Öğrenci cevap OCR’ı çalışıyor',
+  student_answer_ocr_review_needed: 'Öğrenci cevap OCR’ı kontrol bekliyor',
+  student_answer_ocr_ready_for_scoring: 'Öğrenci cevap OCR’ı onaylandı',
+  scoring_ready: 'Notlandırma hazır',
+  scoring_running: 'Notlandırma çalışıyor',
+  scoring_done: 'Notlandırma tamamlandı',
+};
+
+export const blockingReasonLabels: Record<string, string> = {
+  EXAM_SOURCE_MISSING: 'Sınav kağıdı eksik',
+  EXAM_SOURCE_PDF_MISSING: 'Orijinal sınav PDF’i eksik',
+  RUBRIC_DOCUMENT_MISSING: 'Rubrik / cevap anahtarı PDF’i eksik',
+  QUESTION_COUNT_MISSING: 'Soru sayısı eksik',
+  EXAM_PACKAGE_BUILD_PRECHECK_FAILED: 'Sınav paketi ön kontrolü başarısız',
+  PDF_PREVIEW_MISSING: 'Sınav PDF önizlemeleri eksik',
+  QUESTION_TEXT_MISSING: 'Soru metni eksik',
+  RUBRIC_MISSING: 'Cevap anahtarı/rubrik eksik',
+  RUBRIC_INVALID: 'Rubrik geçersiz',
+  CROP_MISSING: 'Kırpma alanı eksik',
+  PLACEHOLDER_DATA_DETECTED: 'Taslak (placeholder) veri bulundu',
+  REVIEW_REQUIRED: 'Öğretmen onayı bekleniyor',
+  QEP_NOT_FROZEN: 'QEP henüz dondurulmamış',
+  RUBRIC_NOT_READY: 'Rubrik hazırlığı kilitli',
+  RUBRIC_JSON_INVALID: 'Rubrik JSON geçersiz',
+  RUBRIC_JSON_PARSE_FAILED: 'Rubrik JSON çözülemedi',
+  RUBRIC_JSON_SCHEMA_UNSUPPORTED: 'Rubrik JSON biçimi desteklenmiyor',
+  RUBRIC_SCHEMA_VALIDATION_FAILED: 'Rubrik JSON şeması doğrulanamadı',
+  RUBRIC_QUESTION_NOT_FOUND: 'Rubrik sorusu bulunamadı',
+  RUBRIC_PLACEHOLDER_DETECTED: 'Placeholder veri bulundu',
+  RUBRIC_EMPTY_CONTENT: 'Rubrik boş geldi',
+  RUBRIC_MAX_SCORE_MISSING: 'Max puan eksik',
+  RUBRIC_EXPECTED_ANSWER_MISSING: 'Beklenen cevap eksik',
+  RUBRIC_CRITERIA_MISSING: 'Kriter eksik',
+  RUBRIC_POINTS_TOTAL_MISMATCH: 'Kriter puanları uyumsuz',
+  RUBRIC_CONFIRM_FAILED: 'Rubrik onaylanamadı',
+  QUESTION_COVERAGE_INCOMPLETE: 'Soru kapsamı eksik',
+  QUESTION_LAST_ITEM_MISSING: 'Son soru eksik',
+  MODEL_OUTPUT_RETRY_FAILED: 'Model çıktı yeniden denemesi başarısız',
+  STUDENT_SCAN_NOT_FOUND: 'Öğrenci cevap PDF’i bulunamadı',
+  STUDENT_SCAN_PREVIEW_NOT_READY: 'Öğrenci PDF önizlemesi hazır değil',
+  STUDENT_GROUPING_NOT_READY: 'Öğrenci gruplaması hazır değil',
+  STUDENT_GROUPING_INVALID: 'Öğrenci gruplaması geçersiz',
+  STUDENT_SUBMISSION_NOT_FOUND: 'Öğrenci submission’ı bulunamadı',
+  STUDENT_IDENTITY_INVALID: 'Öğrenci kimliği geçersiz',
+  OCR_NOT_READY: 'OCR hazırlığı tamam değil',
+  STUDENT_ANSWER_OCR_NOT_READY: 'Öğrenci cevap OCR’ı henüz onaylanmadı',
+  SCORING_RERUN_REQUIRED: 'Notlandırma sonuçları güncel değil',
+  SCORING_NOT_READY: 'Notlandırma için gerekli kontroller tamam değil',
+  SCORING_RESULT_MISSING: 'Notlandırma sonucu eksik',
+  MODEL_SERVER_NOT_RUNNING: 'Gemma model sunucusu çalışmıyor.'
+};
+
+export const actionLabels: Record<string, string> = {
+  IMPORT_EXAM_SOURCE: 'Sınav Kağıdını İçe Aktar',
+  START_PDF_PREVIEW_RENDER: 'PDF Önizlemelerini Oluştur',
+  OPEN_PDF_PREVIEW_PAGE: 'PDF Önizleme Sayfasını Aç',
+  EXTRACT_QUESTION_TEXT: 'Soru Metnini Çıkar',
+  CONFIRM_QUESTION_TEXT: 'Soru Metnini Onayla',
+  CONFIRM_ALL_QUESTION_TEXTS: 'Önerileri Onayla',
+  OPEN_QUESTION_TEXT_PAGE: 'Önerileri İncele',
+  PREPARE_RUBRIC: 'Cevap anahtarı / rubrik hazırla',
+  OPEN_RUBRIC_PREPARATION_PAGE: 'Rubrik Hazırlığı',
+  IMPORT_RUBRIC_JSON: 'Rubrik JSON Yükle',
+  UPDATE_QUESTION_RUBRIC: 'Rubriği Kaydet',
+  VALIDATE_RUBRICS: 'Rubrikleri Doğrula',
+  CONFIRM_QUESTION_RUBRIC: 'Rubriği Onayla',
+  START_MODEL_SERVER: 'Model Server’ı Başlat',
+  OPEN_MODEL_STATUS_PAGE: 'Model durumunu aç',
+  CONFIRM_ALL_RUBRICS: 'Sınav Paketini Onayla',
+  EXTRACT_RUBRIC: 'Cevap Anahtarını Çıkar',
+  CONFIRM_RUBRIC: 'Cevap Anahtarını Onayla',
+  START_EXAM_PACKAGE_BUILD: 'Sınav Paketi Oluştur',
+  OPEN_EXAM_PACKAGE_REVIEW_PAGE: 'Sınav Paketini İncele',
+  DEFINE_CROPS: 'Kırpma Alanlarını Belirle',
+  IMPORT_STUDENT_SCAN_PDF: 'Öğrenci PDF Yükle',
+  START_STUDENT_SCAN_PREVIEW_RENDER: 'Öğrenci Önizlemesini Oluştur',
+  OPEN_STUDENT_SCANS_PAGE: 'Öğrenci PDF’leri',
+  CREATE_STUDENT_PAGE_GROUPS: 'Öğrencileri Sayfalara Göre Grupla',
+  CREATE_FIXED_STUDENT_GROUPS: 'Öğrencileri Sayfalara Göre Grupla',
+  OPEN_STUDENT_GROUPING_PAGE: 'Öğrenci Gruplama',
+  MARK_STUDENT_GROUPING_COMPLETE: 'Gruplamayı Tamamla',
+  GET_OCR_READINESS: 'OCR Hazırlığını Kontrol Et',
+  START_OCR_JOB: 'OCR İşlemini Başlat',
+  START_STUDENT_ANSWER_OCR: 'Öğrenci Cevap OCR’ını Başlat',
+  OPEN_STUDENT_ANSWER_OCR_PAGE: 'OCR Sonuçlarını İncele',
+  OPEN_STUDENT_ANSWER_OCR_ISSUE_REVIEW_PAGE: 'OCR Sorun İnceleme',
+  SUGGEST_OCR_ISSUE_CORRECTION_WITH_MODEL: 'Gemma ile öneriyi kontrol et',
+  OPEN_SCORING_PAGE: 'Notlandırma',
+  UPDATE_STUDENT_ANSWER_OCR_TEXT: 'OCR Metnini Kaydet',
+  MARK_STUDENT_ANSWER_OCR_REVIEWED: 'OCR Kaydını Onayla',
+  MARK_ALL_STUDENT_ANSWER_OCR_REVIEWED: 'Tüm OCR Kayıtlarını Onayla',
+  BUILD_QEP: 'QEP Oluştur',
+  FREEZE_QEP: 'QEP Dondur',
+  START_SCORING_JOB: 'Puanlamayı Başlat',
+  VIEW_ANALYSIS: 'Analizi Görüntüle'
+};
+
+export const previewStatusLabels: Record<string, string> = {
+  missing: 'Eksik',
+  queued: 'Kuyrukta',
+  running: 'Oluşturuluyor',
+  ready: 'Hazır',
+  failed: 'Başarısız',
+};
+
+export const textFieldStatusLabels: Record<string, string> = {
+  missing: 'Eksik',
+  suggested: 'Önerildi',
+  confirmed: 'Onaylandı',
+  edited: 'Düzenlendi',
+  failed: 'Başarısız'
+};
+
+export const textFieldSourceLabels: Record<string, string> = {
+  manual: 'Manuel',
+  exam_pdf: 'Sınav PDF',
+  student_pdf: 'Öğrenci PDF',
+  imported_template: 'İçe aktarılan şablon',
+  unknown: 'Bilinmiyor'
+};
+
+export const answerTypeLabels: Record<string, string> = {
+  general_text: 'Genel metin',
+  short_text: 'Kısa cevap',
+  essay: 'Açık uçlu cevap',
+  table: 'Tablo',
+  correction_table: 'Düzeltme tablosu',
+  fill_blank: 'Boşluk doldurma',
+  matching: 'Eşleştirme',
+  multiple_choice: 'Çoktan seçmeli',
+  true_false: 'Doğru / yanlış',
+  ordering: 'Sıralama',
+  numeric: 'Sayısal cevap',
+  diagram_labeling: 'Şema / görsel etiketleme',
+  sentence_annotation: 'Cümle üzerinde işaretleme',
+  grammar_analysis: 'Dil bilgisi çözümlemesi',
+};
+
+export const rubricStatusLabels: Record<string, string> = {
+  missing: 'Eksik',
+  suggested: 'Önerildi',
+  imported: 'İçe aktarıldı',
+  manual: 'Manuel',
+  confirmed: 'Onaylandı',
+  invalid: 'Geçersiz',
+  legacy: 'Eski biçim',
+};
+
+export const rubricSourceLabels: Record<string, string> = {
+  manual: 'Manuel',
+  json: 'JSON',
+  answer_key_pdf: 'Cevap anahtarı PDF',
+  generated: 'Üretilmiş',
+  unknown: 'Bilinmiyor',
+};
+
+export const studentSubmissionStatusLabels: Record<string, string> = {
+  grouped: 'Gruplanmış',
+  identity_missing: 'Kimlik eksik',
+  ready_for_ocr: 'OCR için hazır',
+  ocr_running: 'OCR çalışıyor',
+  ocr_suggested: 'OCR önerildi',
+  ocr_confirmed: 'OCR onaylandı',
+  failed: 'Başarısız',
+};
+
+export const studentAnswerSlotStatusLabels: Record<string, string> = {
+  empty: 'Boş',
+  pending_ocr: 'OCR bekliyor',
+  ocr_suggested: 'OCR önerildi',
+  confirmed: 'Onaylandı',
+  edited: 'Düzenlendi',
+  failed: 'Başarısız',
+};
+
+export const pageGroupingModeLabels: Record<string, string> = {
+  one_pdf_one_student: 'Tek PDF = tek öğrenci',
+  fixed_pages_per_student: 'Sabit sayfa sayısı',
+  manual: 'Manuel',
+};
+
+export const jobStatusLabels: Record<string, string> = {
+  queued: 'Kuyrukta',
+  running: 'Çalışıyor',
+  succeeded: 'Başarılı',
+  partial: 'Kısmi',
+  failed: 'Başarısız',
+  cancelled: 'İptal edildi'
+};
+
+export const studentAnswerOcrStatusLabels: Record<string, string> = {
+  pending: 'Bekliyor',
+  running: 'Çalışıyor',
+  succeeded: 'Üretildi',
+  partial: 'Kısmi',
+  failed: 'Başarısız',
+  review_needed: 'Kontrol gerekli',
+  parse_failed: 'JSON çözülemedi',
+  crop_missing: 'Kırpma eksik',
+  partial_answer_suspected: 'Kısmi cevap şüphesi',
+  printed_text_leak_suspected: 'Basılı metin karıştı',
+  model_error: 'Model hatası',
+  teacher_corrected: 'Düzeltilmiş',
+  teacher_approved: 'Onaylandı',
+};
+
+export const scoringWarningLabels: Record<string, string> = {
+  model_score_mismatch_corrected: 'Modelin toplam puanı ile kriter toplamı uyuşmadı; puan kriter toplamına göre düzeltildi.',
+  criterion_sum_exceeds_question_max: 'Kriter toplamı soru maksimum puanını aştı; puan üst sınıra çekildi.',
+  criterion_max_sum_mismatch: 'Kriter puanları toplamı soru maksimum puanıyla uyuşmuyor.',
+  critical_keyword_ocr_uncertain: 'OCR kritik bir terimde belirsizlik görüyor; scoring bu cevabı ihtiyatlı değerlendirmeli.',
+  ocr_critical_keyword_uncertain: 'OCR kritik bir terimde belirsizlik görüyor; scoring bu cevabı ihtiyatlı değerlendirmeli.',
+  ocr_parse_failed: 'OCR çıktısı çözülemedi.',
+  scoring_json_parse_failed: 'Model yanıtı güvenilir bir puanlama sonucuna dönüştürülemedi; puan uygulanmadı.',
+  scoring_criteria_incomplete: 'Model rubrik kriterlerinin tamamını değerlendirmedi; puan uygulanmadı.',
+  low_scoring_confidence: 'Modelin bu değerlendirmeye güveni düşük; öğretmen kontrolü gerekli.',
+  scoring_rationale_too_short: 'Model gerekçesi kararı açıklamak için yetersiz.',
+  criterion_rationale_incomplete: 'Bir veya daha fazla kriterin gerekçesi eksik.',
+  scoring_criterion_max_mismatch: 'Model rubrikteki kriter üst puanını değiştirmeye çalıştı; kanonik rubrik değeri korundu.',
+  scoring_criterion_score_out_of_range: 'Bir kriter puanı izin verilen aralığın dışındaydı; güvenli aralığa çekildi.',
+  scoring_evidence_missing: 'Pozitif puan verilen bir kriter için öğrenci cevabından kanıt gösterilmedi; puan uygulanmadı.',
+  scoring_evidence_not_in_answer: 'Modelin gösterdiği kanıt öğrenci cevabında birebir bulunamadı; puan uygulanmadı.',
+  MODEL_SERVER_NOT_RUNNING: 'Model sunucusuna ulaşılamadı; puan uygulanmadı.',
+  MODEL_TIMEOUT: 'Model zamanında yanıt vermedi; puan uygulanmadı.',
+  MODEL_RESPONSE_EMPTY: 'Model puanlama yanıtı üretmedi; puan uygulanmadı.',
+  MODEL_RESPONSE_INVALID_JSON: 'Model yanıtı doğrulanamadı; puan uygulanmadı.',
+  ModelServerNotRunning: 'Model sunucusuna ulaşılamadı; puan uygulanmadı.',
+  ModelTimeout: 'Model zamanında yanıt vermedi; puan uygulanmadı.',
+  ModelResponseEmpty: 'Model puanlama yanıtı üretmedi; puan uygulanmadı.',
+  ModelResponseInvalidJson: 'Model yanıtı doğrulanamadı; puan uygulanmadı.',
+  ocr_record_missing: 'Onaylı öğrenci cevabı bulunamadığı için puan uygulanmadı.',
+  ocr_not_approved: 'Öğrenci cevabı öğretmen onaylı olmadığı için puan uygulanmadı.',
+};
+
+export const scoringReviewStatusLabels: Record<string, string> = {
+  pending_review: 'Onay bekliyor',
+  approved: 'Onaylandı',
+  edited: 'Düzenlendi',
+  invalidated: 'Geçersiz',
+};
+
+export const ocrWarningLabels: Record<string, string> = {
+  critical_keyword_ocr_uncertain: 'Kritik terim belirsizliği',
+  ocr_critical_keyword_uncertain: 'Kritik terim belirsizliği',
+  ocr_parse_failed: 'OCR çıktısı çözülemedi',
+  preprocess_failed: 'Ön işleme sorunu',
+  preprocess_fallback_used: 'Ön işleme yedeği kullanıldı',
+  printed_question_leak_detected: 'Soru kökü cevaba karışmış olabilir',
+  printed_text_mixed: 'Basılı metin karışmış olabilir',
+  answer_crop_may_be_incomplete: 'Kırpım eksik olabilir',
+  answer_crop_may_be_truncated: 'Kırpım eksik olabilir',
+  issue_context_missing: 'İşaretli ifade için yeterli bağlam yok',
+  scope_expansion_blocked: 'Öneri kapsamı genişletildi, kontrol gerekli',
+  visual_reading_unclear: 'Görsel okuma net değil',
+  suggestion_confidence_low: 'Öneri güveni düşük',
+};
+
+export const ocrIssueTypeLabels: Record<string, string> = {
+  needs_review: 'İnceleme gerekli',
+  critical_keyword_uncertain: 'Kritik terim belirsiz',
+  critical_term_uncertain: 'Kritik terim belirsiz',
+  uncertain_span: 'Belirsiz ifade',
+  suggested_correction: 'Önerili düzeltme',
+  critical_term_warning: 'Kritik terim uyarısı',
+  ocr_low_confidence: 'OCR düşük güven',
+  preprocess_warning: 'Ön işleme uyarısı',
+  parse_warning: 'Çözümleme sorunu',
+  printed_text_mixed: 'Basılı metin karışmış',
+  printed_question_leak: 'Basılı metin karışmış',
+  answer_crop_may_be_truncated: 'Kırpım eksik olabilir',
+  partial_answer_warning: 'Kırpım eksik olabilir',
+  pending_review: 'Onay bekleyenler',
+};
+
+export const ocrPreprocessModeLabels: Record<string, string> = {
+  original: 'Orijinal',
+  clean_grayscale: 'Temiz gri ton',
+  handwriting_enhanced: 'El yazısı güçlendirildi',
+  high_contrast: 'Yüksek kontrast',
+  high_contrast_bw: 'Siyah-beyaz alternatif',
+  high_contrast_bw_optional: 'Siyah-beyaz alternatif',
+};

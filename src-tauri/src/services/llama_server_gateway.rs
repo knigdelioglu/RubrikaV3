@@ -1,0 +1,4358 @@
+use async_trait::async_trait;
+use base64::{engine::general_purpose, Engine as _};
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::json;
+use tokio::time::timeout;
+use uuid::Uuid;
+
+use crate::domain::errors::{AppError, AppErrorCode};
+use crate::domain::model::{
+    AnalysisReportRequest, AnalysisReportResult, ExtractedQuestionCandidate,
+    ExtractedRubricCandidate, ModelDiagnostics, ModelRequestKind, ModelRequestPayloadSummary,
+    ModelStatus, QuestionTextExtractionOutput, QuestionTextExtractionRequest,
+    QuestionTextExtractionResult, RubricExtractionOutput, RubricExtractionRequest,
+    RubricExtractionResult, ScoringCriterionScore, ScoringOutput, ScoringRequest, ScoringResult,
+    SpeakingTranscriptCleanupOutputSegment, SpeakingTranscriptCleanupRequest,
+    SpeakingTranscriptCleanupResult, StudentAnswerOcrIssueCorrectionDecision,
+    StudentAnswerOcrIssueCorrectionOutput, StudentAnswerOcrIssueCorrectionRequest,
+    StudentAnswerOcrIssueCorrectionResult, StudentAnswerOcrIssueCorrectionScope,
+    StudentAnswerOcrRequest, StudentAnswerOcrResult, StudentIdentityOcrOutput,
+    StudentIdentityOcrRequest, StudentIdentityOcrResult,
+};
+use crate::domain::student::{
+    OcrCriticalTermWarning, OcrImagePreprocessMode, OcrSuggestedCorrection, OcrUncertainSpan,
+};
+use crate::services::model_gateway::ModelGateway;
+
+const QUESTION_TEXT_MAX_TOKENS: u32 = 4096;
+const RUBRIC_MAX_TOKENS: u32 = 8192;
+const STUDENT_ANSWER_OCR_MAX_TOKENS: u32 = 4096;
+const STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS: u32 = 512;
+const STUDENT_IDENTITY_OCR_MAX_TOKENS: u32 = 1024;
+const CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING: &str = "critical_keyword_ocr_uncertain";
+const MIN_STUDENT_ANSWER_OCR_CONFIDENCE: f32 = 0.72;
+
+#[derive(Clone)]
+pub struct LlamaServerGateway {
+    client: Client,
+    base_url: String,
+}
+
+impl LlamaServerGateway {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            client: Client::new(),
+            base_url,
+        }
+    }
+
+    fn health_url(&self, base_url: &str) -> String {
+        format!("{}/health", base_url.trim_end_matches('/'))
+    }
+
+    fn chat_url(&self, base_url: &str) -> String {
+        format!("{}/v1/chat/completions", base_url.trim_end_matches('/'))
+    }
+
+    async fn send_chat_request(
+        &self,
+        base_url: &str,
+        body: serde_json::Value,
+        timeout_seconds: u64,
+        request_kind: &str,
+    ) -> Result<(u16, String, u64), AppError> {
+        let url = self.chat_url(base_url);
+        let start = std::time::Instant::now();
+        let response = timeout(
+            std::time::Duration::from_secs(timeout_seconds),
+            self.client.post(&url).json(&body).send(),
+        )
+        .await
+        .map_err(|_| {
+            app_error(
+                AppErrorCode::ModelTimeout,
+                "Model isteği zaman aşımına uğradı.",
+                Some(format!("Endpoint: {}\nTimeout: {}s\nRequest Kind: {}", url.clone(), timeout_seconds, request_kind)),
+                Some("Model server çalışıyor ancak zamanında yanıt vermedi. Tekrar deneyebilir veya model loglarını kontrol edebilirsiniz.".to_string()),
+            )
+        })?
+        .map_err(|error| map_transport_error(error, &url))?;
+
+        let status = response.status().as_u16();
+        let body_text = timeout(std::time::Duration::from_secs(30), response.text())
+            .await
+            .map_err(|_| {
+                app_error(
+                    AppErrorCode::ModelTimeout,
+                    "Model yanıtı okunurken zaman aşımı oldu.",
+                    Some(url.clone()),
+                    Some("Yanıt büyük olabilir ya da model takılmış olabilir.".to_string()),
+                )
+            })?
+            .map_err(|error| map_transport_error(error, &url))?;
+
+        Ok((status, body_text, start.elapsed().as_millis() as u64))
+    }
+}
+
+impl Default for LlamaServerGateway {
+    fn default() -> Self {
+        Self::new("http://127.0.0.1:8080".to_string())
+    }
+}
+
+#[async_trait]
+impl ModelGateway for LlamaServerGateway {
+    async fn get_status(&self) -> Result<ModelStatus, AppError> {
+        self.probe_status(&self.base_url).await
+    }
+
+    async fn probe_server(&self) -> Result<ModelStatus, AppError> {
+        self.probe_status(&self.base_url).await
+    }
+
+    async fn health_status(&self, base_url: &str) -> Result<ModelStatus, AppError> {
+        let mut status = ModelStatus {
+            base_url: base_url.to_string(),
+            ..Default::default()
+        };
+
+        match timeout(
+            std::time::Duration::from_secs(5),
+            self.client.get(self.health_url(base_url)).send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                status.server_running = true;
+                status.health_ok = response.status().is_success();
+                if !status.health_ok {
+                    status.last_error = Some(app_error(
+                        AppErrorCode::ModelHealthFailed,
+                        "Health endpoint başarılı dönmedi.",
+                        Some(format!("HTTP {}", response.status())),
+                        Some("Health endpoint çıktısını kontrol edin.".to_string()),
+                    ));
+                }
+            }
+            Ok(Err(error)) => {
+                status.last_error = Some(map_transport_error(error, &self.health_url(base_url)));
+            }
+            Err(_) => {
+                status.last_error = Some(app_error(
+                    AppErrorCode::ModelTimeout,
+                    "Health check zaman aşımına uğradı.",
+                    Some(self.health_url(base_url)),
+                    Some("llama-server sürecini kontrol edin.".to_string()),
+                ));
+            }
+        }
+
+        Ok(status)
+    }
+
+    async fn probe_status(&self, base_url: &str) -> Result<ModelStatus, AppError> {
+        let mut status = self.health_status(base_url).await?;
+        if !status.server_running || !status.health_ok {
+            return Ok(status);
+        }
+
+        let probe_body = json!({
+            "model": "probe",
+            "messages": [
+                {"role": "user", "content": "Reply with exactly one word: ok"}
+            ],
+            "temperature": 0.0,
+            "stream": false
+        });
+
+        match self
+            .send_chat_request(base_url, probe_body, 30, "HealthProbe")
+            .await
+        {
+            Ok((http_status, body_text, _duration_ms)) => {
+                if (200..300).contains(&http_status) {
+                    match extract_assistant_content(&body_text) {
+                        Ok(content) => {
+                            status.completion_probe_ok = !content.trim().is_empty();
+                            if !status.completion_probe_ok {
+                                status.last_error = Some(app_error(
+                                    AppErrorCode::ModelResponseEmpty,
+                                    "Completion probe boş yanıt verdi.",
+                                    Some(body_text),
+                                    Some("Model probe yanıtını kontrol edin.".to_string()),
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            status.last_error = Some(error);
+                        }
+                    }
+                } else {
+                    status.last_error = Some(app_error(
+                        AppErrorCode::ModelHealthFailed,
+                        "Completion probe başarılı HTTP yanıtı vermedi.",
+                        Some(format!("HTTP {}", http_status)),
+                        Some("Model sunucusunun chat endpointini kontrol edin.".to_string()),
+                    ));
+                }
+            }
+            Err(error) => {
+                status.last_error = Some(error);
+            }
+        }
+
+        Ok(status)
+    }
+
+    async fn extract_question_text(
+        &self,
+        input: QuestionTextExtractionRequest,
+    ) -> Result<QuestionTextExtractionResult, AppError> {
+        let status = self.get_status().await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let images = request_images(
+            &input.model_input_images,
+            Some(&input.image_path),
+            "İşlenmiş PDF sayfası okunamadı.",
+        )?;
+
+        let request_body = json!({
+            "model": "gemma",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": input.prompt
+                },
+                {
+                    "role": "user",
+                    "content": build_image_content(
+                        format!(
+                            "Sadece {} numaralı sorunun metnini çıkar. Toplam soru sayısı bu istekte dışarıdan verildi; başka soru döndürme.",
+                            input.target_question_number
+                        ),
+                        &images
+                    )
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": QUESTION_TEXT_MAX_TOKENS,
+            "stream": false
+        });
+
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, 600, "QuestionTextExtraction")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        if cleaned.trim().is_empty() {
+            return Err(app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final cevap içeriği üretmedi.",
+                Some(assistant_content),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            ));
+        }
+
+        let payload_summary = build_payload_summary(
+            input.prompt.len() as u32,
+            600,
+            Some(&input.model_input_images),
+            images.first().map(|image| image.bytes_len),
+            Some(QUESTION_TEXT_MAX_TOKENS),
+        );
+        let output = parse_question_text_output(&cleaned)?;
+        Ok(QuestionTextExtractionResult {
+            page_index: input.page_index,
+            page_count: input.page_count,
+            output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::QuestionText,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason: finish_reason.clone(),
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: None,
+                error_code: None,
+            },
+        })
+    }
+
+    async fn draft_rubric(
+        &self,
+        input: RubricExtractionRequest,
+    ) -> Result<RubricExtractionResult, AppError> {
+        let status = self.get_status().await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let prompt = build_rubric_prompt(&input.prompt, input.strict_json_only);
+
+        let messages = if let Some(text) = &input.raw_text {
+            json!([
+                {
+                    "role": "system",
+                    "content": prompt.clone()
+                },
+                {
+                    "role": "user",
+                    "content": text
+                }
+            ])
+        } else if input.image_path.is_some() || !input.model_input_images.is_empty() {
+            let images = request_images(
+                &input.model_input_images,
+                input.image_path.as_deref(),
+                "Rubrik sayfası okunamadı.",
+            )?;
+            json!([
+                {
+                    "role": "system",
+                    "content": prompt.clone()
+                },
+                {
+                    "role": "user",
+                    "content": build_image_content(
+                        format!(
+                            "Bu rubrik/cevap anahtarı görsellerinden sadece {} numaralı sorunun puanlama kriterlerini çıkarın. Başka soru döndürmeyin.",
+                            input.target_question_number
+                        ),
+                        &images
+                    )
+                }
+            ])
+        } else {
+            return Err(app_error(
+                AppErrorCode::UnknownError,
+                "Request must have raw_text or image_path",
+                None,
+                None,
+            ));
+        };
+
+        let request_body = json!({
+            "model": "gemma",
+            "messages": messages,
+            "temperature": 0.0,
+            "max_tokens": RUBRIC_MAX_TOKENS,
+            "stream": false
+        });
+
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, 600, "RubricExtraction")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        let extraction_method = if input.raw_text.is_some() {
+            "pdftotext_text_only"
+        } else {
+            "vision_fallback"
+        };
+        let prompt_length = prompt.len();
+        let raw_text_length = input.raw_text.as_ref().map(|text| text.len()).unwrap_or(0);
+        let payload_summary = build_payload_summary(
+            prompt_length as u32,
+            600,
+            Some(&input.model_input_images),
+            input
+                .image_path
+                .as_ref()
+                .and_then(|path| std::fs::metadata(path).ok().map(|m| m.len())),
+            Some(RUBRIC_MAX_TOKENS),
+        );
+        let raw_response_path = save_rubric_import_artifacts(
+            &input,
+            extraction_method,
+            raw_text_length,
+            prompt_length,
+            &assistant_content,
+            &cleaned,
+        )?;
+        if cleaned.trim().is_empty() {
+            let parse_error = app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final cevap içeriği üretmedi.",
+                Some(assistant_content.clone()),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            );
+            let _ = save_rubric_parse_error(&input, &parse_error, &assistant_content, &cleaned);
+            let mut parse_error = parse_error;
+            if let Some(dir) = rubric_artifact_dir(&input) {
+                parse_error.technical_details = Some(format!(
+                    "retry_attempted={}\nraw_response_path={}\nextracted_json_path={}\nparse_error_path={}\nschema_expected=canonical rubric questions schema\n{}",
+                    input.strict_json_only,
+                    dir.join("response_raw.txt").display(),
+                    dir.join("response_extracted_json.txt").display(),
+                    dir.join("parse_error.json").display(),
+                    parse_error
+                        .technical_details
+                        .clone()
+                        .unwrap_or_default()
+                ));
+            }
+            return Err(parse_error);
+        }
+
+        let parsed = match parse_rubric_model_response(&cleaned) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let _ = save_rubric_parse_error(&input, &error, &assistant_content, &cleaned);
+                let mut error = error;
+                if let Some(dir) = rubric_artifact_dir(&input) {
+                    error.technical_details = Some(format!(
+                        "retry_attempted={}\nraw_response_path={}\nextracted_json_path={}\nparse_error_path={}\nschema_expected=canonical rubric questions schema\n{}",
+                        input.strict_json_only,
+                        dir.join("response_raw.txt").display(),
+                        dir.join("response_extracted_json.txt").display(),
+                        dir.join("parse_error.json").display(),
+                        error
+                            .technical_details
+                            .clone()
+                            .unwrap_or_default()
+                    ));
+                }
+                return Err(error);
+            }
+        };
+
+        let output = rubric_payload_to_output(parsed);
+        Ok(RubricExtractionResult {
+            output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::RubricDraft,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason: finish_reason.clone(),
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: raw_response_path,
+                error_code: None,
+            },
+        })
+    }
+
+    async fn extract_student_answer_ocr(
+        &self,
+        input: StudentAnswerOcrRequest,
+    ) -> Result<StudentAnswerOcrResult, AppError> {
+        let preprocess_mode = input.preprocess_mode;
+        let preprocess_version = input.preprocess_version.clone();
+        let model_input_crop_ref = input.model_input_crop_ref.clone();
+        let status = self.get_status().await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let images = request_images(
+            &input.model_input_images,
+            None,
+            "Öğrenci cevap görselleri okunamadı.",
+        )?;
+
+        let request_body = json!({
+            "model": "gemma",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": input.prompt
+                },
+                {
+                    "role": "user",
+                    "content": build_image_content(
+                        format!(
+                            "Soru {} için yalnızca öğrencinin verdiği cevabı çıkar. Başka soru ekleme. Görsel ön işleme profili: {}.",
+                            input.question_number,
+                            preprocess_mode
+                                .map(|mode| preprocess_mode_label(&mode).to_string())
+                                .unwrap_or_else(|| "bilinmiyor".to_string())
+                        ),
+                        &images
+                    )
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": STUDENT_ANSWER_OCR_MAX_TOKENS,
+            "response_format": { "type": "json_object" },
+            "stream": false
+        });
+
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, 600, "StudentAnswerOcr")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        if cleaned.trim().is_empty() {
+            return Err(app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final cevap içeriği üretmedi.",
+                Some(assistant_content),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            ));
+        }
+
+        let payload_summary = build_payload_summary(
+            input.prompt.len() as u32,
+            600,
+            Some(&input.model_input_images),
+            images.first().map(|image| image.bytes_len),
+            Some(STUDENT_ANSWER_OCR_MAX_TOKENS),
+        );
+        let parse_outcome =
+            parse_student_answer_ocr_output(&assistant_content, &input.question_text);
+        let StudentAnswerOcrParseOutcome {
+            output,
+            parsed_json,
+            parse_error,
+            salvaged_answer_text,
+            parse_strategy,
+            printed_text_mixed,
+            printed_question_leak_detected,
+        } = parse_outcome;
+        let raw_response_path =
+            save_student_answer_ocr_artifacts(&input, &assistant_content, &cleaned)?;
+        Ok(StudentAnswerOcrResult {
+            output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::Ocr,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason: finish_reason.clone(),
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: raw_response_path,
+                error_code: None,
+            },
+            parse_error,
+            parsed_json,
+            salvaged_answer_text,
+            parse_strategy,
+            model_request_metadata: Some(json!({
+                "requestKind": "student_answer_ocr",
+                "submissionId": input.submission_id,
+                "questionId": input.question_id,
+                "questionNumber": input.question_number,
+                "questionTextLength": input.question_text.len(),
+                "answerType": input.answer_type,
+                "sourcePageNumbers": input.source_page_numbers,
+                "preprocessMode": preprocess_mode,
+                "preprocessModeLabel": preprocess_mode.as_ref().map(preprocess_mode_label),
+                "preprocessVersion": preprocess_version,
+                "modelInputCropRef": model_input_crop_ref,
+                "promptLength": payload_summary.prompt_length,
+                "imageCount": payload_summary.image_count,
+                "imageTotalBytes": payload_summary.image_total_bytes,
+                "base64ApproxTotalBytes": payload_summary.base64_approx_total_bytes,
+                "timeoutSeconds": payload_summary.timeout_seconds,
+                "maxTokens": payload_summary.max_tokens,
+                "diagnostics": {
+                    "endpoint": self.chat_url(&self.base_url),
+                    "httpStatus": http_status,
+                    "durationMs": duration_ms,
+                    "finishReason": finish_reason.clone(),
+                    "contentLength": assistant_content.len(),
+                    "reasoningContentLength": reasoning_length,
+                }
+            })),
+            printed_text_mixed,
+            printed_question_leak_detected,
+        })
+    }
+
+    async fn suggest_student_answer_issue_correction(
+        &self,
+        input: StudentAnswerOcrIssueCorrectionRequest,
+    ) -> Result<StudentAnswerOcrIssueCorrectionResult, AppError> {
+        let status = self.get_status().await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let images = request_images(
+            &input.model_input_images,
+            None,
+            "OCR sorun görseli okunamadı.",
+        )?;
+        let request_body = json!({
+            "model": "gemma",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": input.prompt
+                },
+                {
+                    "role": "user",
+                    "content": build_image_content(
+                        format!(
+                            "Yalnızca işaretli veya belirtilen sorunlu kelimeyi oku. Tüm cevabı yeniden yazma. Eksik cevabı tamamlamaya çalışma. Soru {} için sadece aynı kapsamda düzeltme öner. İlk olarak görsel okuma yap, sonra yakın OCR bağlamıyla ikinci kez kontrol et.",
+                            input.question_number
+                        ),
+                        &images
+                    )
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS,
+            "stream": false
+        });
+
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(
+                &self.base_url,
+                request_body,
+                300,
+                "StudentAnswerOcrIssueCorrection",
+            )
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        if cleaned.trim().is_empty() {
+            return Err(app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final cevap içeriği üretmedi.",
+                Some(assistant_content),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            ));
+        }
+
+        let parsed = parse_student_answer_issue_correction_output(&cleaned)?;
+        let payload_summary = build_payload_summary(
+            input.prompt.len() as u32,
+            300,
+            Some(&input.model_input_images),
+            images.first().map(|image| image.bytes_len),
+            Some(STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS),
+        );
+        let raw_response_path =
+            save_student_answer_issue_correction_artifacts(&input, &assistant_content, &cleaned)?;
+
+        Ok(StudentAnswerOcrIssueCorrectionResult {
+            output: parsed.output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::OcrIssueCorrection,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason: finish_reason.clone(),
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: raw_response_path,
+                error_code: None,
+            },
+            parse_error: parsed.parse_error,
+            parsed_json: parsed.parsed_json,
+            model_request_metadata: Some(json!({
+                "requestKind": "student_answer_ocr_issue_correction",
+                "ocrRecordId": input.ocr_record_id,
+                "issueId": input.issue_id,
+                "observedText": input.observed_text,
+                "suggestedTextFromAnalyzer": input.suggested_text_from_analyzer,
+                "questionNumber": input.question_number,
+                "promptLength": payload_summary.prompt_length,
+                "imageCount": payload_summary.image_count,
+                "imageTotalBytes": payload_summary.image_total_bytes,
+                "base64ApproxTotalBytes": payload_summary.base64_approx_total_bytes,
+                "timeoutSeconds": payload_summary.timeout_seconds,
+                "maxTokens": payload_summary.max_tokens,
+                "diagnostics": {
+                    "endpoint": self.chat_url(&self.base_url),
+                    "httpStatus": http_status,
+                    "durationMs": duration_ms,
+                    "finishReason": finish_reason,
+                    "contentLength": assistant_content.len(),
+                    "reasoningContentLength": reasoning_length,
+                }
+            })),
+        })
+    }
+
+    async fn extract_student_identity_ocr(
+        &self,
+        input: StudentIdentityOcrRequest,
+    ) -> Result<StudentIdentityOcrResult, AppError> {
+        let preprocess_mode = input.preprocess_mode;
+        let preprocess_version = input.preprocess_version.clone();
+        let model_input_crop_ref = input.model_input_crop_ref.clone();
+        let status = self.get_status().await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let images = request_images(
+            &input.model_input_images,
+            None,
+            "Öğrenci kimlik crop görseli okunamadı.",
+        )?;
+        let request_body = json!({
+            "model": "gemma",
+            "messages": [
+                { "role": "system", "content": input.prompt },
+                {
+                    "role": "user",
+                    "content": build_image_content(
+                        format!(
+                            "Yalnızca bu görseldeki öğrenci kimlik alanını oku. Görsel ön işleme profili: {}.",
+                            input
+                                .preprocess_mode
+                                .map(|mode| preprocess_mode_label(&mode).to_string())
+                                .unwrap_or_else(|| "bilinmiyor".to_string())
+                        ),
+                        &images
+                    )
+                }
+            ],
+            "temperature": 0.0,
+            "max_tokens": STUDENT_IDENTITY_OCR_MAX_TOKENS,
+            "stream": false
+        });
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, 300, "StudentIdentityOcr")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        if cleaned.trim().is_empty() {
+            return Err(app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final cevap içeriği üretmedi.",
+                Some(assistant_content),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            ));
+        }
+
+        let payload_summary = build_payload_summary(
+            input.prompt.len() as u32,
+            300,
+            Some(&input.model_input_images),
+            images.first().map(|image| image.bytes_len),
+            Some(STUDENT_IDENTITY_OCR_MAX_TOKENS),
+        );
+        let parse_outcome = parse_student_identity_ocr_output(&assistant_content);
+        let raw_response_path =
+            save_student_identity_ocr_artifacts(&input, &assistant_content, &cleaned)?;
+        Ok(StudentIdentityOcrResult {
+            output: parse_outcome.output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::Ocr,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason,
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: raw_response_path,
+                error_code: None,
+            },
+            parse_error: parse_outcome.parse_error,
+            parsed_json: parse_outcome.parsed_json,
+            parse_strategy: parse_outcome.parse_strategy,
+            model_request_metadata: Some(json!({
+                "requestKind": "student_identity_ocr",
+                "submissionId": input.submission_id,
+                "sourcePageNumbers": input.source_page_numbers,
+                "preprocessMode": preprocess_mode,
+                "preprocessModeLabel": preprocess_mode.as_ref().map(preprocess_mode_label),
+                "preprocessVersion": preprocess_version,
+                "modelInputCropRef": model_input_crop_ref,
+                "promptLength": payload_summary.prompt_length,
+                "imageCount": payload_summary.image_count,
+                "timeoutSeconds": payload_summary.timeout_seconds,
+                "maxTokens": payload_summary.max_tokens,
+            })),
+        })
+    }
+
+    async fn cleanup_speaking_transcript(
+        &self,
+        input: SpeakingTranscriptCleanupRequest,
+    ) -> Result<SpeakingTranscriptCleanupResult, AppError> {
+        // The speaking job already completed a full readiness probe before
+        // entering cleanup. Avoid spending another model completion on the
+        // same probe; health is sufficient at this boundary.
+        let status = self.health_status(&self.base_url).await?;
+        if !status.server_running || !status.health_ok {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "ASR düzeltme model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Gemma 4 12B modelini başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let user_content = if input.segments.is_empty() {
+            format!(
+                "{}\n\nHAM TRANSKRİPT:\n{}",
+                input.prompt, input.raw_transcript
+            )
+        } else {
+            format!(
+                "{}\n\nSEGMENTLER (JSON):\n{}",
+                input.prompt,
+                serde_json::to_string(&input.segments).unwrap_or_default()
+            )
+        };
+        let request_body = json!({
+            "model": "gemma-4-12b",
+            "messages": [
+                { "role": "system", "content": input.prompt },
+                { "role": "user", "content": user_content }
+            ],
+            "chat_template_kwargs": { "enable_thinking": false },
+            "temperature": 0.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "seed": 42,
+            "max_tokens": input.max_tokens,
+            "response_format": { "type": "json_object" },
+            "stream": false
+        });
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(
+                &self.base_url,
+                request_body,
+                input.timeout_seconds,
+                "SpeakingTranscriptCleanup",
+            )
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "ASR düzeltme modeli başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Gemma 4 12B model loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let segments = parse_speaking_transcript_cleanup_output(&assistant_content)?;
+        let cleaned_transcript = segments
+            .iter()
+            .map(|segment| segment.cleaned_text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        Ok(SpeakingTranscriptCleanupResult {
+            cleaned_transcript: cleaned_transcript.clone(),
+            segments,
+            raw_response: assistant_content,
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::SpeakingTranscriptCleanup,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(input.prompt.len() as u32),
+                image_count: Some(0),
+                image_total_bytes: Some(0),
+                base64_approx_total_bytes: Some(0),
+                model_input_images: vec![],
+                timeout_seconds: Some(input.timeout_seconds),
+                max_tokens: Some(input.max_tokens),
+                finish_reason: extract_finish_reason(&response_body),
+                content_length: Some(cleaned_transcript.len() as u32),
+                reasoning_content_length: extract_reasoning_length(&response_body),
+                raw_text_stored_path: None,
+                error_code: None,
+            },
+        })
+    }
+
+    async fn generate_analysis_report(
+        &self,
+        input: AnalysisReportRequest,
+    ) -> Result<AnalysisReportResult, AppError> {
+        let status = self.get_status().await?;
+        if !status.server_running || !status.health_ok {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Analiz raporu modeli çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Gemma 4 12B modelini başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let request_body = json!({
+            "model": "gemma-4-12b",
+            "messages": [
+                { "role": "system", "content": input.prompt },
+                {
+                    "role": "user",
+                    "content": "Yalnızca öğretmene sunulacak Türkçe analiz raporunu yaz."
+                }
+            ],
+            "chat_template_kwargs": { "enable_thinking": false },
+            "temperature": 0.1,
+            "top_p": 0.9,
+            "max_tokens": 900,
+            "stream": false
+        });
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, 120, "AnalysisReport")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::AnalysisFailed,
+                "Gemma analiz raporu üretemedi.",
+                Some(format!("HTTP {http_status}\n{response_body}")),
+                Some("Grafikler korunmuştur; raporu yeniden oluşturabilirsiniz.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let report = strip_reasoning_and_fences(&assistant_content);
+        if report.trim().is_empty() {
+            return Err(app_error(
+                AppErrorCode::ModelResponseEmpty,
+                "Gemma boş bir analiz raporu döndürdü.",
+                Some(assistant_content),
+                Some("Grafikler korunmuştur; raporu yeniden oluşturabilirsiniz.".to_string()),
+            ));
+        }
+
+        Ok(AnalysisReportResult {
+            report: report.clone(),
+            raw_response: assistant_content,
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::AnalysisReport,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(input.prompt.len() as u32),
+                image_count: Some(0),
+                image_total_bytes: Some(0),
+                base64_approx_total_bytes: Some(0),
+                model_input_images: vec![],
+                timeout_seconds: Some(120),
+                max_tokens: Some(900),
+                finish_reason: extract_finish_reason(&response_body),
+                content_length: Some(report.len() as u32),
+                reasoning_content_length: extract_reasoning_length(&response_body),
+                raw_text_stored_path: None,
+                error_code: None,
+            },
+        })
+    }
+
+    async fn score_answer(&self, input: ScoringRequest) -> Result<ScoringResult, AppError> {
+        let speaking_request = input.answer_type == "speaking";
+        let status = self.health_status(&self.base_url).await?;
+        if !status.server_running {
+            return Err(app_error(
+                AppErrorCode::ModelServerNotRunning,
+                "Gemma model sunucusu çalışmıyor.",
+                status.last_error.as_ref().map(|error| format!("{error:?}")),
+                Some("Model sunucusunu başlatıp tekrar deneyin.".to_string()),
+            ));
+        }
+
+        let max_tokens = if speaking_request { 3072 } else { 2048 };
+        let timeout_seconds = if speaking_request { 300 } else { 600 };
+        let user_instruction = if speaking_request {
+            "Doğrulanmış konuşma transkriptini ve konuşma rubriğini kullanarak yalnızca JSON döndür."
+                .to_string()
+        } else {
+            format!(
+                "Öğrenci cevabı, rubrik ve onaylı OCR verisini kullanarak yalnızca JSON döndür. Soru {}.",
+                input.question_number
+            )
+        };
+        let request_body = json!({
+            "model": "gemma",
+            "messages": [
+                { "role": "system", "content": input.prompt },
+                {
+                    "role": "user",
+                    "content": user_instruction
+                }
+            ],
+            "chat_template_kwargs": { "enable_thinking": false },
+            "temperature": 0.0,
+            "top_k": 1,
+            "top_p": 1.0,
+            "seed": 42,
+            "max_tokens": max_tokens,
+            "response_format": { "type": "json_object" },
+            "stream": false
+        });
+
+        let (http_status, response_body, duration_ms) = self
+            .send_chat_request(&self.base_url, request_body, timeout_seconds, "Scoring")
+            .await?;
+        if !(200..300).contains(&http_status) {
+            return Err(app_error(
+                AppErrorCode::ModelHealthFailed,
+                "Model sunucusu başarılı bir yanıt döndürmedi.",
+                Some(response_body),
+                Some("Model sunucusunun loglarını kontrol edin.".to_string()),
+            ));
+        }
+
+        let assistant_content = extract_assistant_content(&response_body)?;
+        let finish_reason = extract_finish_reason(&response_body);
+        let reasoning_length = extract_reasoning_length(&response_body);
+        let cleaned = strip_reasoning_and_fences(&assistant_content);
+        if cleaned.trim().is_empty() {
+            return Err(app_error(
+                if assistant_content.contains("<think>") {
+                    AppErrorCode::ModelResponseReasoningOnly
+                } else {
+                    AppErrorCode::ModelResponseEmpty
+                },
+                "Model final puanlama içeriği üretmedi.",
+                Some(assistant_content),
+                Some("Promptu veya model çıktısını kontrol edin.".to_string()),
+            ));
+        }
+
+        let payload_summary = build_payload_summary(
+            input.prompt.len() as u32,
+            timeout_seconds,
+            None,
+            None,
+            Some(max_tokens),
+        );
+        let parse_outcome = parse_scoring_output(&assistant_content, input.max_score);
+        Ok(ScoringResult {
+            output: parse_outcome.output,
+            raw_response: assistant_content.clone(),
+            diagnostics: ModelDiagnostics {
+                endpoint: self.chat_url(&self.base_url),
+                request_kind: ModelRequestKind::Scoring,
+                http_status: Some(http_status),
+                duration_ms,
+                prompt_length: Some(payload_summary.prompt_length),
+                image_count: Some(payload_summary.image_count),
+                image_total_bytes: Some(payload_summary.image_total_bytes),
+                base64_approx_total_bytes: Some(payload_summary.base64_approx_total_bytes),
+                model_input_images: payload_summary.model_input_images,
+                timeout_seconds: Some(payload_summary.timeout_seconds),
+                max_tokens: payload_summary.max_tokens,
+                finish_reason,
+                content_length: Some(assistant_content.len() as u32),
+                reasoning_content_length: reasoning_length,
+                raw_text_stored_path: None,
+                error_code: None,
+            },
+            parse_error: parse_outcome.parse_error,
+            parsed_json: parse_outcome.parsed_json,
+            salvaged_rationale: parse_outcome.salvaged_rationale,
+            parse_strategy: parse_outcome.parse_strategy,
+            model_request_metadata: Some(json!({
+                "requestKind": "scoring",
+                "submissionId": input.submission_id,
+                "questionId": input.question_id,
+                "questionNumber": input.question_number,
+                "studentDisplayName": input.student_display_name,
+                "studentNumber": input.student_number,
+                "studentClassName": input.student_class_name,
+                "promptLength": payload_summary.prompt_length,
+                "timeoutSeconds": payload_summary.timeout_seconds,
+                "maxTokens": payload_summary.max_tokens,
+                "sourceHash": input.source_hash,
+                "packageHash": input.package_hash,
+                "ocrRecordHash": input.ocr_record_hash,
+            })),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    content: serde_json::Value,
+}
+
+fn extract_assistant_content(body_text: &str) -> Result<String, AppError> {
+    if body_text.trim().is_empty() {
+        return Err(app_error(
+            AppErrorCode::ModelResponseEmpty,
+            "Model response was empty.",
+            None,
+            Some("Model sunucusunu kontrol edin.".to_string()),
+        ));
+    }
+
+    let response: ChatResponse = serde_json::from_str(body_text).map_err(|error| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidJson,
+            "Model yanıtı JSON olarak çözülemedi.",
+            Some(error.to_string()),
+            Some("Model response schema uyumsuz olabilir.".to_string()),
+        )
+    })?;
+
+    let content = response
+        .choices
+        .first()
+        .map(|choice| content_value_to_text(&choice.message.content))
+        .unwrap_or_default();
+
+    Ok(content)
+}
+
+fn content_value_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .map(content_value_to_text)
+            .collect::<Vec<_>>()
+            .join(""),
+        serde_json::Value::Object(object) => {
+            for key in ["text", "content", "value"] {
+                if let Some(value) = object.get(key) {
+                    return content_value_to_text(value);
+                }
+            }
+            value.to_string()
+        }
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn extract_finish_reason(body_text: &str) -> Option<String> {
+    serde_json::from_str::<ChatResponse>(body_text)
+        .ok()
+        .and_then(|response| {
+            response
+                .choices
+                .first()
+                .and_then(|choice| choice.finish_reason.clone())
+        })
+}
+
+fn extract_reasoning_length(body_text: &str) -> Option<u32> {
+    let content = serde_json::from_str::<ChatResponse>(body_text)
+        .ok()
+        .and_then(|response| {
+            response
+                .choices
+                .first()
+                .map(|choice| choice.message.content.to_string())
+        })?;
+    let start = content.find("<think>")?;
+    let after_start = &content[start + "<think>".len()..];
+    let end = after_start.find("</think>")?;
+    Some(after_start[..end].chars().count() as u32)
+}
+
+fn strip_reasoning_and_fences(text: &str) -> String {
+    let without_think = remove_think_blocks(text);
+    let trimmed = without_think.trim();
+
+    // 1. Try to find ```json ... ``` code block anywhere in the text
+    if let Some(start_idx) = trimmed.find("```json") {
+        let content_after = &trimmed[start_idx + "```json".len()..];
+        if let Some(end_idx) = content_after.find("```") {
+            return content_after[..end_idx].trim().to_string();
+        }
+    }
+
+    // 2. Try to find ``` ... ``` code block anywhere in the text
+    if let Some(start_idx) = trimmed.find("```") {
+        let content_after = &trimmed[start_idx + "```".len()..];
+        if let Some(end_idx) = content_after.find("```") {
+            return content_after[..end_idx].trim().to_string();
+        }
+    }
+
+    // 3. Extract a complete object/array from prose or wrapper tokens. If the
+    // outer JSON is truncated, keep it intact so callers can attempt recovery
+    // instead of accidentally selecting one complete nested item.
+    if let Some((start_index, _)) = trimmed
+        .char_indices()
+        .find(|(_, ch)| *ch == '{' || *ch == '[')
+    {
+        if let Some(candidate) = extract_balanced_json_from_start(trimmed, start_index) {
+            return candidate;
+        }
+    }
+    if let (Some(first_brace), Some(last_brace)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if first_brace < last_brace {
+            return trimmed[first_brace..=last_brace].trim().to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn build_rubric_prompt(base_prompt: &str, strict_json_only: bool) -> String {
+    if !strict_json_only {
+        return base_prompt.to_string();
+    }
+
+    format!(
+        "{}\n\nÖnceki cevabın geçerli JSON değildi. Sadece aşağıdaki schema'ya uygun JSON döndür. Markdown, açıklama, code fence kullanma. Sadece JSON.",
+        base_prompt.trim()
+    )
+}
+
+struct RequestImage {
+    data_url: String,
+    bytes_len: u64,
+}
+
+fn request_images(
+    model_input_images: &[crate::domain::model::ModelInputImage],
+    fallback_path: Option<&str>,
+    read_message: &str,
+) -> Result<Vec<RequestImage>, AppError> {
+    let paths = if model_input_images.is_empty() {
+        fallback_path
+            .map(|path| vec![path.to_string()])
+            .unwrap_or_default()
+    } else {
+        model_input_images
+            .iter()
+            .map(|image| image.output_image_path.clone())
+            .collect()
+    };
+
+    let mut images = Vec::new();
+    for path in paths {
+        let image_bytes = std::fs::read(&path).map_err(|error| {
+            app_error(
+                AppErrorCode::PdfRenderFailed,
+                read_message,
+                Some(error.to_string()),
+                Some("PDF render çıktısını kontrol edin.".to_string()),
+            )
+        })?;
+        images.push(RequestImage {
+            data_url: format!(
+                "data:image/jpeg;base64,{}",
+                general_purpose::STANDARD.encode(&image_bytes)
+            ),
+            bytes_len: image_bytes.len() as u64,
+        });
+    }
+
+    Ok(images)
+}
+
+fn build_image_content(text: String, images: &[RequestImage]) -> Vec<serde_json::Value> {
+    let mut content = vec![json!({"type": "text", "text": text})];
+    content.extend(
+        images
+            .iter()
+            .map(|image| json!({"type": "image_url", "image_url": {"url": image.data_url, "detail": "high"}})),
+    );
+    content
+}
+
+fn preprocess_mode_label(mode: &OcrImagePreprocessMode) -> &'static str {
+    match mode {
+        OcrImagePreprocessMode::Original => "orijinal",
+        OcrImagePreprocessMode::CleanGrayscale => "temiz gri ton",
+        OcrImagePreprocessMode::HandwritingEnhanced => "el yazısı güçlendirildi",
+        OcrImagePreprocessMode::HighContrast => "yüksek kontrast",
+        OcrImagePreprocessMode::HighContrastBw => "yüksek kontrast siyah-beyaz",
+    }
+}
+
+fn extract_first_balanced_json_candidate(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    trimmed
+        .char_indices()
+        .filter(|(_, ch)| *ch == '{' || *ch == '[')
+        .find_map(|(start_index, _)| extract_balanced_json_from_start(trimmed, start_index))
+}
+
+fn extract_balanced_json_from_start(text: &str, start_index: usize) -> Option<String> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (relative_index, ch) in text[start_index..].char_indices() {
+        let index = start_index + relative_index;
+        if in_string {
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    return Some(text[start_index..index + ch.len_utf8()].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_alias_warning(field: &str, alias: &str) -> String {
+    format!("{field}_alias:{alias}")
+}
+
+fn sanitize_json_control_chars(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in text.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                result.push(ch);
+                continue;
+            }
+            match ch {
+                '\\' => {
+                    escape = true;
+                    result.push(ch);
+                }
+                '"' => {
+                    in_string = false;
+                    result.push(ch);
+                }
+                '\n' => result.push_str("\\n"),
+                '\r' => result.push_str("\\r"),
+                '\t' => result.push_str("\\t"),
+                c if c.is_control() => {
+                    result.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                _ => result.push(ch),
+            }
+        } else {
+            match ch {
+                '"' => {
+                    in_string = true;
+                    result.push(ch);
+                }
+                _ => result.push(ch),
+            }
+        }
+    }
+    result
+}
+
+fn extract_speaking_cleanup_segments_from_value(
+    value: &serde_json::Value,
+) -> Option<Vec<SpeakingTranscriptCleanupOutputSegment>> {
+    let array = if let Some(arr) = value.as_array() {
+        arr
+    } else if let Some(obj) = value.as_object() {
+        for key in ["result", "output", "response", "payload"] {
+            if let Some(nested) = obj.get(key) {
+                if let Some(segments) = extract_speaking_cleanup_segments_from_value(nested) {
+                    return Some(segments);
+                }
+            }
+        }
+        [
+            "segments",
+            "transcriptSegments",
+            "transcript_segments",
+            "cleanedSegments",
+            "cleaned_segments",
+            "results",
+            "outputs",
+            "data",
+            "items",
+            "transcript",
+        ]
+        .iter()
+        .find_map(|key| obj.get(*key))
+        .and_then(serde_json::Value::as_array)?
+    } else {
+        return None;
+    };
+
+    if array.is_empty() {
+        return Some(vec![]);
+    }
+
+    let mut segments = Vec::with_capacity(array.len());
+    for item in array {
+        if let Ok(segment) =
+            serde_json::from_value::<SpeakingTranscriptCleanupOutputSegment>(item.clone())
+        {
+            segments.push(segment);
+        } else if let Some(obj) = item.as_object() {
+            let segment_id = ["segment_id", "segmentId", "id", "index"]
+                .iter()
+                .find_map(|key| obj.get(*key).and_then(json_text))?;
+            let cleaned_text = [
+                "cleaned_text",
+                "cleanedText",
+                "text",
+                "transcript",
+                "cleaned_transcript",
+                "cleanedTranscript",
+                "content",
+            ]
+            .iter()
+            .find_map(|key| obj.get(*key).and_then(json_text))?;
+            let changes = obj
+                .get("changes")
+                .or_else(|| obj.get("modifications"))
+                .or_else(|| obj.get("edits"))
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let semantic_change_detected = obj
+                .get("semantic_change_detected")
+                .or_else(|| obj.get("semanticChangeDetected"))
+                .or_else(|| obj.get("semantic_change"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let needs_review = obj
+                .get("needs_review")
+                .or_else(|| obj.get("needsReview"))
+                .or_else(|| obj.get("review"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            segments.push(SpeakingTranscriptCleanupOutputSegment {
+                segment_id,
+                cleaned_text,
+                changes,
+                semantic_change_detected,
+                needs_review,
+            });
+        } else {
+            return None;
+        }
+    }
+
+    Some(segments)
+}
+
+fn parse_speaking_transcript_cleanup_output(
+    raw_content: &str,
+) -> Result<Vec<SpeakingTranscriptCleanupOutputSegment>, AppError> {
+    let cleaned_response = strip_reasoning_and_fences(raw_content);
+    if cleaned_response.trim().is_empty() {
+        return Err(app_error(
+            if raw_content.contains("<think>") {
+                AppErrorCode::ModelResponseReasoningOnly
+            } else {
+                AppErrorCode::ModelResponseEmpty
+            },
+            "ASR düzeltme modeli geçerli bir transkript üretmedi.",
+            Some(raw_content.to_string()),
+            Some("Kayıt öğretmen incelemesine bırakıldı.".to_string()),
+        ));
+    }
+
+    let raw_trimmed = raw_content.trim();
+    let fenced_candidate = extract_fenced_json_candidate(raw_content);
+    let balanced_candidate = extract_first_balanced_json_candidate(&cleaned_response);
+
+    let mut candidates = vec![
+        raw_trimmed.to_string(),
+        cleaned_response.trim().to_string(),
+        fenced_candidate.unwrap_or_default(),
+        balanced_candidate.unwrap_or_default(),
+    ];
+    for (start_index, ch) in cleaned_response.char_indices() {
+        if (ch == '{' || ch == '[')
+            && extract_balanced_json_from_start(&cleaned_response, start_index).is_some_and(
+                |candidate| {
+                    if !candidates.iter().any(|existing| existing == &candidate) {
+                        candidates.push(candidate);
+                    }
+                    true
+                },
+            )
+        {
+            // Candidate collection is intentionally tolerant: schema validation below
+            // decides which balanced JSON value is the cleanup payload.
+        }
+    }
+
+    let mut last_parse_error: Option<String> = None;
+    let mut saw_valid_json = false;
+
+    for candidate in &candidates {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(value) => {
+                saw_valid_json = true;
+                if let Some(segments) = extract_speaking_cleanup_segments_from_value(&value) {
+                    return Ok(segments);
+                }
+            }
+            Err(err) => {
+                last_parse_error = Some(err.to_string());
+            }
+        }
+
+        let repaired = sanitize_json_control_chars(trimmed);
+        if repaired != trimmed {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                saw_valid_json = true;
+                if let Some(segments) = extract_speaking_cleanup_segments_from_value(&value) {
+                    return Ok(segments);
+                }
+            }
+        }
+    }
+
+    Err(app_error(
+        if saw_valid_json {
+            AppErrorCode::ModelResponseInvalidSchema
+        } else {
+            AppErrorCode::ModelResponseInvalidJson
+        },
+        if saw_valid_json {
+            "Konuşma transkript temizleme çıktısı beklenen segment şemasında değil."
+        } else {
+            "Konuşma transkript temizleme çıktısı geçerli JSON değil."
+        },
+        Some(format!(
+            "parse_error={}; valid_json_seen={}; raw_model_output={}",
+            last_parse_error.unwrap_or_else(|| "schema_not_found".to_string()),
+            saw_valid_json,
+            raw_content.chars().take(12000).collect::<String>()
+        )),
+        Some(
+            "Temizlemeyi yeniden çalıştırın veya ham transkripti öğretmen onayına gönderin."
+                .to_string(),
+        ),
+    ))
+}
+
+fn request_metadata(
+    request: &RubricExtractionRequest,
+    extraction_method: &str,
+    raw_text_length: usize,
+    prompt_length: usize,
+) -> serde_json::Value {
+    let image_count = request.model_input_images.len();
+    let image_total_bytes: u64 = request
+        .model_input_images
+        .iter()
+        .map(|image| image.output_bytes)
+        .sum();
+    let base64_approx_total_bytes: u64 = request
+        .model_input_images
+        .iter()
+        .map(|image| image.base64_approx_bytes)
+        .sum();
+
+    json!({
+        "requestKind": "rubric_draft",
+        "attempt": request.attempt,
+        "strictJsonOnly": request.strict_json_only,
+        "extractionMethod": extraction_method,
+        "promptLength": prompt_length,
+        "rawTextLength": raw_text_length,
+        "imageCount": image_count,
+        "imageBytes": image_total_bytes,
+        "base64ApproxBytes": base64_approx_total_bytes,
+        "projectRootPath": request.project_root_path,
+        "jobId": request.job_id,
+    })
+}
+
+fn rubric_artifact_dir(request: &RubricExtractionRequest) -> Option<std::path::PathBuf> {
+    let project_root = request.project_root_path.as_ref()?;
+    let job_id = request.job_id.as_ref()?;
+    let base_job_id = if let Some(idx) = job_id.find("_q") {
+        &job_id[..idx]
+    } else {
+        job_id
+    };
+    Some(
+        std::path::Path::new(project_root)
+            .join("logs")
+            .join("model_responses")
+            .join("rubric_import")
+            .join(base_job_id)
+            .join(format!("question_{}", request.target_question_number))
+            .join(format!("attempt_{}", request.attempt.max(1))),
+    )
+}
+
+fn save_rubric_import_artifacts(
+    request: &RubricExtractionRequest,
+    extraction_method: &str,
+    raw_text_length: usize,
+    prompt_length: usize,
+    raw_response: &str,
+    extracted_json: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(dir) = rubric_artifact_dir(request) else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Rubrik model artifact klasörü oluşturulamadı.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    let request_path = dir.join("request.json");
+    let raw_path = dir.join("response_raw.txt");
+    let extracted_path = dir.join("response_extracted_json.txt");
+
+    let request_body = request_metadata(request, extraction_method, raw_text_length, prompt_length);
+    std::fs::write(
+        &request_path,
+        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+    )
+    .map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Rubrik request artifact kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&raw_path, raw_response).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Rubrik raw response kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Rubrik extracted JSON kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    Ok(Some(raw_path.to_string_lossy().to_string()))
+}
+
+fn save_rubric_parse_error(
+    request: &RubricExtractionRequest,
+    parse_error: &AppError,
+    raw_response: &str,
+    extracted_json: &str,
+) -> Result<(), AppError> {
+    let Some(dir) = rubric_artifact_dir(request) else {
+        return Ok(());
+    };
+    let parse_error_path = dir.join("parse_error.json");
+    let payload = json!({
+        "attempt": request.attempt,
+        "strictJsonOnly": request.strict_json_only,
+        "error": parse_error,
+        "rawResponseLength": raw_response.len(),
+        "extractedJsonLength": extracted_json.len(),
+    });
+    std::fs::write(
+        &parse_error_path,
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
+    )
+    .map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Rubrik parse error artifact kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    Ok(())
+}
+
+fn student_answer_ocr_artifact_dir(
+    request: &StudentAnswerOcrRequest,
+) -> Option<std::path::PathBuf> {
+    let project_root = request.project_root_path.as_ref()?;
+    let job_id = request.job_id.as_ref()?;
+    Some(
+        std::path::Path::new(project_root)
+            .join("logs")
+            .join("model_responses")
+            .join("student_answer_ocr")
+            .join(job_id)
+            .join(format!("submission_{}", request.submission_id))
+            .join(format!("question_{}", request.question_number)),
+    )
+}
+
+fn save_student_answer_ocr_artifacts(
+    request: &StudentAnswerOcrRequest,
+    raw_response: &str,
+    extracted_json: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(dir) = student_answer_ocr_artifact_dir(request) else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student OCR model artifact klasörü oluşturulamadı.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    let request_path = dir.join("request.json");
+    let raw_path = dir.join("response_raw.txt");
+    let extracted_path = dir.join("response_extracted_json.txt");
+    let request_body = json!({
+        "submissionId": request.submission_id,
+        "questionId": request.question_id,
+        "questionNumber": request.question_number,
+        "questionTextLength": request.question_text.len(),
+        "answerType": request.answer_type,
+        "preprocessMode": request.preprocess_mode,
+        "preprocessVersion": request.preprocess_version,
+        "modelInputCropRef": request.model_input_crop_ref,
+        "pageNumbers": request.source_page_numbers,
+        "promptLength": request.prompt.len(),
+        "imageCount": request.model_input_images.len(),
+        "projectRootPath": request.project_root_path,
+        "jobId": request.job_id,
+    });
+
+    std::fs::write(
+        &request_path,
+        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+    )
+    .map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student OCR request artifact kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&raw_path, raw_response).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student OCR raw response kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student OCR extracted JSON kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    Ok(Some(raw_path.to_string_lossy().to_string()))
+}
+
+fn student_answer_issue_correction_artifact_dir(
+    request: &StudentAnswerOcrIssueCorrectionRequest,
+) -> Option<std::path::PathBuf> {
+    let project_root = request.project_root_path.as_ref()?;
+    let job_id = request.job_id.as_ref()?;
+    Some(
+        std::path::Path::new(project_root)
+            .join("logs")
+            .join("model_responses")
+            .join("student_answer_ocr_issue_correction")
+            .join(job_id)
+            .join(format!("ocr_record_{}", request.ocr_record_id))
+            .join(format!("question_{}", request.question_number)),
+    )
+}
+
+fn save_student_answer_issue_correction_artifacts(
+    request: &StudentAnswerOcrIssueCorrectionRequest,
+    raw_response: &str,
+    extracted_json: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(dir) = student_answer_issue_correction_artifact_dir(request) else {
+        return Ok(None);
+    };
+
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "OCR issue correction model artifact klasörü oluşturulamadı.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    let request_path = dir.join("request.json");
+    let raw_path = dir.join("response_raw.txt");
+    let extracted_path = dir.join("response_extracted_json.txt");
+    let request_body = json!({
+        "ocrRecordId": request.ocr_record_id,
+        "issueId": request.issue_id,
+        "observedText": request.observed_text,
+        "suggestedTextFromAnalyzer": request.suggested_text_from_analyzer,
+        "questionNumber": request.question_number,
+        "highlightRegion": request.highlight_region,
+        "modelInputCropRef": request.model_input_crop_ref,
+        "sourceImageRef": request.source_image_ref,
+        "nearbyContext": request.nearby_context,
+        "contextHints": request.context_hints,
+        "promptLength": request.prompt.len(),
+        "imageCount": request.model_input_images.len(),
+        "projectRootPath": request.project_root_path,
+        "jobId": request.job_id,
+    });
+
+    std::fs::write(
+        &request_path,
+        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+    )
+    .map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "OCR issue correction request artifact kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&raw_path, raw_response).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "OCR issue correction raw response kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "OCR issue correction extracted JSON kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+
+    Ok(Some(raw_path.to_string_lossy().to_string()))
+}
+
+fn student_identity_ocr_artifact_dir(
+    request: &StudentIdentityOcrRequest,
+) -> Option<std::path::PathBuf> {
+    let project_root = request.project_root_path.as_ref()?;
+    let job_id = request.job_id.as_ref()?;
+    Some(
+        std::path::Path::new(project_root)
+            .join("logs")
+            .join("model_responses")
+            .join("student_identity_ocr")
+            .join(job_id)
+            .join(format!("submission_{}", request.submission_id)),
+    )
+}
+
+fn save_student_identity_ocr_artifacts(
+    request: &StudentIdentityOcrRequest,
+    raw_response: &str,
+    extracted_json: &str,
+) -> Result<Option<String>, AppError> {
+    let Some(dir) = student_identity_ocr_artifact_dir(request) else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student identity OCR model artifact klasörü oluşturulamadı.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    let request_path = dir.join("request.json");
+    let raw_path = dir.join("response_raw.txt");
+    let extracted_path = dir.join("response_extracted_json.txt");
+    let request_body = json!({
+        "submissionId": request.submission_id,
+        "preprocessMode": request.preprocess_mode,
+        "preprocessVersion": request.preprocess_version,
+        "modelInputCropRef": request.model_input_crop_ref,
+        "pageNumbers": request.source_page_numbers,
+        "promptLength": request.prompt.len(),
+        "imageCount": request.model_input_images.len(),
+        "projectRootPath": request.project_root_path,
+        "jobId": request.job_id,
+    });
+    std::fs::write(
+        &request_path,
+        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+    )
+    .map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student identity OCR request artifact kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&raw_path, raw_response).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student identity OCR raw response kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
+        app_error(
+            AppErrorCode::FileWriteFailed,
+            "Student identity OCR extracted JSON kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Proje logs klasörünü kontrol edin.".to_string()),
+        )
+    })?;
+    Ok(Some(raw_path.to_string_lossy().to_string()))
+}
+
+fn normalize_rubric_criteria(
+    value: &serde_json::Value,
+) -> (Vec<crate::domain::rubric::RubricCriterion>, Vec<String>) {
+    let Some(array) = value.as_array() else {
+        return (vec![], vec!["criteria_not_array".to_string()]);
+    };
+
+    let mut warnings = Vec::new();
+    let criteria = array
+        .iter()
+        .filter_map(|criterion| {
+            let object = criterion.as_object()?;
+            let label = object
+                .get("label")
+                .or_else(|| object.get("name"))
+                .or_else(|| object.get("kriter"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let description = object
+                .get("description")
+                .or_else(|| object.get("açıklama"))
+                .or_else(|| object.get("aciklama"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let points = object
+                .get("points")
+                .or_else(|| object.get("puan"))
+                .or_else(|| object.get("score"))
+                .or_else(|| object.get("point"))
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0) as f32;
+            if object.contains_key("name") {
+                warnings.push(normalize_alias_warning("criterion.label", "name"));
+            }
+            if object.contains_key("kriter") {
+                warnings.push(normalize_alias_warning("criterion.label", "kriter"));
+            }
+            if object.contains_key("puan") {
+                warnings.push(normalize_alias_warning("criterion.points", "puan"));
+            }
+            if object.contains_key("score") {
+                warnings.push(normalize_alias_warning("criterion.points", "score"));
+            }
+            Some(crate::domain::rubric::RubricCriterion {
+                id: uuid::Uuid::new_v4().to_string(),
+                label,
+                description,
+                points,
+            })
+        })
+        .collect();
+
+    (criteria, warnings)
+}
+
+fn parse_rubric_model_response(
+    raw: &str,
+) -> Result<crate::domain::model::RubricImportPayload, AppError> {
+    let cleaned = strip_reasoning_and_fences(raw);
+    let candidate = cleaned
+        .trim_start()
+        .char_indices()
+        .find(|(_, ch)| *ch == '{' || *ch == '[')
+        .and_then(|(start_index, _)| {
+            extract_balanced_json_from_start(cleaned.trim_start(), start_index)
+        })
+        .unwrap_or_else(|| cleaned.clone());
+    let value: serde_json::Value = match serde_json::from_str(&candidate) {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(payload) = parse_partial_rubric_questions(&candidate) {
+                return Ok(payload);
+            }
+            return Err(app_error(
+                AppErrorCode::RubricJsonParseFailed,
+                "Rubrik JSON çıktısı çözülemedi.",
+                Some(format!(
+                    "JSON Parse Error: {}\nCandidate: {}\nRaw output received: {}",
+                    error, candidate, raw
+                )),
+                Some("Model çıktısını strict JSON olarak tekrar isteyin.".to_string()),
+            ));
+        }
+    };
+
+    let questions_value = match value {
+        serde_json::Value::Object(mut object) => object.remove("questions").ok_or_else(|| {
+            app_error(
+                AppErrorCode::RubricSchemaValidationFailed,
+                "Rubrik JSON şeması beklenen alanları içermiyor.",
+                Some("Missing `questions` field".to_string()),
+                Some("Model output schema is incomplete.".to_string()),
+            )
+        })?,
+        serde_json::Value::Array(array) => serde_json::Value::Array(array),
+        other => {
+            return Err(app_error(
+                AppErrorCode::RubricSchemaValidationFailed,
+                "Rubrik JSON kök nesnesi beklenen biçimde değil.",
+                Some(format!("root={other}")),
+                Some("Model output schema is invalid.".to_string()),
+            ))
+        }
+    };
+
+    let items = questions_value.as_array().ok_or_else(|| {
+        app_error(
+            AppErrorCode::RubricSchemaValidationFailed,
+            "`questions` alanı bir liste olmalıdır.",
+            Some(format!("questions={questions_value}")),
+            Some("Model output schema is invalid.".to_string()),
+        )
+    })?;
+
+    let mut questions = Vec::new();
+    for item in items {
+        questions.push(parse_rubric_question_item(item, &[])?);
+    }
+
+    if questions.is_empty() {
+        return Err(app_error(
+            AppErrorCode::RubricSchemaValidationFailed,
+            "Rubrik JSON çıktısında geçerli soru bulunamadı.",
+            Some(candidate),
+            Some("Model output schema is invalid.".to_string()),
+        ));
+    }
+
+    Ok(crate::domain::model::RubricImportPayload { questions })
+}
+
+struct StudentAnswerOcrParseOutcome {
+    output: crate::domain::model::StudentAnswerOcrOutput,
+    parsed_json: Option<serde_json::Value>,
+    parse_error: Option<String>,
+    salvaged_answer_text: Option<String>,
+    parse_strategy: String,
+    printed_text_mixed: bool,
+    printed_question_leak_detected: bool,
+}
+
+struct StudentAnswerOcrIssueCorrectionParseOutcome {
+    output: StudentAnswerOcrIssueCorrectionOutput,
+    parsed_json: Option<serde_json::Value>,
+    parse_error: Option<String>,
+}
+
+struct StudentIdentityOcrParseOutcome {
+    output: StudentIdentityOcrOutput,
+    parsed_json: Option<serde_json::Value>,
+    parse_error: Option<String>,
+    parse_strategy: String,
+}
+
+struct ScoringParseOutcome {
+    output: ScoringOutput,
+    parsed_json: Option<serde_json::Value>,
+    parse_error: Option<String>,
+    salvaged_rationale: Option<String>,
+    parse_strategy: String,
+}
+
+fn parse_student_identity_ocr_output(raw: &str) -> StudentIdentityOcrParseOutcome {
+    let cleaned = strip_reasoning_and_fences(raw);
+    let candidate = extract_first_balanced_json_candidate(&cleaned).unwrap_or(cleaned);
+    let parsed = serde_json::from_str::<serde_json::Value>(&candidate);
+    match parsed {
+        Ok(value) => {
+            let display_name = optional_string_field(&value, "displayName");
+            let number = optional_string_field(&value, "number");
+            let class_name = optional_string_field(&value, "className");
+            let confidence = value
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let mut warnings = string_array_field(&value, "warnings");
+            if display_name.is_none() && number.is_none() {
+                warnings.push("identity_name_or_number_missing".to_string());
+            }
+            let needs_review = value
+                .get("needsReview")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false)
+                || display_name.is_none() && number.is_none();
+            StudentIdentityOcrParseOutcome {
+                output: StudentIdentityOcrOutput {
+                    display_name,
+                    number,
+                    class_name,
+                    confidence,
+                    needs_review,
+                    warnings,
+                },
+                parsed_json: Some(value),
+                parse_error: None,
+                parse_strategy: "json".to_string(),
+            }
+        }
+        Err(error) => StudentIdentityOcrParseOutcome {
+            output: StudentIdentityOcrOutput {
+                display_name: None,
+                number: None,
+                class_name: None,
+                confidence: 0.0,
+                needs_review: true,
+                warnings: vec!["identity_ocr_json_parse_failed".to_string()],
+            },
+            parsed_json: None,
+            parse_error: Some(error.to_string()),
+            parse_strategy: "parse_failed".to_string(),
+        },
+    }
+}
+
+fn optional_string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn string_array_field(value: &serde_json::Value, field: &str) -> Vec<String> {
+    value
+        .get(field)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalize_ocr_warning_code(code: &str) -> String {
+    match code {
+        "ocr_critical_keyword_uncertain" | "critical_keyword_ocr_uncertain" => {
+            CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+fn uncertain_spans_field(value: &serde_json::Value) -> Vec<OcrUncertainSpan> {
+    value
+        .get("uncertainSpans")
+        .or_else(|| value.get("uncertain_spans"))
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let text = optional_string_field(item, "text")
+                        .or_else(|| optional_string_field(item, "value"))
+                        .unwrap_or_default();
+                    if text.trim().is_empty() {
+                        return None;
+                    }
+                    let alternatives = object
+                        .get("alternatives")
+                        .or_else(|| object.get("alternativeTexts"))
+                        .or_else(|| object.get("alternative_texts"))
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str().map(str::trim))
+                                .filter(|value| !value.is_empty())
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let confidence = object
+                        .get("confidence")
+                        .and_then(|value| value.as_f64())
+                        .map(|value| value.clamp(0.0, 1.0) as f32);
+                    let reason = optional_string_field(item, "reason")
+                        .or_else(|| optional_string_field(item, "explanation"))
+                        .unwrap_or_else(|| "critical_term_uncertain".to_string());
+                    let _warning_code = object
+                        .get("warningCode")
+                        .or_else(|| object.get("warning_code"))
+                        .and_then(|value| value.as_str())
+                        .map(normalize_ocr_warning_code)
+                        .unwrap_or_else(|| CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING.to_string());
+                    Some(OcrUncertainSpan {
+                        text,
+                        start: object
+                            .get("start")
+                            .or_else(|| object.get("startIndex"))
+                            .or_else(|| object.get("start_index"))
+                            .and_then(|value| value.as_u64())
+                            .map(|value| value as usize),
+                        end: object
+                            .get("end")
+                            .or_else(|| object.get("endIndex"))
+                            .or_else(|| object.get("end_index"))
+                            .and_then(|value| value.as_u64())
+                            .map(|value| value as usize),
+                        alternatives,
+                        confidence,
+                        reason,
+                        highlight_region: highlight_region_field(object),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn suggested_corrections_field(value: &serde_json::Value) -> Vec<OcrSuggestedCorrection> {
+    value
+        .get("suggestedCorrections")
+        .or_else(|| value.get("suggested_corrections"))
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let original_text = optional_string_field(item, "originalText")
+                        .or_else(|| optional_string_field(item, "original_text"))
+                        .unwrap_or_default();
+                    let suggested_text = optional_string_field(item, "suggestedText")
+                        .or_else(|| optional_string_field(item, "suggested_text"))
+                        .unwrap_or_default();
+                    if original_text.trim().is_empty() || suggested_text.trim().is_empty() {
+                        return None;
+                    }
+                    let reason = optional_string_field(item, "reason")
+                        .or_else(|| optional_string_field(item, "explanation"))
+                        .unwrap_or_else(|| "critical_term_suggestion".to_string());
+                    let confidence = object
+                        .get("confidence")
+                        .and_then(|value| value.as_f64())
+                        .map(|value| value.clamp(0.0, 1.0) as f32);
+                    let applied = object
+                        .get("applied")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    Some(OcrSuggestedCorrection {
+                        original_text,
+                        suggested_text,
+                        reason,
+                        confidence,
+                        applied,
+                        highlight_region: highlight_region_field(object),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn critical_term_warnings_field(value: &serde_json::Value) -> Vec<OcrCriticalTermWarning> {
+    value
+        .get("criticalTermWarnings")
+        .or_else(|| value.get("critical_term_warnings"))
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let observed_text = optional_string_field(item, "observedText")
+                        .or_else(|| optional_string_field(item, "observed_text"))
+                        .unwrap_or_default();
+                    let expected_or_related_term =
+                        optional_string_field(item, "expectedOrRelatedTerm")
+                            .or_else(|| optional_string_field(item, "expected_or_related_term"))
+                            .or_else(|| optional_string_field(item, "expectedTerm"))
+                            .unwrap_or_default();
+                    if observed_text.trim().is_empty() || expected_or_related_term.trim().is_empty()
+                    {
+                        return None;
+                    }
+                    let reason = optional_string_field(item, "reason")
+                        .or_else(|| optional_string_field(item, "explanation"))
+                        .unwrap_or_else(|| "critical_term_uncertain".to_string());
+                    let warning_code = optional_string_field(item, "warningCode")
+                        .or_else(|| optional_string_field(item, "warning_code"))
+                        .map(|value| normalize_ocr_warning_code(&value))
+                        .unwrap_or_else(|| CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING.to_string());
+                    Some(OcrCriticalTermWarning {
+                        observed_text,
+                        expected_or_related_term,
+                        reason,
+                        warning_code,
+                        highlight_region: highlight_region_field(object),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn highlight_region_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<crate::domain::student::StudentAnswerOcrCropBBox> {
+    let region = object
+        .get("highlightRegion")
+        .or_else(|| object.get("highlight_region"))
+        .or_else(|| object.get("bbox"))
+        .or_else(|| object.get("normalizedBBox"))
+        .or_else(|| object.get("normalized_bbox"))?;
+    let region_object = region.as_object()?;
+    let x = region_object.get("x")?.as_f64()?.clamp(0.0, 1.0) as f32;
+    let y = region_object.get("y")?.as_f64()?.clamp(0.0, 1.0) as f32;
+    let width = region_object.get("width")?.as_f64()?.clamp(0.0, 1.0) as f32;
+    let height = region_object.get("height")?.as_f64()?.clamp(0.0, 1.0) as f32;
+    let page_index = region_object
+        .get("pageIndex")
+        .or_else(|| region_object.get("pageIndexWithinSubmission"))
+        .or_else(|| region_object.get("page_index_within_submission"))
+        .or_else(|| region_object.get("page_index"))
+        .and_then(|value| value.as_u64())? as u32;
+
+    Some(crate::domain::student::StudentAnswerOcrCropBBox {
+        x,
+        y,
+        width,
+        height,
+        page_index,
+    })
+}
+
+fn parse_student_answer_ocr_output(raw: &str, question_text: &str) -> StudentAnswerOcrParseOutcome {
+    let raw_text = raw.trim().to_string();
+    let cleaned = strip_reasoning_and_fences(raw);
+    let fenced_candidate = extract_fenced_json_candidate(raw);
+    let balanced_candidate = extract_first_balanced_json_candidate(raw);
+    let attempts = [
+        ("strict_json", raw_text.as_str()),
+        ("fenced_json", fenced_candidate.as_deref().unwrap_or("")),
+        ("trailing_prose_trim", cleaned.as_str()),
+        ("balanced_json", balanced_candidate.as_deref().unwrap_or("")),
+    ];
+
+    for (strategy, candidate) in attempts {
+        if candidate.trim().is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            if let Some(output) = parse_student_answer_ocr_value(
+                value.clone(),
+                candidate,
+                strategy,
+                None,
+                question_text,
+                raw,
+            ) {
+                return output;
+            }
+        }
+    }
+
+    let salvaged_answer_text = salvage_student_answer_text(&cleaned, raw);
+    let printed_question_leak_detected =
+        detect_printed_question_leak(&salvaged_answer_text, question_text);
+    let mut warnings = vec!["ocr_parse_failed".to_string()];
+    if printed_question_leak_detected {
+        warnings.push("printed_question_leak_detected".to_string());
+    }
+    StudentAnswerOcrParseOutcome {
+        output: crate::domain::model::StudentAnswerOcrOutput {
+            answer_text: salvaged_answer_text.clone(),
+            structured_answer: None,
+            confidence: 0.0,
+            uncertain_spans: vec![],
+            suggested_corrections: vec![],
+            critical_term_warnings: vec![],
+            ocr_semantic_warnings: vec!["ocr_parse_failed".to_string()],
+            critical_keyword_uncertain: true,
+            needs_review: true,
+            review_reasons: vec!["parse_failed".to_string()],
+            warnings,
+        },
+        parsed_json: None,
+        parse_error: Some("Öğrenci OCR JSON çıktısı çözülemedi.".to_string()),
+        salvaged_answer_text: Some(salvaged_answer_text),
+        parse_strategy: "raw_text_salvage".to_string(),
+        printed_text_mixed: printed_question_leak_detected,
+        printed_question_leak_detected,
+    }
+}
+
+fn extract_fenced_json_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let (start_idx, fence_len) = if let Some(start_idx) = trimmed.find("```json") {
+        (start_idx, "```json".len())
+    } else if let Some(start_idx) = trimmed.find("```") {
+        (start_idx, "```".len())
+    } else {
+        return None;
+    };
+    let content_after = &trimmed[start_idx + fence_len..];
+    let end_idx = content_after.find("```")?;
+    Some(content_after[..end_idx].trim().to_string())
+}
+
+fn parse_student_answer_ocr_value(
+    value: serde_json::Value,
+    candidate: &str,
+    strategy: &str,
+    parse_error: Option<String>,
+    question_text: &str,
+    raw: &str,
+) -> Option<StudentAnswerOcrParseOutcome> {
+    let object = value.as_object()?;
+    let has_answer_field = object.contains_key("answerText")
+        || object.contains_key("answer_text")
+        || object.contains_key("text")
+        || object.contains_key("answer");
+    let has_confidence_field = object.contains_key("confidence");
+    let has_review_field =
+        object.contains_key("needsReview") || object.contains_key("needs_review");
+
+    let answer_text = object
+        .get("answerText")
+        .or_else(|| object.get("answer_text"))
+        .or_else(|| object.get("text"))
+        .or_else(|| object.get("answer"))
+        .and_then(|value| value.as_str())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| salvage_student_answer_text(candidate, raw));
+    let structured_answer = object
+        .get("structuredAnswer")
+        .or_else(|| object.get("structured_answer"))
+        .cloned()
+        .and_then(|value| if value.is_null() { None } else { Some(value) });
+    let confidence = object
+        .get("confidence")
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+    let mut needs_review = object
+        .get("needsReview")
+        .or_else(|| object.get("needs_review"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut review_reasons = object
+        .get("reviewReasons")
+        .or_else(|| object.get("review_reasons"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(|text| text.trim().to_string()))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut warnings = object
+        .get("warnings")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(|text| text.trim().to_string()))
+                .filter(|text| !text.is_empty())
+                .map(|text| normalize_ocr_warning_code(&text))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let uncertain_spans = uncertain_spans_field(&value);
+    let suggested_corrections = suggested_corrections_field(&value);
+    let critical_term_warnings = critical_term_warnings_field(&value);
+    let mut ocr_semantic_warnings = string_array_field(&value, "ocrSemanticWarnings")
+        .into_iter()
+        .map(|warning| normalize_ocr_warning_code(&warning))
+        .collect::<Vec<_>>();
+    if ocr_semantic_warnings.is_empty() {
+        ocr_semantic_warnings = string_array_field(&value, "ocr_semantic_warnings")
+            .into_iter()
+            .map(|warning| normalize_ocr_warning_code(&warning))
+            .collect();
+    }
+    let critical_keyword_uncertain = object
+        .get("criticalKeywordUncertain")
+        .or_else(|| object.get("critical_keyword_uncertain"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || !uncertain_spans.is_empty()
+        || !suggested_corrections.is_empty()
+        || !critical_term_warnings.is_empty()
+        || !ocr_semantic_warnings.is_empty();
+
+    let scoring_fields_present = object.contains_key("score")
+        || object.contains_key("points")
+        || object.contains_key("criteria")
+        || object.contains_key("awardedScore")
+        || object.contains_key("criterionScores");
+    if scoring_fields_present {
+        warnings.push("ocr_scoring_fields_ignored".to_string());
+        review_reasons.push("ocr_scoring_fields_present".to_string());
+        needs_review = true;
+    }
+    if !has_answer_field || !has_confidence_field || !has_review_field {
+        warnings.push("ocr_schema_incomplete".to_string());
+        review_reasons.push("ocr_schema_incomplete".to_string());
+        needs_review = true;
+    }
+
+    let printed_question_leak_detected = detect_printed_question_leak(&answer_text, question_text);
+    let printed_text_mixed = printed_question_leak_detected || answer_text.trim().is_empty();
+    if printed_question_leak_detected {
+        review_reasons.push("printed_question_leak_detected".to_string());
+        warnings.push("printed_question_leak_detected".to_string());
+        needs_review = true;
+    }
+    if answer_text.trim().is_empty() {
+        review_reasons.push("ocr_answer_empty".to_string());
+        warnings.push("ocr_answer_empty".to_string());
+        needs_review = true;
+    }
+    if answer_text.to_lowercase().contains("[okunamadı]")
+        || answer_text.to_lowercase().contains("[okunamadi]")
+    {
+        review_reasons.push("ocr_unreadable_span".to_string());
+        warnings.push("ocr_unreadable_span".to_string());
+        needs_review = true;
+    }
+    if contains_ocr_commentary(&answer_text) {
+        review_reasons.push("ocr_commentary_detected".to_string());
+        warnings.push("ocr_commentary_detected".to_string());
+        needs_review = true;
+    }
+    if critical_keyword_uncertain {
+        review_reasons.push("critical_keyword_uncertain".to_string());
+        warnings.push(CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING.to_string());
+        if ocr_semantic_warnings.is_empty() {
+            ocr_semantic_warnings.push(CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING.to_string());
+        }
+        needs_review = true;
+    }
+    if parse_error.is_some() {
+        review_reasons.push("parse_failed".to_string());
+        warnings.push("ocr_parse_failed".to_string());
+        needs_review = true;
+    }
+    if confidence < MIN_STUDENT_ANSWER_OCR_CONFIDENCE {
+        review_reasons.push("ocr_low_confidence".to_string());
+        warnings.push("ocr_low_confidence".to_string());
+        needs_review = true;
+    }
+
+    review_reasons.sort();
+    review_reasons.dedup();
+    warnings.sort();
+    warnings.dedup();
+
+    Some(StudentAnswerOcrParseOutcome {
+        output: crate::domain::model::StudentAnswerOcrOutput {
+            answer_text,
+            structured_answer,
+            confidence,
+            uncertain_spans,
+            suggested_corrections,
+            critical_term_warnings,
+            ocr_semantic_warnings,
+            critical_keyword_uncertain,
+            needs_review,
+            review_reasons,
+            warnings,
+        },
+        parsed_json: Some(value),
+        parse_error,
+        salvaged_answer_text: Some(salvage_student_answer_text(candidate, raw)),
+        parse_strategy: strategy.to_string(),
+        printed_text_mixed,
+        printed_question_leak_detected,
+    })
+}
+
+fn contains_ocr_commentary(answer_text: &str) -> bool {
+    let normalized = answer_text.trim().to_lowercase();
+    [
+        "öğrenci burada",
+        "öğrenci şunu",
+        "öğrencinin cevabı",
+        "cevap şu şekildedir",
+        "cevap şudur",
+        "görselde öğrencinin",
+        "buradan anlaşılmaktadır",
+        "demek istemiştir",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
+fn parse_student_answer_issue_correction_output(
+    raw: &str,
+) -> Result<StudentAnswerOcrIssueCorrectionParseOutcome, AppError> {
+    let cleaned = strip_reasoning_and_fences(raw);
+    let candidate = extract_first_balanced_json_candidate(&cleaned).unwrap_or(cleaned.clone());
+    let parsed_json: serde_json::Value = serde_json::from_str(&candidate).map_err(|error| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidJson,
+            "OCR sorun önerisi JSON çıktısı çözülemedi.",
+            Some(format!(
+                "JSON Parse Error: {}\nRaw output received: {}",
+                error, raw
+            )),
+            Some("Prompt çıktısının strict JSON olduğundan emin olun.".to_string()),
+        )
+    })?;
+
+    let mut output: StudentAnswerOcrIssueCorrectionOutput =
+        serde_json::from_value(parsed_json.clone()).map_err(|error| {
+            app_error(
+                AppErrorCode::ModelResponseInvalidSchema,
+                "OCR sorun önerisi JSON şeması beklenen biçimde değil.",
+                Some(format!(
+                    "Schema error: {}\nRaw value: {}",
+                    error, parsed_json
+                )),
+                Some("Model output schema is invalid.".to_string()),
+            )
+        })?;
+
+    output.original_text = output.original_text.trim().to_string();
+    output.context_reason = output.context_reason.trim().to_string();
+    output.visual_reading = output
+        .visual_reading
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    output.suggested_text = output
+        .suggested_text
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    output.warnings.sort();
+    output.warnings.dedup();
+
+    if output.original_text.is_empty() {
+        return Err(app_error(
+            AppErrorCode::ModelResponseInvalidSchema,
+            "`originalText` alanı boş olamaz.",
+            Some(parsed_json.to_string()),
+            Some("Model output schema is invalid.".to_string()),
+        ));
+    }
+    if output.context_reason.is_empty() {
+        return Err(app_error(
+            AppErrorCode::ModelResponseInvalidSchema,
+            "`contextReason` alanı boş olamaz.",
+            Some(parsed_json.to_string()),
+            Some("Model output schema is invalid.".to_string()),
+        ));
+    }
+
+    output.requires_teacher_approval = true;
+
+    let observed_scope = issue_scope_from_text(&output.original_text);
+    if !scope_allows_text(&observed_scope, output.suggested_text.as_deref()) {
+        output.warnings.push("scope_expansion_blocked".to_string());
+        output.decision = StudentAnswerOcrIssueCorrectionDecision::NeedsTeacherReview;
+        output.suggested_text = None;
+    }
+
+    if matches!(
+        output.decision,
+        StudentAnswerOcrIssueCorrectionDecision::NoChange
+    ) {
+        output.suggested_text = None;
+    }
+
+    if matches!(
+        output.decision,
+        StudentAnswerOcrIssueCorrectionDecision::SuggestCorrection
+    ) && output
+        .suggested_text
+        .as_ref()
+        .map(|text| text.trim().is_empty())
+        .unwrap_or(true)
+    {
+        output.warnings.push("issue_context_missing".to_string());
+        output.decision = StudentAnswerOcrIssueCorrectionDecision::NeedsTeacherReview;
+    }
+
+    if output.confidence < 0.3 {
+        output
+            .warnings
+            .push("suggestion_confidence_low".to_string());
+    }
+    output.warnings.sort();
+    output.warnings.dedup();
+
+    Ok(StudentAnswerOcrIssueCorrectionParseOutcome {
+        output,
+        parsed_json: Some(parsed_json),
+        parse_error: None,
+    })
+}
+
+fn salvage_student_answer_text(candidate: &str, raw: &str) -> String {
+    let cleaned = strip_reasoning_and_fences(candidate);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return raw.trim().to_string();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(text) = value
+            .get("answerText")
+            .or_else(|| value.get("answer_text"))
+            .or_else(|| value.get("text"))
+            .or_else(|| value.get("answer"))
+            .and_then(|value| value.as_str())
+        {
+            return text.trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+fn detect_printed_question_leak(answer_text: &str, question_text: &str) -> bool {
+    let answer = normalize_for_similarity(answer_text);
+    let question = normalize_for_similarity(question_text);
+    if answer.is_empty() || question.is_empty() {
+        return false;
+    }
+    if answer == question {
+        return true;
+    }
+    if answer.contains(&question) || question.contains(&answer) {
+        return true;
+    }
+    let answer_tokens = token_set(&answer);
+    let question_tokens = token_set(&question);
+    if answer_tokens.is_empty() || question_tokens.is_empty() {
+        return false;
+    }
+    let common = answer_tokens.intersection(&question_tokens).count() as f32;
+    common / question_tokens.len().max(answer_tokens.len()) as f32 >= 0.75
+}
+
+fn normalize_for_similarity(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+}
+
+fn token_set(text: &str) -> std::collections::BTreeSet<String> {
+    text.split_whitespace()
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn issue_scope_from_text(text: &str) -> StudentAnswerOcrIssueCorrectionScope {
+    if text.split_whitespace().count() <= 1 {
+        StudentAnswerOcrIssueCorrectionScope::SingleWord
+    } else {
+        StudentAnswerOcrIssueCorrectionScope::ShortPhrase
+    }
+}
+
+fn scope_allows_text(
+    scope: &StudentAnswerOcrIssueCorrectionScope,
+    suggested_text: Option<&str>,
+) -> bool {
+    let Some(text) = suggested_text else {
+        return true;
+    };
+    let token_count = text
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .count();
+    match scope {
+        StudentAnswerOcrIssueCorrectionScope::SingleWord => token_count <= 1,
+        StudentAnswerOcrIssueCorrectionScope::ShortPhrase => token_count <= 2,
+    }
+}
+
+fn parse_rubric_question_item(
+    item: &serde_json::Value,
+    extra_warnings: &[&str],
+) -> Result<crate::domain::model::RubricImportQuestion, AppError> {
+    let Some(object) = item.as_object() else {
+        return Err(app_error(
+            AppErrorCode::RubricSchemaValidationFailed,
+            "Rubrik soru girdisi nesne olmalıdır.",
+            Some(format!("item={item}")),
+            Some("Model output schema is invalid.".to_string()),
+        ));
+    };
+
+    let mut warnings = extra_warnings
+        .iter()
+        .map(|warning| warning.to_string())
+        .collect::<Vec<_>>();
+    let number_value = object
+        .get("questionNumber")
+        .or_else(|| object.get("question_number"))
+        .or_else(|| object.get("question_no"))
+        .or_else(|| object.get("questionNo"))
+        .or_else(|| object.get("number"))
+        .or_else(|| object.get("soru_no"));
+    if object.contains_key("question_no") {
+        warnings.push(normalize_alias_warning("questionNumber", "question_no"));
+    }
+    if object.contains_key("question_number") {
+        warnings.push(normalize_alias_warning("questionNumber", "question_number"));
+    }
+    if object.contains_key("soru_no") {
+        warnings.push(normalize_alias_warning("questionNumber", "soru_no"));
+    }
+    let question_number = number_value
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            app_error(
+                AppErrorCode::RubricSchemaValidationFailed,
+                "`questionNumber` alanı eksik veya geçersiz.",
+                Some(format!("item={item}")),
+                Some("Model output schema is invalid.".to_string()),
+            )
+        })? as u32;
+
+    let max_points_value = object
+        .get("maxPoints")
+        .or_else(|| object.get("max_points"))
+        .or_else(|| object.get("maxPoint"))
+        .or_else(|| object.get("max_score"))
+        .or_else(|| object.get("puan"))
+        .or_else(|| object.get("points"))
+        .or_else(|| object.get("score"));
+    if object.contains_key("max_points") {
+        warnings.push(normalize_alias_warning("maxPoints", "max_points"));
+    }
+    if object.contains_key("maxPoint") {
+        warnings.push(normalize_alias_warning("maxPoints", "maxPoint"));
+    }
+    if object.contains_key("max_score") {
+        warnings.push(normalize_alias_warning("maxPoints", "max_score"));
+    }
+    if object.contains_key("puan") {
+        warnings.push(normalize_alias_warning("maxPoints", "puan"));
+    }
+    if object.contains_key("points") {
+        warnings.push(normalize_alias_warning("maxPoints", "points"));
+    }
+    if object.contains_key("score") {
+        warnings.push(normalize_alias_warning("maxPoints", "score"));
+    }
+    let max_points = max_points_value
+        .and_then(|value| value.as_f64())
+        .map(|value| value as f32);
+
+    let expected_answer = object
+        .get("expectedAnswer")
+        .or_else(|| object.get("expected_answer"))
+        .or_else(|| object.get("answer"))
+        .or_else(|| object.get("beklenen_cevap"))
+        .or_else(|| object.get("model_answer"))
+        .or_else(|| object.get("expected"))
+        .and_then(|value| value.as_str())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    if object.contains_key("expected_answer") {
+        warnings.push(normalize_alias_warning("expectedAnswer", "expected_answer"));
+    }
+    if object.contains_key("answer") {
+        warnings.push(normalize_alias_warning("expectedAnswer", "answer"));
+    }
+    if object.contains_key("beklenen_cevap") {
+        warnings.push(normalize_alias_warning("expectedAnswer", "beklenen_cevap"));
+    }
+    if object.contains_key("model_answer") {
+        warnings.push(normalize_alias_warning("expectedAnswer", "model_answer"));
+    }
+    if object.contains_key("rubric") {
+        warnings.push(normalize_alias_warning("criteria", "rubric"));
+    }
+    if object.contains_key("scoring_criteria") {
+        warnings.push(normalize_alias_warning("criteria", "scoring_criteria"));
+    }
+    if object.contains_key("kriterler") {
+        warnings.push(normalize_alias_warning("criteria", "kriterler"));
+    }
+
+    let criteria_value = object
+        .get("criteria")
+        .or_else(|| object.get("rubric"))
+        .or_else(|| object.get("scoring_criteria"))
+        .or_else(|| object.get("kriterler"))
+        .or_else(|| object.get("criteria_list"));
+    let (criteria, criterion_warnings) = if let Some(value) = criteria_value {
+        normalize_rubric_criteria(value)
+    } else {
+        (vec![], vec!["criteria_missing".to_string()])
+    };
+    warnings.extend(criterion_warnings);
+    warnings.extend(
+        object
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|warning| warning.as_str().map(|text| text.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
+
+    let has_meaningful_content = max_points.is_some_and(|points| points > 0.0)
+        || expected_answer
+            .as_ref()
+            .is_some_and(|text| !text.trim().is_empty())
+        || !criteria.is_empty();
+    if !has_meaningful_content {
+        warnings.push("rubric_empty_content".to_string());
+    }
+
+    Ok(crate::domain::model::RubricImportQuestion {
+        question_number,
+        max_points,
+        expected_answer,
+        criteria: criteria
+            .into_iter()
+            .map(|criterion| crate::domain::model::RubricImportCriterion {
+                label: criterion.label,
+                points: criterion.points,
+                description: criterion.description,
+            })
+            .collect(),
+        warnings,
+    })
+}
+
+fn parse_partial_rubric_questions(raw: &str) -> Option<crate::domain::model::RubricImportPayload> {
+    let questions_key = raw.find("\"questions\"")?;
+    let array_start = raw[questions_key..].find('[')? + questions_key;
+    let mut questions = Vec::new();
+    let mut object_start = None;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (relative_index, ch) in raw[array_start + 1..].char_indices() {
+        let index = array_start + 1 + relative_index;
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    object_start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start) = object_start.take() {
+                        if let Ok(value) =
+                            serde_json::from_str::<serde_json::Value>(&raw[start..=index])
+                        {
+                            if let Ok(question) = parse_rubric_question_item(
+                                &value,
+                                &[
+                                    "partial_model_json_recovered",
+                                    "model_response_truncated_or_incomplete_json",
+                                ],
+                            ) {
+                                questions.push(question);
+                            }
+                        }
+                    }
+                }
+            }
+            ']' if depth == 0 => break,
+            _ => {}
+        }
+    }
+
+    if questions.is_empty() {
+        None
+    } else {
+        Some(crate::domain::model::RubricImportPayload { questions })
+    }
+}
+
+fn rubric_payload_to_output(
+    payload: crate::domain::model::RubricImportPayload,
+) -> RubricExtractionOutput {
+    let questions = payload
+        .questions
+        .into_iter()
+        .map(|question| {
+            let criteria = question
+                .criteria
+                .into_iter()
+                .map(|criterion| crate::domain::rubric::RubricCriterion {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    label: criterion.label,
+                    description: criterion.description,
+                    points: criterion.points,
+                })
+                .collect();
+
+            ExtractedRubricCandidate {
+                number: question.question_number,
+                max_points: question.max_points,
+                expected_answer: question.expected_answer,
+                criteria,
+                confidence: 1.0,
+                warnings: question.warnings,
+            }
+        })
+        .collect();
+
+    RubricExtractionOutput {
+        questions,
+        document_warnings: vec![],
+    }
+}
+
+fn remove_think_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        let after_start = &remaining[start + "<think>".len()..];
+        if let Some(end) = after_start.find("</think>") {
+            remaining = &after_start[end + "</think>".len()..];
+        } else {
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    result
+}
+
+fn parse_question_text_output(text: &str) -> Result<QuestionTextExtractionOutput, AppError> {
+    let cleaned = strip_reasoning_and_fences(text);
+    let candidate =
+        extract_first_balanced_json_candidate(&cleaned).unwrap_or_else(|| cleaned.clone());
+    let value: serde_json::Value = serde_json::from_str(&candidate).map_err(|error| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidJson,
+            "Soru metni JSON çıktısı çözülemedi.",
+            Some(format!(
+                "JSON Parse Error: {}\nRaw output received: {}",
+                error, text
+            )),
+            Some("Prompt çıktısının strict JSON olduğundan emin olun.".to_string()),
+        )
+    })?;
+
+    let questions_value = match &value {
+        serde_json::Value::Object(object) => object.get("questions").ok_or_else(|| {
+            app_error(
+                AppErrorCode::ModelResponseInvalidSchema,
+                "Soru metni JSON şeması beklenen alanları içermiyor.",
+                Some("Missing `questions` field".to_string()),
+                Some("Model output schema is incomplete.".to_string()),
+            )
+        })?,
+        serde_json::Value::Array(_) => &value,
+        other => {
+            return Err(app_error(
+                AppErrorCode::ModelResponseInvalidSchema,
+                "Soru metni JSON kök nesnesi beklenen biçimde değil.",
+                Some(format!("root={other}")),
+                Some("Model output schema is invalid.".to_string()),
+            ))
+        }
+    };
+    let questions_array = questions_value.as_array().ok_or_else(|| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidSchema,
+            "`questions` alanı bir liste olmalıdır.",
+            Some(format!("questions={questions_value}")),
+            Some("Model output schema is invalid.".to_string()),
+        )
+    })?;
+
+    let mut questions = Vec::new();
+    for item in questions_array {
+        let item_object = item.as_object().ok_or_else(|| {
+            app_error(
+                AppErrorCode::ModelResponseInvalidSchema,
+                "Soru girdisi nesne olmalıdır.",
+                Some(format!("item={item}")),
+                Some("Model output schema is invalid.".to_string()),
+            )
+        })?;
+
+        let number = item_object
+            .get("number")
+            .or_else(|| item_object.get("questionNumber"))
+            .or_else(|| item_object.get("question_number"))
+            .or_else(|| item_object.get("soru_no"))
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                app_error(
+                    AppErrorCode::ModelResponseInvalidSchema,
+                    "`number` alanı eksik veya geçersiz.",
+                    Some(format!("item={item}")),
+                    Some("Model output schema is invalid.".to_string()),
+                )
+            })? as u32;
+        let question_text = item_object
+            .get("question_text")
+            .or_else(|| item_object.get("questionText"))
+            .or_else(|| item_object.get("text"))
+            .or_else(|| item_object.get("soru"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                app_error(
+                    AppErrorCode::ModelResponseInvalidSchema,
+                    "`question_text` alanı eksik veya geçersiz.",
+                    Some(format!("item={item}")),
+                    Some("Model output schema is invalid.".to_string()),
+                )
+            })?;
+        if number == 0 || question_text.trim().is_empty() {
+            return Err(app_error(
+                AppErrorCode::ModelResponseInvalidSchema,
+                "Soru girdisi boş veya geçersiz.",
+                Some(format!("item={item}")),
+                Some("Model output schema is invalid.".to_string()),
+            ));
+        }
+
+        let confidence = item_object
+            .get("confidence")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.5) as f32;
+        let warnings = item_object
+            .get("warnings")
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|warning| warning.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        questions.push(ExtractedQuestionCandidate {
+            number,
+            question_text: question_text.to_string(),
+            confidence,
+            warnings,
+        });
+    }
+
+    if questions.is_empty() {
+        return Err(app_error(
+            AppErrorCode::ModelResponseInvalidSchema,
+            "Soru metni çıktısında geçerli soru bulunamadı.",
+            Some(text.to_string()),
+            Some("Model output schema is invalid.".to_string()),
+        ));
+    }
+
+    let page_warnings = value
+        .as_object()
+        .and_then(|object| object.get("page_warnings"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|warning| warning.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(QuestionTextExtractionOutput {
+        questions,
+        page_warnings,
+    })
+}
+
+fn map_transport_error(error: reqwest::Error, url: &str) -> AppError {
+    let err_str = error.to_string();
+    let code = if error.is_timeout() {
+        AppErrorCode::ModelTimeout
+    } else if error.is_connect() {
+        AppErrorCode::ModelServerNotRunning
+    } else if err_str.contains("connection reset") || err_str.contains("Connection reset") {
+        AppErrorCode::ModelConnectionReset
+    } else {
+        AppErrorCode::ModelHealthFailed
+    };
+
+    app_error(
+        code,
+        "Model sunucusuna erişilemedi.",
+        Some(format!("{url}: {error}")),
+        Some("llama-server durumunu kontrol edin.".to_string()),
+    )
+}
+
+fn build_payload_summary(
+    prompt_length: u32,
+    timeout_seconds: u64,
+    model_input_images: Option<&[crate::domain::model::ModelInputImage]>,
+    fallback_image_bytes: Option<u64>,
+    max_tokens: Option<u32>,
+) -> ModelRequestPayloadSummary {
+    let images: Vec<crate::domain::model::ModelInputImage> =
+        model_input_images.unwrap_or_default().to_vec();
+    let image_total_bytes = if images.is_empty() {
+        fallback_image_bytes.unwrap_or_default()
+    } else {
+        images.iter().map(|image| image.output_bytes).sum()
+    };
+    let base64_approx_total_bytes = if images.is_empty() {
+        if let Some(bytes) = fallback_image_bytes {
+            bytes.div_ceil(3) * 4
+        } else {
+            0
+        }
+    } else {
+        images.iter().map(|image| image.base64_approx_bytes).sum()
+    };
+    let image_count = if images.is_empty() {
+        if fallback_image_bytes.is_some() {
+            1
+        } else {
+            0
+        }
+    } else {
+        images.len() as u32
+    };
+    ModelRequestPayloadSummary {
+        prompt_length,
+        image_count,
+        image_total_bytes,
+        base64_approx_total_bytes,
+        model_input_images: images,
+        timeout_seconds,
+        max_tokens,
+    }
+}
+
+fn app_error(
+    code: AppErrorCode,
+    message: &str,
+    technical_details: Option<String>,
+    suggested_action: Option<String>,
+) -> AppError {
+    AppError {
+        code,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action,
+        technical_details,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn json_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn json_number(value: &serde_json::Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.trim().parse::<f64>().ok())
+    })
+}
+
+fn object_text(object: &serde_json::Map<String, serde_json::Value>, names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(json_text))
+        .unwrap_or_default()
+}
+
+fn object_number(object: &serde_json::Map<String, serde_json::Value>, names: &[&str]) -> f32 {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(json_number))
+        .unwrap_or(0.0) as f32
+}
+
+fn object_evidence(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    for name in ["evidenceQuote", "evidence_quote", "quote", "evidence"] {
+        let Some(value) = object.get(name) else {
+            continue;
+        };
+        if let Some(text) = json_text(value) {
+            return Some(text);
+        }
+        if let Some(item) = value.as_object() {
+            let text = object_text(item, &["quote", "text", "evidence"]);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        if let Some(items) = value.as_array() {
+            if let Some(text) = items.iter().find_map(json_text) {
+                return Some(text);
+            }
+            if let Some(text) = items.iter().find_map(|item| {
+                item.as_object()
+                    .map(|item| object_text(item, &["quote", "text", "evidence"]))
+                    .filter(|text| !text.is_empty())
+            }) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
+    let cleaned = strip_reasoning_and_fences(raw);
+    let candidate = extract_first_balanced_json_candidate(&cleaned).unwrap_or(cleaned.clone());
+    match serde_json::from_str::<serde_json::Value>(&candidate) {
+        Ok(value) => {
+            let awarded_score = value
+                .as_object()
+                .map(|object| object_number(object, &["awardedScore", "awarded_score", "score"]))
+                .unwrap_or(0.0);
+            let confidence = value
+                .get("confidence")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0) as f32;
+            let criterion_scores = value
+                .get("criterionScores")
+                .or_else(|| value.get("criteria"))
+                .or_else(|| value.get("scoringCriteria"))
+                .or_else(|| value.get("scores"))
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let object = item.as_object()?;
+                            let criterion_id = object_text(
+                                object,
+                                &[
+                                    "criterionId",
+                                    "criterion_id",
+                                    "id",
+                                    "criterion",
+                                    "criterionName",
+                                    "criterion_name",
+                                ],
+                            );
+                            let criterion_title = object_text(
+                                object,
+                                &[
+                                    "criterionTitle",
+                                    "criterion_title",
+                                    "title",
+                                    "label",
+                                    "criterion",
+                                    "criterionName",
+                                    "criterion_name",
+                                    "name",
+                                ],
+                            );
+                            let criterion_max_score = object_number(
+                                object,
+                                &[
+                                    "criterionMaxScore",
+                                    "criterion_max_score",
+                                    "maxScore",
+                                    "max_score",
+                                    "points",
+                                ],
+                            );
+                            let criterion_awarded_score = object_number(
+                                object,
+                                &["awardedScore", "awarded_score", "score", "points"],
+                            );
+                            let rationale = object_text(
+                                object,
+                                &["rationale", "reason", "explanation", "feedback"],
+                            );
+                            let evidence_quote = object_evidence(object);
+                            if criterion_id.is_empty() && criterion_title.is_empty() {
+                                return None;
+                            }
+                            Some(ScoringCriterionScore {
+                                criterion_id,
+                                criterion_title,
+                                criterion_max_score,
+                                awarded_score: criterion_awarded_score,
+                                rationale,
+                                evidence_quote,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let rationale = value
+                .get("rationale")
+                .or_else(|| value.get("feedback"))
+                .or_else(|| value.get("explanation"))
+                .or_else(|| value.get("reason"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let warnings = string_array_field(&value, "warnings");
+            let parse_strategy = if value.get("criterionScores").is_some() {
+                "criterion_scores"
+            } else if value.get("criteria").is_some() {
+                "criteria"
+            } else if value.get("scores").is_some() {
+                "scores"
+            } else {
+                "fallback"
+            }
+            .to_string();
+
+            let schema_error = scoring_schema_error(&value, max_score);
+            ScoringParseOutcome {
+                output: ScoringOutput {
+                    awarded_score,
+                    confidence,
+                    rationale: rationale.clone(),
+                    teacher_visible_explanation: rationale.clone(),
+                    needs_review: value
+                        .get("needsReview")
+                        .or_else(|| value.get("needs_review"))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                        || rationale.is_empty()
+                        || criterion_scores.is_empty()
+                        || schema_error.is_some(),
+                    warnings,
+                    criterion_scores,
+                },
+                parsed_json: Some(value),
+                parse_error: schema_error,
+                salvaged_rationale: if rationale.is_empty() {
+                    None
+                } else {
+                    Some(rationale)
+                },
+                parse_strategy,
+            }
+        }
+        Err(error) => ScoringParseOutcome {
+            output: ScoringOutput {
+                awarded_score: 0.0,
+                confidence: 0.0,
+                rationale: String::new(),
+                teacher_visible_explanation: String::new(),
+                needs_review: true,
+                warnings: vec!["scoring_json_parse_failed".to_string()],
+                criterion_scores: vec![],
+            },
+            parsed_json: None,
+            parse_error: Some(error.to_string()),
+            salvaged_rationale: None,
+            parse_strategy: "parse_failed".to_string(),
+        },
+    }
+}
+
+fn scoring_schema_error(value: &serde_json::Value, max_score: f32) -> Option<String> {
+    let Some(object) = value.as_object() else {
+        return Some("Notlandırma çıktısı JSON nesnesi değil.".to_string());
+    };
+    let mut missing = Vec::new();
+    for (canonical_name, aliases) in [
+        (
+            "awardedScore",
+            &["awardedScore", "awarded_score", "score"][..],
+        ),
+        ("confidence", &["confidence"][..]),
+        (
+            "rationale",
+            &["rationale", "feedback", "explanation", "reason"][..],
+        ),
+        (
+            "criterionScores",
+            &["criterionScores", "criteria", "scoringCriteria", "scores"][..],
+        ),
+    ] {
+        if !aliases.iter().any(|alias| object.contains_key(*alias)) {
+            missing.push(canonical_name);
+        }
+    }
+    if !missing.is_empty() {
+        return Some(format!(
+            "Notlandırma şeması eksik alan içeriyor: {}",
+            missing.join(",")
+        ));
+    }
+    let awarded_score = object
+        .get("awardedScore")
+        .or_else(|| object.get("awarded_score"))
+        .or_else(|| object.get("score"))
+        .and_then(json_number);
+    if awarded_score.map_or(true, |score| {
+        !score.is_finite() || score < 0.0 || score > max_score as f64
+    }) {
+        return Some("Notlandırma toplam puanı geçerli aralıkta değil.".to_string());
+    }
+    let confidence = object.get("confidence").and_then(|value| value.as_f64());
+    if confidence.map_or(true, |value| {
+        !value.is_finite() || !(0.0..=1.0).contains(&value)
+    }) {
+        return Some("Notlandırma güven değeri 0..1 aralığında değil.".to_string());
+    }
+    if let Some(nr) = object
+        .get("needsReview")
+        .or_else(|| object.get("needs_review"))
+    {
+        if !nr.is_boolean() {
+            return Some("Notlandırma needsReview alanı boolean değil.".to_string());
+        }
+    }
+    let criteria_value = object
+        .get("criterionScores")
+        .or_else(|| object.get("criteria"))
+        .or_else(|| object.get("scoringCriteria"))
+        .or_else(|| object.get("scores"));
+    if !criteria_value.is_some_and(|value| value.is_array()) {
+        return Some("Notlandırma criterionScores alanı dizi değil.".to_string());
+    }
+    if let Some(criteria) = criteria_value.and_then(|value| value.as_array()) {
+        for (index, criterion) in criteria.iter().enumerate() {
+            let Some(criterion) = criterion.as_object() else {
+                return Some(format!("Notlandırma kriteri {index} JSON nesnesi değil."));
+            };
+            for (field, aliases) in [
+                (
+                    "criterionId",
+                    &[
+                        "criterionId",
+                        "criterion_id",
+                        "id",
+                        "criterion",
+                        "criterionName",
+                        "criterion_name",
+                    ][..],
+                ),
+                (
+                    "criterionTitle",
+                    &[
+                        "criterionTitle",
+                        "criterion_title",
+                        "title",
+                        "label",
+                        "criterion",
+                        "criterionName",
+                        "criterion_name",
+                        "name",
+                    ][..],
+                ),
+                (
+                    "criterionMaxScore",
+                    &[
+                        "criterionMaxScore",
+                        "criterion_max_score",
+                        "maxScore",
+                        "max_score",
+                        "points",
+                    ][..],
+                ),
+                (
+                    "awardedScore",
+                    &["awardedScore", "awarded_score", "score", "points"][..],
+                ),
+                (
+                    "rationale",
+                    &["rationale", "reason", "explanation", "feedback"][..],
+                ),
+                (
+                    "evidenceQuote",
+                    &["evidenceQuote", "evidence_quote", "quote", "evidence"][..],
+                ),
+            ] {
+                if !aliases.iter().any(|alias| criterion.contains_key(*alias)) {
+                    return Some(format!(
+                        "Notlandırma kriteri {index} eksik alan içeriyor: {field}"
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    fn spawn_test_server(
+        response_health: &'static str,
+        response_completion: &'static str,
+    ) -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("failed to bind test server: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(stream) => stream,
+                    Err(_) => break,
+                };
+                handle_stream(&mut stream, response_health, response_completion);
+            }
+        });
+        Some(format!("http://{}", addr))
+    }
+
+    fn handle_stream(stream: &mut TcpStream, health: &str, completion: &str) {
+        let mut buffer = [0u8; 2048];
+        let _ = stream.read(&mut buffer);
+        let request = String::from_utf8_lossy(&buffer);
+        let body = if request.contains("/health") {
+            health
+        } else {
+            completion
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+
+    #[test]
+    fn test_server_unavailable() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let gateway = LlamaServerGateway::new("http://127.0.0.1:59999".to_string());
+            let status = gateway.probe_server().await.unwrap();
+            assert!(!status.server_running);
+            assert!(!status.health_ok);
+        });
+    }
+
+    #[test]
+    fn test_health_and_completion_probe() {
+        let base_url = match spawn_test_server(
+            r#"{"status":"ok"}"#,
+            r#"{"choices":[{"message":{"content":"OK"}}]}"#,
+        ) {
+            Some(base_url) => base_url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let gateway = LlamaServerGateway::new(base_url);
+            let status = gateway.probe_server().await.unwrap();
+            assert!(status.server_running);
+            assert!(status.health_ok);
+            assert!(status.completion_probe_ok);
+        });
+    }
+
+    #[test]
+    fn test_parse_question_text_output_requires_schema() {
+        let err = parse_question_text_output(r#"{"page_warnings":[]}"#).unwrap_err();
+        assert_eq!(err.code, AppErrorCode::ModelResponseInvalidSchema);
+    }
+
+    #[test]
+    fn test_parse_question_text_output_handles_valid_payload() {
+        let output = parse_question_text_output(
+            r#"{"questions":[{"number":1,"question_text":"Question 1","confidence":0.8,"warnings":["low_confidence"]}],"page_warnings":["page_1"]}"#,
+        )
+        .expect("output");
+        assert_eq!(output.questions.len(), 1);
+        assert_eq!(output.questions[0].number, 1);
+        assert_eq!(output.page_warnings, vec!["page_1".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_question_text_output_handles_fenced_alias_payload() {
+        let output = parse_question_text_output(
+            "Açıklama\n```json\n[{\"soru_no\":6,\"questionText\":\"S6. Son soru\",\"confidence\":0.9,\"warnings\":[]}]\n```",
+        )
+        .expect("output");
+
+        assert_eq!(output.questions.len(), 1);
+        assert_eq!(output.questions[0].number, 6);
+        assert_eq!(output.questions[0].question_text, "S6. Son soru");
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_ignores_scoring_fields() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"Cevap","structuredAnswer":{"kind":"text"},"confidence":0.84,"needsReview":true,"reviewReasons":["handwriting"],"warnings":["layout"],"score":10,"points":12,"criteria":[{"label":"x"}]}"#,
+            "Soru metni",
+        );
+        let output = outcome.output;
+
+        assert_eq!(output.answer_text, "Cevap");
+        assert_eq!(output.confidence, 0.84);
+        assert!(output.structured_answer.is_some());
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning == "ocr_scoring_fields_ignored"));
+        assert!(output.needs_review);
+        assert!(output
+            .review_reasons
+            .iter()
+            .any(|reason| reason == "ocr_scoring_fields_present"));
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_flags_commentary_instead_of_accepting_it() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"Öğrencinin cevabı burada enerji dönüşümünü anlatmaktadır.","confidence":0.95,"needsReview":false,"reviewReasons":[],"warnings":[]}"#,
+            "Enerji dönüşümünü açıklayınız.",
+        );
+        assert!(outcome.output.needs_review);
+        assert!(outcome
+            .output
+            .review_reasons
+            .contains(&"ocr_commentary_detected".to_string()));
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_flags_incomplete_contract() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"yalnızca görülen metin"}"#,
+            "Soru metni",
+        );
+        assert!(outcome.output.needs_review);
+        assert!(outcome
+            .output
+            .review_reasons
+            .contains(&"ocr_schema_incomplete".to_string()));
+    }
+
+    #[test]
+    fn test_parse_scoring_output_normalizes_numeric_ids_and_common_aliases() {
+        let outcome = parse_scoring_output(
+            r#"{
+              "scores": [
+                {
+                  "criterionId": 1,
+                  "label": "Konuya uygunluk, içerik ve ana düşünce",
+                  "maxScore": "20",
+                  "score": "18",
+                  "feedback": "Konu açıkça ele alınmış.",
+                  "evidence": [{"quote": "Bugün bu konu hakkında düşünüyorum."}]
+                }
+              ],
+              "score": "18",
+              "confidence": 0.9,
+              "rationale": "Kanıtlı değerlendirme."
+            }"#,
+            50.0,
+        );
+        assert!(outcome.parse_error.is_none());
+        assert_eq!(outcome.output.criterion_scores.len(), 1);
+        assert_eq!(outcome.output.criterion_scores[0].criterion_id, "1");
+        assert_eq!(
+            outcome.output.criterion_scores[0].criterion_title,
+            "Konuya uygunluk, içerik ve ana düşünce"
+        );
+        assert_eq!(outcome.output.criterion_scores[0].awarded_score, 18.0);
+        assert_eq!(
+            outcome.output.criterion_scores[0].evidence_quote.as_deref(),
+            Some("Bugün bu konu hakkında düşünüyorum.")
+        );
+    }
+
+    #[test]
+    fn test_parse_scoring_output_preserves_evidence_quote() {
+        let outcome = parse_scoring_output(
+            r#"{"awardedScore":2,"confidence":0.88,"needsReview":false,"rationale":"Kanıt kriteri destekliyor.","criterionScores":[{"criterionId":"c1","criterionTitle":"Kavram","criterionMaxScore":2,"awardedScore":2,"rationale":"Kavram açıkça yazılmış.","evidenceQuote":"ısı enerjisine dönüşür"}],"warnings":[]}"#,
+            2.0,
+        );
+        assert!(outcome.parse_error.is_none());
+        assert_eq!(
+            outcome.output.criterion_scores[0].evidence_quote.as_deref(),
+            Some("ısı enerjisine dönüşür")
+        );
+    }
+
+    #[test]
+    fn test_parse_scoring_output_rejects_missing_required_schema_fields() {
+        let outcome = parse_scoring_output(r#"{"awardedScore":0,"criterionScores":[]}"#, 10.0);
+        assert!(outcome.parse_error.is_some());
+        assert!(outcome.output.needs_review);
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_parses_uncertainty_metadata() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"çelişen sözcük kullanımı","confidence":0.73,"uncertainSpans":[{"text":"çelişen","start":0,"end":8,"alternatives":["gelişen"],"confidence":0.41,"reason":"handwriting_ambiguity","highlightRegion":{"x":0.1,"y":0.2,"width":0.3,"height":0.1,"pageIndex":0}}],"suggestedCorrections":[{"originalText":"çelişen","suggestedText":"gelişen","reason":"near_match","confidence":0.41,"applied":false,"highlightRegion":{"x":0.2,"y":0.3,"width":0.2,"height":0.1,"pageIndex":0}}],"criticalTermWarnings":[{"observedText":"çelişen sözcük kullanımı","expectedOrRelatedTerm":"gelişen sözcük kullanımı","reason":"semantic_confusion","warningCode":"critical_keyword_ocr_uncertain","highlightRegion":{"x":0.15,"y":0.35,"width":0.4,"height":0.12,"pageIndex":0}}],"ocrSemanticWarnings":["critical_keyword_ocr_uncertain"],"criticalKeywordUncertain":true,"reviewReasons":[],"warnings":[]}"#,
+            "Soru metni",
+        );
+
+        assert!(outcome.output.critical_keyword_uncertain);
+        assert_eq!(outcome.output.uncertain_spans.len(), 1);
+        assert_eq!(outcome.output.suggested_corrections.len(), 1);
+        assert_eq!(outcome.output.critical_term_warnings.len(), 1);
+        assert!(outcome.output.uncertain_spans[0].highlight_region.is_some());
+        assert!(outcome.output.suggested_corrections[0]
+            .highlight_region
+            .is_some());
+        assert!(outcome.output.critical_term_warnings[0]
+            .highlight_region
+            .is_some());
+        assert!(outcome
+            .output
+            .review_reasons
+            .iter()
+            .any(|reason| reason == "critical_keyword_uncertain"));
+        assert!(outcome.output.warnings.iter().any(|warning| {
+            warning == "critical_keyword_ocr_uncertain"
+                || warning == "ocr_critical_keyword_uncertain"
+        }));
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_forces_review_below_confidence_threshold() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"Belirsiz el yazısı","confidence":0.41,"needsReview":false,"reviewReasons":[],"warnings":[]}"#,
+            "Soru metni",
+        );
+
+        assert!(outcome.output.needs_review);
+        assert!(outcome
+            .output
+            .review_reasons
+            .iter()
+            .any(|reason| reason == "ocr_low_confidence"));
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_handles_fenced_json() {
+        let outcome = parse_student_answer_ocr_output(
+            "Açıklama\n```json\n{\"answerText\":\"Cevap\",\"reviewReasons\":[],\"warnings\":[]}\n```",
+            "Soru metni",
+        );
+
+        assert_eq!(outcome.output.answer_text, "Cevap");
+        assert_eq!(outcome.parse_strategy, "fenced_json");
+        assert!(outcome.parse_error.is_none());
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_handles_trailing_prose() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"Cevap","reviewReasons":[],"warnings":[]} açıklama fazlası"#,
+            "Soru metni",
+        );
+
+        assert_eq!(outcome.output.answer_text, "Cevap");
+        assert_eq!(outcome.parse_strategy, "trailing_prose_trim");
+        assert!(outcome.parse_error.is_none());
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_salvages_raw_text_on_malformed_json() {
+        let outcome = parse_student_answer_ocr_output("```json\n{broken\n```", "Soru metni");
+
+        assert_eq!(outcome.parse_strategy, "raw_text_salvage");
+        assert!(outcome.parse_error.is_some());
+        assert_eq!(outcome.salvaged_answer_text.as_deref(), Some("{broken"));
+        assert_eq!(outcome.output.answer_text, "{broken");
+        assert!(outcome.output.needs_review);
+    }
+
+    #[test]
+    fn test_parse_student_answer_ocr_output_flags_printed_question_leak() {
+        let outcome = parse_student_answer_ocr_output(
+            r#"{"answerText":"Soru metni","reviewReasons":[],"warnings":[]}"#,
+            "Soru metni",
+        );
+
+        assert!(outcome.printed_question_leak_detected);
+        assert!(outcome.printed_text_mixed);
+        assert!(outcome
+            .output
+            .review_reasons
+            .iter()
+            .any(|reason| reason == "printed_question_leak_detected"));
+    }
+
+    #[test]
+    fn test_parse_student_answer_issue_correction_output_accepts_strict_json() {
+        let outcome = parse_student_answer_issue_correction_output(
+            r#"{"decision":"suggest_correction","originalText":"gelşeqiz","suggestedText":"çelişen","scope":"single_word","visualReading":"gelşeqiz","contextReason":"Visual and OCR hint align","confidence":0.91,"requiresTeacherApproval":true,"warnings":[]}"#,
+        )
+        .expect("issue correction output");
+
+        assert!(matches!(
+            outcome.output.decision,
+            StudentAnswerOcrIssueCorrectionDecision::SuggestCorrection
+        ));
+        assert_eq!(outcome.output.original_text, "gelşeqiz");
+        assert_eq!(outcome.output.suggested_text.as_deref(), Some("çelişen"));
+        assert!(outcome.output.requires_teacher_approval);
+    }
+
+    #[test]
+    fn test_parse_student_answer_issue_correction_output_blocks_scope_expansion() {
+        let outcome = parse_student_answer_issue_correction_output(
+            r#"{"decision":"suggest_correction","originalText":"gelşeqiz","suggestedText":"çelişen sözcüklerin bir arada kullanılması","scope":"single_word","visualReading":"gelşeqiz","contextReason":"Too broad","confidence":0.42,"requiresTeacherApproval":true,"warnings":[]}"#,
+        )
+        .expect("issue correction output");
+
+        assert!(matches!(
+            outcome.output.decision,
+            StudentAnswerOcrIssueCorrectionDecision::NeedsTeacherReview
+        ));
+        assert!(outcome.output.suggested_text.is_none());
+        assert!(outcome
+            .output
+            .warnings
+            .iter()
+            .any(|warning| warning == "scope_expansion_blocked"));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_handles_plain_json() {
+        let payload = parse_rubric_model_response(
+            r#"{"questions":[{"questionNumber":1,"maxPoints":10,"expectedAnswer":"A","criteria":[{"label":"L","points":10,"description":"D"}],"warnings":[]}]}"#,
+        )
+        .expect("payload");
+        assert_eq!(payload.questions.len(), 1);
+        assert_eq!(payload.questions[0].question_number, 1);
+        assert_eq!(payload.questions[0].max_points, Some(10.0));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_normalizes_aliases() {
+        let payload = parse_rubric_model_response(
+            r#"{"questions":[{"question_no":2,"maxPoint":12,"expected_answer":"B","scoring_criteria":[{"kriter":"Ölçüt","score":12,"aciklama":"D"}],"warnings":[]}]}"#,
+        )
+        .expect("payload");
+
+        let question = &payload.questions[0];
+        assert_eq!(question.question_number, 2);
+        assert_eq!(question.max_points, Some(12.0));
+        assert_eq!(question.expected_answer.as_deref(), Some("B"));
+        assert_eq!(question.criteria.len(), 1);
+        assert_eq!(question.criteria[0].label, "Ölçüt");
+        assert_eq!(question.criteria[0].points, 12.0);
+        assert!(question
+            .warnings
+            .iter()
+            .any(|warning| warning == "questionNumber_alias:question_no"));
+        assert!(question
+            .warnings
+            .iter()
+            .any(|warning| warning == "maxPoints_alias:maxPoint"));
+        assert!(question
+            .warnings
+            .iter()
+            .any(|warning| warning == "expectedAnswer_alias:expected_answer"));
+        assert!(question
+            .warnings
+            .iter()
+            .any(|warning| warning == "criteria_alias:scoring_criteria"));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_marks_empty_payload() {
+        let payload = parse_rubric_model_response(
+            r#"{"questions":[{"questionNumber":1,"maxPoints":null,"expectedAnswer":"","criteria":[],"warnings":[]}]}"#,
+        )
+        .expect("payload");
+        assert!(payload.questions[0]
+            .warnings
+            .iter()
+            .any(|warning| warning == "rubric_empty_content"));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_handles_fenced_and_explanatory_json() {
+        let payload = parse_rubric_model_response(
+            "Açıklama\n```json\n{\"questions\":[{\"soru_no\":6,\"max_score\":8,\"expected_answer\":\"B\",\"rubric\":[{\"name\":\"Nokta\",\"puan\":4,\"description\":\"D\"}],\"warnings\":[\"note\"]}]}\n```",
+        )
+        .expect("payload");
+        assert_eq!(payload.questions[0].question_number, 6);
+        assert!(payload.questions[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("soru_no")));
+        assert!(payload.questions[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("max_score")));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_invalid_json_errors() {
+        let err = parse_rubric_model_response("```json\n{broken\n```").unwrap_err();
+        assert_eq!(err.code, AppErrorCode::RubricJsonParseFailed);
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_recovers_complete_items_from_truncated_json() {
+        let payload = parse_rubric_model_response(
+            r#"{"questions":[{"number":1,"max_points":10,"expected_answer":"A","criteria":[{"label":"L","points":10,"description":"D"}],"warnings":[]},{"number":2,"max_points":5"#,
+        )
+        .expect("partial payload");
+
+        assert_eq!(payload.questions.len(), 1);
+        assert_eq!(payload.questions[0].question_number, 1);
+        assert!(payload.questions[0]
+            .warnings
+            .contains(&"partial_model_json_recovered".to_string()));
+    }
+
+    #[test]
+    fn test_parse_scoring_output_accepts_snake_case_keys_and_criteria_array() {
+        let outcome = parse_scoring_output(
+            r#"{
+              "criteria": [
+                {
+                  "criterion_id": "content_main_idea",
+                  "criterion_title": "Konuya uygunluk, içerik ve ana düşünce",
+                  "criterion_max_score": 20.0,
+                  "awarded_score": 10.0,
+                  "rationale": "Gerekçe açıklaması.",
+                  "evidence_quote": "Aras'ı bu ara rahat bırak."
+                }
+              ],
+              "awarded_score": 10.0,
+              "confidence": 0.9,
+              "rationale": "Genel açıklama."
+            }"#,
+            20.0,
+        );
+        assert!(outcome.parse_error.is_none());
+        assert_eq!(outcome.output.criterion_scores.len(), 1);
+        assert_eq!(
+            outcome.output.criterion_scores[0].criterion_id,
+            "content_main_idea"
+        );
+        assert_eq!(
+            outcome.output.criterion_scores[0].criterion_title,
+            "Konuya uygunluk, içerik ve ana düşünce"
+        );
+        assert_eq!(outcome.output.criterion_scores[0].awarded_score, 10.0);
+        assert_eq!(
+            outcome.output.criterion_scores[0].evidence_quote.as_deref(),
+            Some("Aras'ı bu ara rahat bırak.")
+        );
+        assert_eq!(outcome.output.awarded_score, 10.0);
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_snake_case_and_camel_case() {
+        let snake_json = r#"{"segments":[{"segment_id":"seg-1","cleaned_text":"Merhaba dunya","changes":[],"semantic_change_detected":false,"needs_review":false}]}"#;
+        let res = parse_speaking_transcript_cleanup_output(snake_json).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].segment_id, "seg-1");
+        assert_eq!(res[0].cleaned_text, "Merhaba dunya");
+
+        let camel_json = r#"{"segments":[{"segmentId":"seg-2","cleanedText":"Test mesaji","changes":[],"semanticChangeDetected":true,"needsReview":true}]}"#;
+        let res2 = parse_speaking_transcript_cleanup_output(camel_json).unwrap();
+        assert_eq!(res2.len(), 1);
+        assert_eq!(res2[0].segment_id, "seg-2");
+        assert_eq!(res2[0].cleaned_text, "Test mesaji");
+        assert!(res2[0].semantic_change_detected);
+        assert!(res2[0].needs_review);
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_fenced_and_root_array() {
+        let fenced = "<think>Düşünüyorum...</think>\n```json\n[{\"id\":\"seg-10\",\"text\":\"Satir 1\"}]\n```";
+        let res = parse_speaking_transcript_cleanup_output(fenced).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].segment_id, "seg-10");
+        assert_eq!(res[0].cleaned_text, "Satir 1");
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_unescaped_newlines() {
+        let unescaped =
+            "{\"segments\":[{\"segment_id\":\"seg-1\",\"cleaned_text\":\"Satir 1\nSatir 2\"}]}";
+        let res = parse_speaking_transcript_cleanup_output(unescaped).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].segment_id, "seg-1");
+        assert_eq!(res[0].cleaned_text, "Satir 1\nSatir 2");
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_with_wrapper_prose_and_nested_array() {
+        let wrapped = r#"Model cevabı:
+{"segments":[{"segment_id":"seg-1","cleaned_text":"Birinci cümle"},{"segment_id":"seg-2","cleaned_text":"İkinci cümle"}]}
+İşlem tamamlandı."#;
+        let result = parse_speaking_transcript_cleanup_output(wrapped).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1].segment_id, "seg-2");
+
+        let root_array = r#"İşte çıktı: [{"id":"seg-1","text":"Birinci cümle"},{"id":"seg-2","text":"İkinci cümle"}]"#;
+        let result = parse_speaking_transcript_cleanup_output(root_array).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].cleaned_text, "Birinci cümle");
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_accepts_common_root_aliases() {
+        let output = r#"{"cleanedSegments":[{"index":0,"content":"Temiz metin"}]}"#;
+        let result = parse_speaking_transcript_cleanup_output(output).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].segment_id, "0");
+        assert_eq!(result[0].cleaned_text, "Temiz metin");
+
+        let nested =
+            r#"{"result":{"output":{"segments":[{"segmentId":"seg-2","text":"İç içe çıktı"}]}}}"#;
+        let result = parse_speaking_transcript_cleanup_output(nested).unwrap();
+        assert_eq!(result[0].cleaned_text, "İç içe çıktı");
+    }
+
+    #[test]
+    fn test_parse_speaking_transcript_cleanup_output_distinguishes_schema_error() {
+        let error = parse_speaking_transcript_cleanup_output(
+            r#"{"cleanedTranscript":"Sadece metin döndü"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ModelResponseInvalidSchema);
+        assert!(error.message.contains("beklenen segment şemasında"));
+    }
+
+    #[test]
+    fn test_extract_assistant_content_accepts_openai_content_parts() {
+        let body =
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"{\"segments\":[]}"}]}}]}"#;
+        assert_eq!(
+            extract_assistant_content(body).unwrap(),
+            "{\"segments\":[]}"
+        );
+    }
+}

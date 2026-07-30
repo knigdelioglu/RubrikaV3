@@ -1,0 +1,63 @@
+[package]
+name = "app"
+default-run = "app"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+license = ""
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[workspace]
+members = [
+    ".",
+    "crates/speakoflow-types",
+    "crates/speakoflow-audio",
+    "crates/speakoflow-vad",
+    "crates/speakoflow-stt",
+    "crates/speakoflow-engine",
+]
+resolver = "2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde_path_to_error = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = ["protocol-asset", "test"] }
+tauri-plugin-log = "2"
+tokio = { version = "1.35", features = ["full"] }
+thiserror = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tauri-plugin-dialog = "2.7.1"
+reqwest = { version = "0.13.3", features = ["json"] }
+async-trait = "0.1.89"
+libc = "0.2"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+clap = { version = "4.5", features = ["derive"] }
+cpal = "0.16.0"
+hound = "3.5.1"
+transcribe-rs = { version = "0.3.11", features = ["whisper-cpp"] }
+speakoflow-types = { path = "crates/speakoflow-types" }
+speakoflow-audio = { path = "crates/speakoflow-audio" }
+speakoflow-vad = { path = "crates/speakoflow-vad" }
+speakoflow-stt = { path = "crates/speakoflow-stt" }
+speakoflow-engine = { path = "crates/speakoflow-engine" }
+
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = 0

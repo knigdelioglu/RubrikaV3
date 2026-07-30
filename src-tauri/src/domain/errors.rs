@@ -1,0 +1,157 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AppErrorCode {
+    UnknownError,
+    ProjectNotFound,
+    ProjectLoadFailed,
+    ProjectSaveFailed,
+    DocumentImportFailed,
+    DocumentNotFound,
+    PdfDocumentNotFound,
+    PdfPageCountFailed,
+    PdfRenderFailed,
+    PdfPreviewNotFound,
+    PdfPreviewNotReady,
+    PdfPreviewJobFailed,
+    PdfUnsupportedFormat,
+    PdfRendererNotFound,
+    PdfRendererStartFailed,
+    PdfRendererPermissionDenied,
+    PdfRendererOutputMissing,
+    PdfRendererUnsupported,
+    FileReadFailed,
+    FileWriteFailed,
+    CropRegionMissing,
+    WorkflowBlocked,
+    ModelServerNotRunning,
+    ModelConfigMissing,
+    ModelBinaryMissing,
+    ModelFileMissing,
+    ModelMmprojMissing,
+    ModelPortBlocked,
+    ModelProfileNotFound,
+    ModelProfileNotManaged,
+    ModelServerPathMissing,
+    ModelModelPathMissing,
+    ModelMmprojPathMissing,
+    ModelPortAlreadyInUse,
+    ModelStartFailed,
+    ModelStartTimeout,
+    ModelServerStartFailed,
+    ModelServerReadyTimeout,
+    ModelServerStopFailed,
+    ModelServerUnsupportedFlags,
+    ModelServerNotStartedByApp,
+    ModelStateAccessFailed,
+    ModelHealthFailed,
+    ModelTimeout,
+    ModelResponseEmpty,
+    ModelResponseInvalidJson,
+    ModelResponseInvalidSchema,
+    ModelResponseReasoningOnly,
+    OcrFailed,
+    ScoringFailed,
+    QepNotFrozen,
+    RubricMissing,
+    QuestionTextMissing,
+    QuestionTextExtractionFailed,
+    QuestionTextSuggestionNotFound,
+    QuestionTextConfirmFailed,
+    QuestionTextPartialSuccess,
+    JobStaleInterrupted,
+    RubricJsonInvalid,
+    RubricJsonParseFailed,
+    RubricJsonSchemaUnsupported,
+    RubricSchemaValidationFailed,
+    RubricQuestionNotFound,
+    RubricPlaceholderDetected,
+    RubricEmptyContent,
+    RubricImportEmpty,
+    RubricMaxScoreMissing,
+    RubricCriteriaScoreMismatch,
+    RubricConfirmFailed,
+    RubricNotReady,
+    ExamSourcePdfMissing,
+    RubricDocumentMissing,
+    QuestionCountMissing,
+    ExamPackageBuildPrecheckFailed,
+    QuestionCoverageIncomplete,
+    QuestionLastItemMissing,
+    StudentScanNotFound,
+    StudentScanPreviewNotReady,
+    StudentGroupingNotReady,
+    StudentGroupingInvalid,
+    StudentSubmissionNotFound,
+    StudentIdentityInvalid,
+    SchoolClassNotFound,
+    SchoolClassNameInvalid,
+    SchoolClassAlreadyExists,
+    SchoolClassArchived,
+    StudentScanBatchNotFound,
+    StudentScanBatchAlreadyExists,
+    StudentScanBatchInUse,
+    OcrNotReady,
+    ScoringNotReady,
+    ScoringRerunRequired,
+    JobNotFound,
+    PermissionDenied,
+    FeatureNotImplemented,
+    ModelRequestTimeout,
+    ModelOutputRetryFailed,
+    ModelServerLostDuringRequest,
+    ModelServerCrashedDuringRequest,
+    ModelConnectionReset,
+    SpeakingEngineNotFound,
+    SpeakingEngineLaunchFailed,
+    SpeakingEngineUnsupported,
+    SpeakingAttemptNotFound,
+    SpeakingCaptureBusy,
+    SpeakingTranscriptNotReady,
+    SpeakingAudioMissing,
+    SpeakingEvaluationFailed,
+    SpeakingReviewIncomplete,
+    AnalysisNotReady,
+    AnalysisFailed,
+    StudentNotFound,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AppError {
+    pub code: AppErrorCode,
+    pub message: String,
+    pub recoverable: bool,
+    pub suggested_action: Option<String>,
+    pub technical_details: Option<String>,
+    pub correlation_id: String,
+}
+
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for AppError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_app_error_serialization() {
+        let error = AppError {
+            code: AppErrorCode::ProjectNotFound,
+            message: "Project not found".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: None,
+            correlation_id: "test-id".to_string(),
+        };
+        let serialized = serde_json::to_string(&error).unwrap();
+        assert!(serialized.contains("PROJECT_NOT_FOUND"));
+        assert!(serialized.contains("Project not found"));
+    }
+}
