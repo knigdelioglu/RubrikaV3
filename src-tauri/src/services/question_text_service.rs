@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -121,7 +121,9 @@ impl QuestionTextService {
             .get_project_snapshot(project_id.clone())?;
         running_project.workflow.current_stage = WorkflowStage::QuestionTextExtractionRunning;
         running_project.workflow.summary.text = Some("PDF metni taranıyor.".to_string());
-        self.project_store.save_project(&running_project)?;
+        self.project_store
+            .commit_snapshot_cas(&running_project)
+            .map(|_| ())?;
 
         let service = self.clone();
         let job_id = job.id.clone();
@@ -142,7 +144,6 @@ impl QuestionTextService {
                     },
                 )
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(error) = run_result {
                 if !matches!(
                     service
@@ -164,7 +165,7 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.save_project(&proj);
+                    let _ = service.project_store.commit_snapshot_cas(&proj);
                 }
             } else {
                 // Also update on success just to be safe
@@ -173,7 +174,7 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.save_project(&proj);
+                    let _ = service.project_store.commit_snapshot_cas(&proj);
                 }
             }
         });
@@ -272,7 +273,9 @@ impl QuestionTextService {
         running_project.workflow.current_stage = WorkflowStage::QuestionTextExtractionRunning;
         running_project.workflow.summary.text =
             Some("Gemma vision fallback eksik sorular için çalışıyor.".to_string());
-        self.project_store.save_project(&running_project)?;
+        self.project_store
+            .commit_snapshot_cas(&running_project)
+            .map(|_| ())?;
 
         let service = self.clone();
         let job_id = job.id.clone();
@@ -294,7 +297,6 @@ impl QuestionTextService {
                     },
                 )
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(error) = run_result {
                 if !matches!(
                     service
@@ -315,14 +317,14 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.save_project(&proj);
+                    let _ = service.project_store.commit_snapshot_cas(&proj);
                 }
             } else if let Ok(mut proj) = service
                 .project_store
                 .get_project_snapshot(project_id_for_workflow)
             {
                 proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                let _ = service.project_store.save_project(&proj);
+                let _ = service.project_store.commit_snapshot_cas(&proj);
             }
         });
 
@@ -343,6 +345,21 @@ impl QuestionTextService {
         } = input;
 
         self.job_manager.set_running(&app, &job_id).ok();
+
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Soru metni çıkarma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
 
         let project = self
             .project_store
@@ -428,7 +445,9 @@ impl QuestionTextService {
             expected_question_count,
         );
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         if !coverage.coverage_ok {
             let fallback_targets =
@@ -618,6 +637,21 @@ impl QuestionTextService {
 
         let fallback_total = target_question_numbers.len() as u32;
         self.job_manager.set_running(&app, &job_id).ok();
+
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Soru metni çıkarma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
         self.job_manager
             .update_progress(
                 &app,
@@ -628,22 +662,20 @@ impl QuestionTextService {
             )
             .ok();
 
-        let runtime_status = self
+        let _runtime_lease = self
             .model_runtime_service
-            .ensure_ready(
+            .acquire_runtime(
                 None,
-                ModelRuntimeRequest {
+                &ModelRuntimeRequest {
                     use_case: ModelUseCase::QuestionTextExtraction,
                     capability: ModelCapability::Vision,
                     requires_mmproj: true,
                     timeout_seconds: 180,
                 },
+                "question_text_extraction",
+                Some(&job_id),
             )
-            .await;
-        if let Err(error) = runtime_status {
-            let _ = self.job_manager.fail(&app, &job_id, error.clone());
-            return Err(error);
-        }
+            .await?;
 
         let fallback_image_path = all_prepared_inputs
             .first()
@@ -659,7 +691,23 @@ impl QuestionTextService {
             .project_store
             .get_project_snapshot(project_id.clone())?;
 
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+
         for (index, question_number) in target_question_numbers.iter().copied().enumerate() {
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                    return Err(AppError {
+                        code: AppErrorCode::JobCancelled,
+                        message: "Soru metni çıkarma işlemi iptal edildi.".to_string(),
+                        recoverable: true,
+                        suggested_action: None,
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    });
+                }
+            }
+
             attempted_questions.push(question_number);
             self.job_manager
                 .update_progress(
@@ -744,6 +792,20 @@ impl QuestionTextService {
             return Err(error);
         }
 
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Soru metni çıkarma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+
         let coverage = apply_extraction_to_project_with_expected(
             &mut project,
             merged.into_values().collect::<Vec<_>>(),
@@ -759,7 +821,9 @@ impl QuestionTextService {
             project.expected_question_count = Some(expected_question_count);
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         self.job_manager
             .update_progress(
@@ -842,7 +906,9 @@ impl QuestionTextService {
         question.question_text.updated_at = Some(now);
         let updated = question.clone();
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -893,7 +959,9 @@ impl QuestionTextService {
             });
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -944,7 +1012,9 @@ impl QuestionTextService {
         let updated = question.clone();
         project.invalidate_exam_package_if_frozen("package_changed_after_freeze");
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -1605,18 +1675,15 @@ fn persist_raw_response(
     raw_response: &str,
 ) -> Result<(), AppError> {
     let project = project_store.get_project_snapshot(project_id.to_string())?;
-    let raw_dir = Path::new(&project.root_path)
-        .join("cache")
-        .join("model_raw");
-    std::fs::create_dir_all(&raw_dir).map_err(|e| AppError {
-        code: AppErrorCode::ProjectSaveFailed,
-        message: "Failed to create raw model cache directory.".to_string(),
-        recoverable: false,
-        suggested_action: Some("Check project cache permissions.".to_string()),
-        technical_details: Some(e.to_string()),
-        correlation_id: Uuid::new_v4().to_string(),
-    })?;
-    let file_path = raw_dir.join(format!("question_text_{job_id}_page_{page_index}.json"));
+    let trusted_root = project_store.trusted_project_root(&project.id)?;
+    let raw_dir = trusted_root
+        .root()
+        .join(trusted_root.managed("cache/model_raw")?.as_path());
+    trusted_root.ensure_managed_directory(&raw_dir)?;
+    let file_relative = trusted_root.managed(&format!(
+        "cache/model_raw/question_text_{job_id}_page_{page_index}.json"
+    ))?;
+    let file_path = trusted_root.root().join(file_relative.as_path());
     std::fs::write(&file_path, raw_response).map_err(|e| AppError {
         code: AppErrorCode::ProjectSaveFailed,
         message: "Failed to write raw model response.".to_string(),
@@ -1652,10 +1719,17 @@ mod tests {
     }
 
     fn service_for_tests(project_store: ProjectStore) -> QuestionTextService {
+        service_for_tests_with_job_manager(project_store, std::sync::Arc::new(JobManager::new()))
+    }
+
+    fn service_for_tests_with_job_manager(
+        project_store: ProjectStore,
+        job_manager: std::sync::Arc<JobManager>,
+    ) -> QuestionTextService {
         let pdf_preview_service = std::sync::Arc::new(PdfPreviewService::new(
             project_store.clone(),
             std::sync::Arc::new(SystemPdfService),
-            std::sync::Arc::new(JobManager::new()),
+            job_manager.clone(),
         ));
         let model_gateway_impl = std::sync::Arc::new(LlamaServerGateway::default());
         let model_config = crate::services::model_config_service::ModelConfigService::new();
@@ -1679,7 +1753,7 @@ mod tests {
             model_runtime_service,
             pdf_preview_service,
             document_content_extraction_service,
-            std::sync::Arc::new(JobManager::new()),
+            job_manager,
         )
     }
 
@@ -1808,12 +1882,19 @@ BAŞARILAR...";
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -2047,12 +2128,19 @@ BAŞARILAR...";
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -2147,12 +2235,19 @@ BAŞARILAR...";
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -2407,6 +2502,9 @@ BAŞARILAR...";
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.questions = vec![Question {
@@ -2489,5 +2587,103 @@ BAŞARILAR...";
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.code, AppErrorCode::PdfPreviewNotReady);
+    }
+
+    #[tokio::test]
+    async fn proof_7_question_cancel_preserves_teacher_text() {
+        use crate::domain::job::{DuplicatePolicy, JobStatus};
+        use crate::jobs::job_manager::JobRegistrationInput;
+
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let mut project = store
+            .create_project("proj_p7".to_string(), root.clone())
+            .expect("project");
+
+        project.questions.push(Question {
+            id: "q1-p7".to_string(),
+            number: 1,
+            max_score: 10.0,
+            answer_type: AnswerType::GeneralText,
+            question_text: TextFieldState {
+                value: "Öğretmenin yazdığı soru metni".to_string(),
+                source: TextFieldSource::Manual,
+                status: TextFieldStatus::Edited,
+                confidence: None,
+                warnings: vec![],
+                updated_at: Some("now".to_string()),
+            },
+            rubric: RubricState {
+                status: RubricStatus::Missing,
+                source: None,
+                max_score: None,
+                expected_answer: None,
+                criteria: vec![],
+                partial_credit_hints: vec![],
+                zero_score_conditions: vec![],
+                common_mistakes: vec![],
+                warnings: vec![],
+                updated_at: None,
+            },
+            crop_template: None,
+        });
+        store.save_project(&project).expect("save project");
+
+        let jm = Arc::new(JobManager::new());
+        let service = service_for_tests_with_job_manager(store.clone(), jm.clone());
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+            .handle()
+            .clone();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::QuestionTextExtraction,
+                    display_label: Some("Question Text Extraction".into()),
+                    total: 1,
+                    message: "Extracting".into(),
+                    correlation_id: Some("corr-p7".into()),
+                    idempotency_key: Some("key-p7".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation
+        jm.cancel_job(&app, &reg.snapshot.id).unwrap();
+
+        let input = QuestionTextVisionFallbackRunInput {
+            project_id: project.id.clone(),
+            expected_question_count: 1,
+            target_question_numbers: vec![1],
+            model_inputs: vec![],
+        };
+
+        let res = service
+            .run_vision_fallback(app, reg.snapshot.id.clone(), input)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify teacher text remains preserved
+        let updated = store.get_project_snapshot(project.id).unwrap();
+        assert_eq!(
+            updated.questions[0].question_text.value,
+            "Öğretmenin yazdığı soru metni"
+        );
+        assert_eq!(
+            updated.questions[0].question_text.status,
+            TextFieldStatus::Edited
+        );
     }
 }

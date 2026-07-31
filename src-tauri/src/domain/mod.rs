@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod assessment;
 pub mod document;
 pub mod errors;
 pub mod job;

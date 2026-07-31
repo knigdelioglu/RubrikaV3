@@ -12,6 +12,9 @@ import { projectOverviewPath } from '../app/projectRoutes';
 export function ProjectCreatePage() {
   const [name, setName] = useState('');
   const [rootPath, setRootPath] = useState('');
+  const [academicYearId, setAcademicYearId] = useState('');
+  const [courseId, setCourseId] = useState('');
+  const [courseName, setCourseName] = useState('');
   const [pathTouchedByUser, setPathTouchedByUser] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
@@ -63,7 +66,7 @@ export function ProjectCreatePage() {
     setIsLoading(true);
     setError(null);
     try {
-      const result = await commands.createProject({ name, rootPath });
+      const result = await commands.createProject({ name, rootPath, academicYearId, courseId, courseName });
       setActiveProject(result.project.id, result.projectPath);
       navigate(projectOverviewPath(result.project.id));
     } catch (err) {
@@ -76,6 +79,7 @@ export function ProjectCreatePage() {
   let disabledReason: string | undefined = undefined;
   if (!name.trim()) disabledReason = 'Proje adı boş olamaz';
   else if (!rootPath.trim()) disabledReason = 'Proje klasörü seçilmedi';
+  else if (!academicYearId.trim() || !courseId.trim() || !courseName.trim()) disabledReason = 'Eğitim yılı ve ders bilgileri zorunludur';
 
   return (
     <div style={{ padding: '2rem', fontFamily: 'system-ui, -apple-system, sans-serif', maxWidth: '800px', margin: '2rem auto' }}>
@@ -112,6 +116,12 @@ export function ProjectCreatePage() {
               onBlur={(e) => { e.currentTarget.style.borderColor = '#cbd5e1'; e.currentTarget.style.boxShadow = 'none'; }}
             />
             {!name.trim() && <p style={{ fontSize: '0.75rem', color: '#d97706', margin: 0 }}>Proje adı zorunludur.</p>}
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.75rem' }}>
+            <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Eğitim yılı<input value={academicYearId} onChange={(event) => setAcademicYearId(event.target.value)} placeholder="2026-2027" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
+            <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Ders kodu<input value={courseId} onChange={(event) => setCourseId(event.target.value)} placeholder="tde" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
+            <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Ders adı<input value={courseName} onChange={(event) => setCourseName(event.target.value)} placeholder="Türk Dili ve Edebiyatı" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>

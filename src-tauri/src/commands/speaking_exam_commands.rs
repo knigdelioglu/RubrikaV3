@@ -1,7 +1,7 @@
 use crate::domain::errors::AppError;
 use crate::services::speaking_exam_service::{
-    SpeakingAttemptSyncOutput, SpeakingEngineRuntimeStatus, StartSpeakingExamOutput,
-    ToggleSpeakingCaptureOutput,
+    SpeakingAttemptSyncOutput, SpeakingCaptureRequest, SpeakingEngineRuntimeStatus,
+    StartSpeakingExamOutput, ToggleSpeakingCaptureOutput,
 };
 use crate::AppState;
 use tauri::State;
@@ -30,6 +30,8 @@ pub struct StartSpeakingExamInput {
     #[serde(default)]
     pub assigned_class_ids: Option<Vec<String>>,
     #[serde(default)]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default)]
     pub exam_id: Option<String>,
     #[serde(default)]
     pub teacher_note: Option<String>,
@@ -42,6 +44,10 @@ pub struct StartSpeakingExamInput {
 pub struct ToggleSpeakingCaptureInput {
     pub project_id: String,
     pub exam_id: String,
+    #[serde(default)]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default)]
+    pub class_application_id: Option<String>,
     pub student_id: String,
     pub action: String,
 }
@@ -58,7 +64,12 @@ pub struct SyncSpeakingAttemptInput {
 #[serde(rename_all = "camelCase")]
 pub struct GetSpeakingExamInput {
     pub project_id: String,
+    #[serde(default)]
     pub exam_id: String,
+    #[serde(default)]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default)]
+    pub class_application_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -66,7 +77,12 @@ pub struct GetSpeakingExamInput {
 pub struct SelectSpeakingExamClassInput {
     pub project_id: String,
     pub exam_id: String,
-    pub class_id: String,
+    #[serde(default)]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default)]
+    pub class_application_id: Option<String>,
+    #[serde(default)]
+    pub class_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -74,6 +90,10 @@ pub struct SelectSpeakingExamClassInput {
 pub struct SelectSpeakingExamStudentInput {
     pub project_id: String,
     pub exam_id: String,
+    #[serde(default)]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default)]
+    pub class_application_id: Option<String>,
     pub student_id: String,
 }
 
@@ -185,6 +205,7 @@ pub async fn start_speaking_exam(
             &input.project_id,
             &input.exam_name,
             assigned_ids,
+            input.assessment_activity_id,
             &input.exam_type,
             &input.task_text,
             target_sec,
@@ -207,10 +228,14 @@ pub async fn toggle_speaking_capture(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            &input.action,
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: &input.action,
+            },
         )
         .await
 }
@@ -225,10 +250,14 @@ pub async fn start_speaking_exam_attempt(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            "start",
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: "start",
+            },
         )
         .await
 }
@@ -243,10 +272,14 @@ pub async fn stop_speaking_exam_attempt(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            "stop",
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: "stop",
+            },
         )
         .await
 }
@@ -261,10 +294,14 @@ pub async fn pause_speaking_exam_attempt(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            "pause",
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: "pause",
+            },
         )
         .await
 }
@@ -279,10 +316,14 @@ pub async fn resume_speaking_exam_attempt(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            "resume",
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: "resume",
+            },
         )
         .await
 }
@@ -297,10 +338,14 @@ pub async fn cancel_speaking_exam_attempt(
         .speaking_exam_service
         .toggle_capture(
             app,
-            &input.project_id,
-            &input.exam_id,
-            &input.student_id,
-            "cancel",
+            SpeakingCaptureRequest {
+                project_id: &input.project_id,
+                exam_id: &input.exam_id,
+                assessment_activity_id: input.assessment_activity_id.as_deref(),
+                class_application_id: input.class_application_id.as_deref(),
+                student_id: &input.student_id,
+                action: "cancel",
+            },
         )
         .await
 }
@@ -355,9 +400,12 @@ pub async fn get_speaking_exam(
     state: State<'_, AppState>,
     input: GetSpeakingExamInput,
 ) -> Result<crate::domain::speaking::SpeakingExam, AppError> {
-    state
-        .speaking_exam_service
-        .get_exam(&input.project_id, &input.exam_id)
+    state.speaking_exam_service.get_exam(
+        &input.project_id,
+        &input.exam_id,
+        input.assessment_activity_id.as_deref(),
+        input.class_application_id.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -368,7 +416,9 @@ pub async fn select_speaking_exam_class(
     state.speaking_exam_service.select_exam_class(
         &input.project_id,
         &input.exam_id,
-        &input.class_id,
+        input.assessment_activity_id.as_deref(),
+        input.class_application_id.as_deref(),
+        input.class_id.as_deref(),
     )
 }
 
@@ -380,6 +430,8 @@ pub async fn select_speaking_exam_student(
     state.speaking_exam_service.select_exam_student(
         &input.project_id,
         &input.exam_id,
+        input.assessment_activity_id.as_deref(),
+        input.class_application_id.as_deref(),
         &input.student_id,
     )
 }

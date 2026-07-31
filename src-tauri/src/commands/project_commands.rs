@@ -9,6 +9,12 @@ use tauri::State;
 pub struct CreateProjectInput {
     pub name: String,
     pub root_path: String,
+    #[serde(default)]
+    pub academic_year_id: Option<String>,
+    #[serde(default)]
+    pub course_id: Option<String>,
+    #[serde(default)]
+    pub course_name: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -50,9 +56,13 @@ pub async fn create_project(
     state: State<'_, AppState>,
     input: CreateProjectInput,
 ) -> Result<CreateProjectOutput, AppError> {
-    let project = state
-        .project_store
-        .create_project(input.name, input.root_path)?;
+    let project = state.project_store.create_project_with_setup(
+        input.name,
+        input.root_path,
+        input.academic_year_id,
+        input.course_id,
+        input.course_name,
+    )?;
     Ok(CreateProjectOutput {
         project_path: project.root_path.clone(),
         project,
@@ -73,6 +83,9 @@ pub async fn open_project(
     let (project, warnings) = state
         .project_store
         .open_project_with_warnings(project_path.clone())?;
+    let _ = state
+        .job_manager
+        .rehydrate_jobs(std::path::Path::new(&project.root_path));
     Ok(OpenProjectOutput {
         project_path: project.root_path.clone(),
         project,
@@ -107,4 +120,29 @@ pub async fn get_default_project_path(
 ) -> Result<GetDefaultProjectPathOutput, AppError> {
     let path = crate::platform::paths::generate_default_project_path(&app, &input.project_name)?;
     Ok(GetDefaultProjectPathOutput { path })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCourseInfoInput {
+    pub project_id: String,
+    pub academic_year_id: String,
+    pub course_id: String,
+    pub course_name: String,
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn update_course_info(
+    state: State<'_, AppState>,
+    input: UpdateCourseInfoInput,
+) -> Result<Project, AppError> {
+    state.project_store.update_course_info(
+        input.project_id,
+        input.academic_year_id,
+        input.course_id,
+        input.course_name,
+        input.expected_revision,
+    )
 }

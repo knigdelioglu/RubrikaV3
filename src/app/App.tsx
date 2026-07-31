@@ -11,17 +11,20 @@ import { StartupRedirect } from './StartupRedirect';
 const ProjectCreatePage = lazy(() => import('../pages/ProjectCreatePage').then((module) => ({ default: module.ProjectCreatePage })));
 const DocumentsPage = lazy(() => import('../pages/DocumentsPage').then((module) => ({ default: module.DocumentsPage })));
 const WorkflowPage = lazy(() => import('../pages/WorkflowPage').then((module) => ({ default: module.WorkflowPage })));
-const ModelStatusPage = lazy(() => import('../pages/ModelStatusPage').then((module) => ({ default: module.ModelStatusPage })));
+const SettingsPage = lazy(() => import('../pages/SettingsPage').then((module) => ({ default: module.SettingsPage })));
 const PdfPreviewPage = lazy(() => import('../pages/PdfPreviewPage').then((module) => ({ default: module.PdfPreviewPage })));
 const ExamPackageCompatibilityRedirect = lazy(() => import('../pages/ExamPackageWorkspacePage').then((module) => ({ default: module.ExamPackageCompatibilityRedirect })));
 const ExamPackageWorkspacePage = lazy(() => import('../pages/ExamPackageWorkspacePage').then((module) => ({ default: module.ExamPackageWorkspacePage })));
 const StudentOperationsCompatibilityRedirect = lazy(() => import('../pages/StudentOperationsWorkspacePage').then((module) => ({ default: module.StudentOperationsCompatibilityRedirect })));
 const StudentOperationsWorkspacePage = lazy(() => import('../pages/StudentOperationsWorkspacePage').then((module) => ({ default: module.StudentOperationsWorkspacePage })));
 const ClassesPage = lazy(() => import('../pages/ClassesPage').then((module) => ({ default: module.ClassesPage })));
+const AssessmentOrganizationPage = lazy(() => import('../pages/AssessmentOrganizationPage').then((module) => ({ default: module.AssessmentOrganizationPage })));
 const ScoringPage = lazy(() => import('../pages/ScoringPage').then((module) => ({ default: module.ScoringPage })));
 const GradedExamReviewPage = lazy(() => import('../pages/GradedExamReviewPage').then((module) => ({ default: module.GradedExamReviewPage })));
 const SpeechExamPage = lazy(() => import('../pages/SpeechExamPage').then((module) => ({ default: module.SpeechExamPage })));
 const AnalysisPage = lazy(() => import('../pages/AnalysisPage').then((module) => ({ default: module.AnalysisPage })));
+
+const CanonicalExamWorkspacePage = lazy(() => import('../pages/CanonicalExamWorkspacePage').then((module) => ({ default: module.CanonicalExamWorkspacePage })));
 
 function LegacyProjectRedirect({ pathname }: { pathname: string }) {
   const { projectId, isResolving } = useProjectContext();
@@ -57,6 +60,11 @@ function AppRoutes() {
           <Route path="/project/:projectId/exam/package-review" element={<ExamPackageCompatibilityRedirect tab="freeze" />} />
           <Route path="/project/:projectId/exam/package" element={<ExamPackageWorkspacePage />} />
           <Route path="/project/:projectId/classes" element={<ClassesPage />} />
+          <Route path="/project/:projectId/activities" element={<AssessmentOrganizationPage />} />
+          <Route path="/project/:projectId/activities/:assessmentActivityId" element={<CanonicalExamWorkspacePage />} />
+          <Route path="/project/:projectId/activities/:assessmentActivityId/:step" element={<CanonicalExamWorkspacePage />} />
+          <Route path="/project/:projectId/activity/:assessmentActivityId" element={<CanonicalExamWorkspacePage />} />
+          <Route path="/project/:projectId/activity/:assessmentActivityId/:step" element={<CanonicalExamWorkspacePage />} />
           <Route path="/project/:projectId/students" element={<StudentOperationsWorkspacePage />} />
           <Route path="/project/:projectId/students/grouping" element={<StudentOperationsCompatibilityRedirect tab="grouping" />} />
           <Route path="/project/:projectId/students/crops" element={<StudentOperationsCompatibilityRedirect tab="crops" />} />
@@ -68,9 +76,11 @@ function AppRoutes() {
           <Route path="/project/:projectId/grading/students" element={<ScoringPage />} />
           <Route path="/project/:projectId/grading/papers" element={<GradedExamReviewPage />} />
           <Route path="/project/:projectId/analysis" element={<AnalysisPage kind="written" />} />
-          <Route path="/project/:projectId/settings" element={<ModelStatusPage />} />
-          <Route path="/project/:projectId/settings/model" element={<ModelStatusPage />} />
-          <Route path="/project/:projectId/settings/diagnostics" element={<ModelStatusPage />} />
+          <Route path="/project/:projectId/settings" element={<SettingsPage defaultTab="general" />} />
+          <Route path="/project/:projectId/settings/general" element={<SettingsPage defaultTab="general" />} />
+          <Route path="/project/:projectId/settings/model" element={<SettingsPage defaultTab="models" />} />
+          <Route path="/project/:projectId/settings/storage" element={<SettingsPage defaultTab="storage" />} />
+          <Route path="/project/:projectId/settings/diagnostics" element={<SettingsPage defaultTab="diagnostics" />} />
           <Route path="/project/:projectId/speaking" element={<SpeechExamPage />} />
           <Route path="/project/:projectId/speaking/analysis" element={<AnalysisPage kind="speaking" />} />
 

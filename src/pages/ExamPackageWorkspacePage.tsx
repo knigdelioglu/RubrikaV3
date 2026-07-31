@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
@@ -26,6 +26,7 @@ import { ProjectContextState } from '../components/common/ProjectContextState';
 import { QuestionCountDialog } from '../components/common/QuestionCountDialog';
 import { tauriClient } from '../api/tauriClient';
 import { useProjectContext } from '../state/useProjectContext';
+import { DocumentsPage } from './DocumentsPage';
 import {
   answerTypeLabels,
   blockingReasonLabels,
@@ -34,7 +35,7 @@ import {
   textFieldStatusLabels,
 } from '../utils/labels';
 import { getExamPackageFreezeUiState } from '../utils/examPackageFreeze';
-import { projectDocumentsPath, projectExamPackagePath, type ExamPackageTab } from '../app/projectRoutes';
+import { projectExamPackagePath, type ExamPackageTab } from '../app/projectRoutes';
 import {
   buildExamPackageQuestionItems,
   buildExamPackageWorkspaceSummary,
@@ -370,31 +371,39 @@ export function ExamPackageWorkspacePage() {
   const rubricBusy = activeJobs.some((job) => job.kind === 'rubric_pdf_import' || job.kind === 'exam_package_build');
   const selectedRubricDraft = selectedQuestionId ? rubricDrafts[selectedQuestionId] : undefined;
 
+  const examSourceDoc = project.documents.find((doc) => doc.role === 'exam_source');
+  const answerKeyDoc = project.documents.find((doc) => doc.role === 'answer_key' || doc.role === 'rubric');
+  const examQuestionsUploaded = !!examSourceDoc;
+  const answerKeyUploaded = !!answerKeyDoc;
+
   return (
     <div className="exam-package-workspace">
-      <div className="exam-package-workspace__breadcrumb">
-        <Link to={projectDocumentsPath(projectId)}>Belgeler</Link>
-        <span aria-hidden="true">/</span>
-        <span>Sınav Paketi</span>
-      </div>
-
       <header className="exam-package-workspace__header">
         <div>
-          <h2>Sınav Paketi</h2>
-          <p>Soru metinlerini ve rubrikleri aynı çalışma alanında kontrol edin, ardından notlandırma paketini dondurun.</p>
+          <h2>Sınav Hazırlığı</h2>
+          <p>Sınav belgelerini, soru metinlerini ve puanlama rubriklerini bu çalışma alanında kontrol edip tamamlayın.</p>
         </div>
-        <span className={`package-status ${summary.frozen ? 'is-ready' : summary.invalidated ? 'is-warning' : ''}`}>
-          {freezeUiState.statusText}
-        </span>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          <span className={`package-status ${summary.frozen ? 'is-ready' : summary.invalidated ? 'is-warning' : ''}`}>
+            {freezeUiState.statusText}
+          </span>
+          <LoadingButton
+            type="button"
+            className="button button--primary"
+            loading={freezeMutation.isPending}
+            disabledReason={freezeUiState.freezeButtonDisabledReason}
+            onClick={() => setFreezeDialogOpen(true)}
+          >
+            <CheckCircle2 size={17} /> Sınav Hazırlığını Tamamla
+          </LoadingButton>
+        </div>
       </header>
 
-      <dl className="exam-package-summary" aria-label="Sınav paketi özeti">
-        <div><dt>Toplam soru</dt><dd>{summary.totalQuestions}</dd></div>
-        <div><dt>Soru metni hazır</dt><dd>{summary.readyQuestionCount}/{summary.totalQuestions}</dd></div>
-        <div><dt>Rubrik hazır</dt><dd>{summary.readyRubricCount}/{summary.totalQuestions}</dd></div>
-        <div className={summary.invalidQuestionCount + summary.invalidRubricCount ? 'has-error' : ''}><dt>Eksik / geçersiz</dt><dd>{summary.invalidQuestionCount + summary.invalidRubricCount}</dd></div>
-        <div><dt>Toplam puan</dt><dd>{summary.totalScore}</dd></div>
-        <div className={summary.blockerCount ? 'has-error' : ''}><dt>Engel</dt><dd>{summary.blockerCount}</dd></div>
+      <dl className="exam-package-summary" aria-label="Sınav hazırlık özeti">
+        <div><dt>Sınav soruları</dt><dd>{examQuestionsUploaded ? 'Yüklendi' : 'Eksik'}</dd></div>
+        <div><dt>Cevap anahtarı</dt><dd>{answerKeyUploaded ? 'Yüklendi' : 'Eksik'}</dd></div>
+        <div><dt>Rubrikler</dt><dd>{summary.readyRubricCount}/{summary.totalQuestions} hazır</dd></div>
+        <div><dt>Sınav toplamı</dt><dd>{summary.totalScore} puan</dd></div>
       </dl>
 
       {(error || queryError) && <ErrorBanner error={(error || queryError)!} />}
@@ -409,18 +418,18 @@ export function ExamPackageWorkspacePage() {
         </div>
       )}
 
-      <div className="exam-package-tabs" role="tablist" aria-label="Sınav paketi bölümleri">
+      <div className="exam-package-tabs" role="tablist" aria-label="Sınav hazırlığı bölümleri">
         {([
-          ['question', 'Soru Metni'],
-          ['rubric', 'Rubrik'],
-          ['freeze', 'Paket ve Dondurma'],
+          ['documents', 'Belgeler'],
+          ['question', 'Sorular'],
+          ['rubric', 'Rubrikler'],
         ] as const).map(([value, label]) => (
           <button
             key={value}
             type="button"
             role="tab"
-            aria-selected={tab === value}
-            className={tab === value ? 'is-active' : ''}
+            aria-selected={tab === value || (tab === 'freeze' && value === 'rubric')}
+            className={tab === value || (tab === 'freeze' && value === 'rubric') ? 'is-active' : ''}
             onClick={() => updateSearch(location.search, navigate, projectId, { tab: value })}
           >
             {label}
@@ -428,7 +437,12 @@ export function ExamPackageWorkspacePage() {
         ))}
       </div>
 
-      <div className={`exam-package-layout ${tab === 'freeze' ? 'is-freeze' : ''}`}>
+      {tab === 'documents' ? (
+        <div style={{ marginTop: '1rem' }}>
+          <DocumentsPage hideHeader />
+        </div>
+      ) : (
+        <div className={`exam-package-layout ${tab === 'freeze' ? 'is-freeze' : ''}`}>
         {tab !== 'freeze' && (
           <nav className="package-question-list" aria-label="Soru listesi">
             <div className="package-question-list__heading">
@@ -677,12 +691,13 @@ export function ExamPackageWorkspacePage() {
           )}
         </section>
       </div>
+      )}
 
       <ConfirmationDialog
         open={freezeDialogOpen}
-        title="Sınav paketini dondur"
-        description="Geçerli soru metinleri ve rubrikler notlandırmada kullanılmak üzere onaylanıp sabitlenecek. Taslakta daha sonra yapılacak değişiklikler bu paketi geçersiz kılar ve yeniden dondurma gerektirir."
-        confirmLabel="Paketi Dondur"
+        title="Sınav hazırlığını tamamla"
+        description="Geçerli soru metinleri ve rubrikler notlandırmada kullanılmak üzere kilitlenecek ve onaylanacak. Taslakta daha sonra yapılacak değişiklikler bu hazırlığı geçersiz kılar."
+        confirmLabel="Hazırlığı Tamamla"
         busy={freezeMutation.isPending}
         onCancel={() => setFreezeDialogOpen(false)}
         onConfirm={confirmFreeze}

@@ -3,6 +3,20 @@
 Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembollerini (Command'ler, Servisler, Model Struct'ları) listeler. Projede aradığınız bir yapı veya işleyişi bu tabloda bularak ilgili kod dosyasına gidebilirsiniz.
 
 ## A. Frontend Command Wrappers (TS API)
+
+### Assessment organization canonical symbols
+
+| Sembol | Dosya | Tür | Ne yapar? | Kim çağırır? |
+|---|---|---|---|---|
+| `AssessmentOrganizationPage` | `src/pages/AssessmentOrganizationPage.tsx` | Page | Liste-first sınav yönetimi yapar; kullanıcı aksiyonuyla açılan create mode aktif TeachingAssignment kayıtlarından ders/sınıf seçenekleri üretir ve tek AssessmentActivity altında ClassApplication kayıtları oluşturur. | Router |
+| `CanonicalExamWorkspacePage` | `src/pages/CanonicalExamWorkspacePage.tsx` | Page | Sınav türüne özel 5 adımlı canonical sınav çalışma alanını sunar; üretim sayfalarını adımlar altında wrapper/adapter olarak çalıştırır. | Router |
+| `CanonicalExamWorkspaceHeader` | `src/components/workspace/CanonicalExamWorkspaceHeader.tsx` | Component | Sınav workspace başlığını, tür rozetini, bağlı sınıfları, sınıf filtresini ve 5 adımlı erişilebilir adım çubuğunu çizer. | `CanonicalExamWorkspacePage` |
+| `SpeechExamPage` | `src/pages/SpeechExamPage.tsx` | Page | `assessmentActivityId` bağlamında yalnız activity class applications listesinden speaking execution yürütür. | Router |
+| `createAssessmentActivity` / `getAssessmentActivity` / `getAssessmentClassApplications` / `getClassApplicationStudents` | `src/api/commands.ts` | Func | Activity ve canonical sınıf uygulaması command wrapper’ları. | Organization/Speech pages |
+| `deriveExamStepStatuses` / `resolveNextExamStep` / `getExamStepDefinitions` | `src/app/examWorkspace.ts` | Func | Sınav türüne özel adımları, backend-derived adım durumlarını ve Devam et aksiyon hedefini hesaplar. | Workspace pages/components |
+| `getAssessmentSequenceOptions` | `src/api/commands.ts` | Func | Eğitim yılı, ders, dönem ve tür için backend’in hesapladığı kullanılabilir sınav sıralarını döndürür. | `AssessmentOrganizationPage` |
+| `startSpeakingExamAttempt` | `src/api/commands.ts` | Func | Activity + class application + student referanslarıyla attempt başlatır. | `SpeechExamPage` |
+| `ClassesPage` | `src/pages/ClassesPage.tsx` | Page | Canonical proje kurulumu; sınıfları ve ders–sınıf görevlendirmelerini yönetir, sınav organizasyonuna geçiş sunar. | Router |
 | Sembol | Dosya | Tür | Ne yapar? | Öğrenilecek Konu |
 |---|---|---|---|---|
 | `openProject` | `src/api/commands.ts` | Func | Projeyi açmak için Tauri komutunu çağırır. | Tauri invoke sarmalayıcı (Wrapper) |
@@ -20,9 +34,14 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | `buildStudentSummary` | `src/pages/scoringViewModel.ts` | Func | Öğrenci özet kartı için toplam, badges ve active record görünümü üretir. | ScoringPage |
 | `ExamPackageWorkspacePage` | `src/pages/ExamPackageWorkspacePage.tsx` | Component | Soru metni, rubrik ve paket dondurma panellerini canonical `/project/:projectId/exam/package` route’unda birleştirir. | TanStack Query, query-param deep-link, mevcut command wrapper’ları |
 | `buildExamPackageQuestionItems` / `buildExamPackageWorkspaceSummary` | `src/pages/examPackageWorkspace.ts` | Func | Backend DTO’larını soru listesi ve paket özet sunumuna normalize eder; freeze readiness’i yalnız workflow snapshot’tan kopyalar. | Saf view-model, frontend testleri |
-| `projectExamPackagePath` / `getExamPackageActionPath` | `src/app/projectRoutes.ts` | Func | Canonical question/rubric/freeze deep-link’lerini ve NextActions hedeflerini üretir, query parametrelerini korur. | React Router compatibility |
+| `projectNavigation` / `getProjectArea` / `resolveLegacyProjectDestination` | `src/app/projectRoutes.ts` | Func/Var | 5-menülü global öğretmen navigasyonunu (Ana Sayfa, Sınavlar, Sınıflar ve Öğrenciler, Raporlar, Ayarlar), active area haritalamasını ve query parametrelerini koruyan legacy redirect helper'larını sağlar. | `AppLayout.tsx`, `App.tsx`, testler |
 
 ## B. Tauri Commands (Rust API Katmanı)
+
+| `get_assessment_sequence_options` / `create_assessment_activity` / `update_assessment_activity` | `assessment_organization_commands.rs` | Commands | Sıra önerilerini hesaplar; ortak sınav tanımını ve speaking configuration snapshot’ını kaydeder. | `AssessmentOrganizationPage` |
+| `get_assessment_activity` / `get_assessment_class_applications` / `get_class_application_students` | `assessment_organization_commands.rs` | Commands | Activity’ye bağlı canonical class application ve merkezi roster read modelini döndürür. | `SpeechExamPage` |
+| `add_assessment_class_application` / `remove_assessment_class_application` | `assessment_organization_commands.rs` | Commands | Sınıf uygulaması ekler veya attempt varsa servis blocker’ı döndürür. | Organization UI |
+| `start_speaking_exam_attempt` | `speaking_exam_commands.rs` | Command | Activity/application ownership ve student/class membership doğrulamasıyla capture başlatır. | `SpeechExamPage` |
 | Sembol | Dosya | Tür | Ne yapar? | Kim çağırır? | Neyi çağırır? |
 |---|---|---|---|---|---|
 | `start_student_answer_ocr` | `student_answer_ocr_commands.rs` | Command | Frontend'in OCR başlatma isteğini karşılar. | UI (`commands.ts`) | `StudentAnswerOcrService::start` |

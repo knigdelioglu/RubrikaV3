@@ -10,8 +10,6 @@ import { ProjectContextState } from '../components/common/ProjectContextState';
 import { ClassSelector } from '../components/student/ClassSelector';
 import { useProjectContext } from '../state/useProjectContext';
 import { CropTemplatePage } from './CropTemplatePage';
-import { StudentAnswerOcrIssueReviewPage } from './StudentAnswerOcrIssueReviewPage';
-import { StudentAnswerOcrPage } from './StudentAnswerOcrPage';
 import { StudentGroupingPage } from './StudentGroupingPage';
 import { StudentIdentityPage } from './StudentIdentityPage';
 import {
@@ -19,14 +17,6 @@ import {
   normalizeStudentOperationsTab,
   resolveStudentOperationsSelection,
 } from './studentOperations';
-
-const tabs: Array<{ id: StudentOperationsTab; label: string }> = [
-  { id: 'grouping', label: 'Gruplama' },
-  { id: 'identity', label: 'Kimlik' },
-  { id: 'crops', label: 'Crop Şablonları' },
-  { id: 'ocr', label: 'Cevap OCR' },
-  { id: 'issues', label: 'OCR Sorunları' },
-];
 
 export function StudentOperationsWorkspacePage() {
   const { projectId, projectPath, isResolving } = useProjectContext();
@@ -111,7 +101,10 @@ export function StudentOperationsWorkspacePage() {
   return (
     <div className="student-operations-workspace">
       <header className="student-operations-workspace__header">
-        <div><h2>Öğrenci İşlemleri</h2><p>Sınıf ve PDF paketi bağlamını koruyarak gruplama, kimlik ve OCR adımlarını yönetin.</p></div>
+        <div>
+          <h2>Öğrenci Kâğıtları</h2>
+          <p>Taranmış kâğıtları yükleyin, sınıflara göre ayırın ve sayfaları öğrencilerle eşleştirin.</p>
+        </div>
       </header>
 
       {queryError && <ErrorBanner error={queryError} />}
@@ -128,26 +121,44 @@ export function StudentOperationsWorkspacePage() {
 
       <dl className="student-operations-summary" aria-label="Seçili sınıf ve paket özeti">
         <div><dt>PDF paketi</dt><dd>{summary.scanBatchCount}</dd></div>
-        <div><dt>Öğrenci</dt><dd>{summary.submissionCount}</dd></div>
+        <div><dt>Öğrenci kâğıdı</dt><dd>{summary.submissionCount}</dd></div>
         <div><dt>Kimlik doğrulandı</dt><dd>{summary.identityVerifiedCount}</dd></div>
-        <div><dt>OCR tamamlandı</dt><dd>{summary.ocrCompleteCount}</dd></div>
-        <div><dt>Notlandırıldı</dt><dd>{summary.scoringCompleteCount}</dd></div>
         <div className={summary.reviewRequiredCount ? 'has-warning' : ''}><dt>Kontrol gerekli</dt><dd>{summary.reviewRequiredCount}</dd></div>
       </dl>
 
-      <div className="student-operations-tabs" role="tablist" aria-label="Öğrenci işlemleri bölümleri">
-        {tabs.map((item) => (
-          <button key={item.id} type="button" role="tab" aria-selected={tab === item.id} className={tab === item.id ? 'is-active' : ''} onClick={() => updateSelection({ tab: item.id })}>{item.label}</button>
-        ))}
+      <div className="student-operations-panel">
+        <StudentGroupingPage />
       </div>
 
-      <section className="student-operations-panel" role="tabpanel" aria-label={tabs.find((item) => item.id === tab)?.label}>
-        {tab === 'grouping' && <StudentGroupingPage />}
-        {tab === 'identity' && <StudentIdentityPage />}
-        {tab === 'crops' && <CropTemplatePage />}
-        {tab === 'ocr' && <StudentAnswerOcrPage />}
-        {tab === 'issues' && <StudentAnswerOcrIssueReviewPage />}
-      </section>
+      <details className="package-technical-details" style={{ marginTop: '1.5rem' }}>
+        <summary style={{ fontWeight: 600, cursor: 'pointer', padding: '0.75rem', background: '#f8fafc', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
+          Teknik düzeltme araçları (Kimlik OCR, Crop Şablonu ve İnceleme)
+        </summary>
+        <div style={{ padding: '1rem 0' }}>
+          <div className="student-operations-tabs" role="tablist" style={{ marginBottom: '1rem' }}>
+            <button
+              type="button"
+              className={tab === 'identity' ? 'is-active' : ''}
+              onClick={() => updateSelection({ tab: 'identity' })}
+            >
+              Kimlik Doğrulama
+            </button>
+            <button
+              type="button"
+              className={tab === 'crops' ? 'is-active' : ''}
+              onClick={() => updateSelection({ tab: 'crops' })}
+            >
+              Crop Şablonları
+            </button>
+          </div>
+
+          <div>
+            {tab === 'identity' && <StudentIdentityPage />}
+            {tab === 'crops' && <CropTemplatePage />}
+            {tab !== 'identity' && tab !== 'crops' && <StudentIdentityPage />}
+          </div>
+        </div>
+      </details>
     </div>
   );
 }

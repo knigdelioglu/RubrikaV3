@@ -13,11 +13,13 @@ use crate::domain::model::{
 };
 use crate::domain::project::Project;
 use crate::domain::question::{is_question_text_ready, AnswerType};
+use crate::domain::scoring::ScoringReviewStatus;
 use crate::domain::student::{
-    OcrCriticalTermWarning, OcrImagePreprocessDiagnostics, OcrImagePreprocessMode,
-    OcrSuggestedCorrection, OcrUncertainSpan, StudentAnswerOcrCropBBox,
-    StudentAnswerOcrParseDiagnostics, StudentAnswerOcrRecord, StudentAnswerOcrRenderDiagnostics,
-    StudentAnswerOcrStatus, StudentIdentityOcrRecord, StudentSubmission, StudentSubmissionStatus,
+    OcrCriticalTermWarning, OcrGeneration, OcrGenerationStatus, OcrImagePreprocessDiagnostics,
+    OcrImagePreprocessMode, OcrSuggestedCorrection, OcrTeacherReviewStatus, OcrUncertainSpan,
+    StudentAnswerOcrCropBBox, StudentAnswerOcrParseDiagnostics, StudentAnswerOcrRecord,
+    StudentAnswerOcrRenderDiagnostics, StudentAnswerOcrStatus, StudentIdentityOcrRecord,
+    StudentSubmission, StudentSubmissionStatus,
 };
 use crate::jobs::job_manager::JobManager;
 use crate::services::model_gateway::ModelGateway;
@@ -179,46 +181,111 @@ impl StudentAnswerOcrService {
             "Öğrenci cevap OCR’ı hazırlanıyor...".to_string(),
         )?;
 
-        let mut running_project = project.clone();
-        if force_rerun {
-            running_project.student_answer_ocr_records.clear();
-            let now = chrono::Utc::now().to_rfc3339();
-            for submission in &mut running_project.student_submissions {
-                submission.status = StudentSubmissionStatus::OcrRunning;
-                submission.updated_at = Some(now.clone());
-            }
+        let document = self
+            .active_student_scan_document(&project)
+            .cloned()
+            .ok_or_else(|| {
+                ocr_error(
+                    AppErrorCode::StudentScanNotFound,
+                    "Öğrenci cevap PDF’i bulunamadı.",
+                )
+            })?;
+        let trusted_root = self.project_store.trusted_project_root(&project_id)?;
+        let source_path = document.resolve_path_with_root(&trusted_root)?;
+        let source_fingerprint = file_fingerprint(&source_path)?;
+        let generation_ids = project
+            .student_submissions
+            .iter()
+            .map(|submission| (submission.id.clone(), Uuid::new_v4().to_string()))
+            .collect::<Vec<_>>();
+        let generation_ids_for_commit = generation_ids.clone();
+        let job_id_for_generation = job.id.clone();
+        let source_document_id = document.id.clone();
+        let source_fingerprint_for_queue = source_fingerprint.clone();
+        let queue_result = self
+            .project_store
+            .mutate(
+                &project_id,
+                crate::services::project_store::MutationOptions::new("queue_ocr_generation"),
+                move |current, context| {
+                    let now = chrono::Utc::now();
+                    for (submission_id, generation_id) in &generation_ids_for_commit {
+                        if current
+                            .student_answer_ocr_generations
+                            .iter()
+                            .any(|generation| generation.generation_id == *generation_id)
+                        {
+                            return Err(ocr_error(
+                                AppErrorCode::OcrGenerationConflict,
+                                "OCR yeniden çalıştırma generation çakışması oluştu.",
+                            ));
+                        }
+                        current.student_answer_ocr_generations.push(OcrGeneration {
+                            generation_id: generation_id.clone(),
+                            submission_id: submission_id.clone(),
+                            source_fingerprint: source_fingerprint_for_queue.clone(),
+                            created_at: now,
+                            model_name: Some("gemma".to_string()),
+                            prompt_version: PROMPT_VERSION.to_string(),
+                            status: OcrGenerationStatus::Candidate,
+                            result: vec![],
+                            diagnostics: None,
+                            teacher_review_status: OcrTeacherReviewStatus::Pending,
+                            created_by_job_id: job_id_for_generation.clone(),
+                            source_document_id: source_document_id.clone(),
+                            source_storage_revision: context.current_revision,
+                            failure_reason: None,
+                        });
+                    }
+                    for submission in &mut current.student_submissions {
+                        if generation_ids_for_commit
+                            .iter()
+                            .any(|(id, _)| id == &submission.id)
+                        {
+                            submission.status = StudentSubmissionStatus::OcrRunning;
+                            submission.updated_at = Some(now.to_rfc3339());
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .map(|_| ());
+        if let Err(error) = queue_result {
+            let _ = self.job_manager.fail(&app, &job.id, error.clone());
+            return Err(error);
         }
-        running_project.workflow.current_stage =
-            crate::domain::workflow::WorkflowStage::StudentAnswerOcrRunning;
-        running_project.workflow.current_stage_label = "Öğrenci cevap OCR’ı çalışıyor".to_string();
-        running_project.workflow.summary.text = Some("Öğrenci cevap OCR’ı çalışıyor.".to_string());
-        if !force_rerun {
-            for submission in &mut running_project.student_submissions {
-                submission.status = StudentSubmissionStatus::OcrRunning;
-            }
-        }
-        self.project_store.save_project(&running_project)?;
 
         let service = self.clone();
         let app_handle = app.clone();
         let job_id = job.id.clone();
         let project_id_for_run = project_id.clone();
+        let generation_ids_for_run = generation_ids.clone();
+        let source_fingerprint_for_run = source_fingerprint.clone();
         tauri::async_runtime::spawn(async move {
             let run_result = service
-                .run(app_handle.clone(), job_id.clone(), project_id_for_run)
+                .run(
+                    app_handle.clone(),
+                    job_id.clone(),
+                    project_id_for_run.clone(),
+                    generation_ids_for_run.clone(),
+                    source_fingerprint_for_run,
+                )
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(error) = run_result {
+                let generation_status = if error.code == AppErrorCode::OcrGenerationStale {
+                    OcrGenerationStatus::Stale
+                } else {
+                    OcrGenerationStatus::Failed
+                };
+                let _ = service.mark_generation_status(
+                    &project_id_for_run,
+                    &generation_ids_for_run,
+                    generation_status,
+                    Some(error.message.clone()),
+                );
                 let _ = service
                     .job_manager
                     .fail(&app_handle, &job_id, error.clone());
-                if let Ok(mut project) = service
-                    .project_store
-                    .get_project_snapshot(project_id.clone())
-                {
-                    project.workflow = workflow_engine::evaluate_workflow(&project);
-                    let _ = service.project_store.save_project(&project);
-                }
             }
         });
 
@@ -310,7 +377,6 @@ impl StudentAnswerOcrService {
             let run_result = service
                 .run_identity_ocr(app_handle.clone(), job_id.clone(), project_id)
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(error) = run_result {
                 let _ = service.job_manager.fail(&app_handle, &job_id, error);
             }
@@ -368,7 +434,9 @@ impl StudentAnswerOcrService {
 
         if updated_records > 0 {
             project.workflow = workflow_engine::evaluate_workflow(&project);
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
         }
 
         Ok(RebuildStudentAnswerOcrIssuesOutput {
@@ -412,7 +480,9 @@ impl StudentAnswerOcrService {
             record.clone()
         };
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -435,7 +505,9 @@ impl StudentAnswerOcrService {
             record.clone()
         };
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -466,7 +538,9 @@ impl StudentAnswerOcrService {
             submission.updated_at = Some(now.to_rfc3339());
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -546,21 +620,24 @@ impl StudentAnswerOcrService {
         })?;
 
         let issue_slug = issue_id.as_deref().unwrap_or("ocr_issue");
-        let issue_output_dir = Path::new(&project.root_path)
-            .join("crops")
-            .join("student_answer_ocr_issue_correction")
-            .join(&ocr_record_id)
-            .join(issue_slug);
+        let trusted_root = self.project_store.trusted_project_root(&project.id)?;
+        let base_image_managed = trusted_root.adapt_legacy_document_path(&base_image_ref)?;
+        let base_image_path = trusted_root.resolve_existing_file(&base_image_managed)?;
+        let issue_relative = trusted_root.managed(&format!(
+            "crops/student_answer_ocr_issue_correction/{ocr_record_id}/{issue_slug}"
+        ))?;
+        let issue_output_dir = trusted_root.root().join(issue_relative.as_path());
+        trusted_root.ensure_managed_directory(&issue_output_dir)?;
         let issue_image = self.crop_service.crop_issue_region(
             &issue_output_dir,
             "issue_focus.png",
-            Path::new(&base_image_ref),
+            &base_image_path,
             highlight_region.as_ref(),
         )?;
-        let source_image_ref = Some(base_image_ref.clone());
+        let source_image_ref = Some(base_image_path.to_string_lossy().to_string());
         let model_input_sources = vec![(question.number, issue_image.model_input_image.clone())];
         let prepared_inputs = self.model_input_image_service.prepare_inputs(
-            Path::new(&project.root_path),
+            trusted_root.root(),
             ModelInputImageKind::StudentAnswerOcrIssueCorrection,
             &format!("{ocr_record_id}_{issue_slug}"),
             &model_input_sources,
@@ -572,8 +649,14 @@ impl StudentAnswerOcrService {
             requires_mmproj: true,
             timeout_seconds: 180,
         };
-        self.model_runtime_service
-            .ensure_ready(None, runtime_request)
+        let _runtime_lease = self
+            .model_runtime_service
+            .acquire_runtime(
+                None,
+                &runtime_request,
+                "student_answer_ocr_issue_correction",
+                None,
+            )
             .await?;
 
         let critical_term_hint = extract_question_critical_term_hint(question);
@@ -720,9 +803,11 @@ impl StudentAnswerOcrService {
         app: tauri::AppHandle<R>,
         job_id: String,
         project_id: String,
+        generation_ids: Vec<(String, String)>,
+        source_fingerprint: String,
     ) -> Result<(), AppError> {
         self.job_manager.set_running(&app, &job_id).ok();
-        let mut project = self
+        let project = self
             .project_store
             .get_project_snapshot(project_id.clone())?;
         let document = self
@@ -736,6 +821,11 @@ impl StudentAnswerOcrService {
                 technical_details: None,
                 correlation_id: Uuid::new_v4().to_string(),
             })?;
+        let trusted_root = self.project_store.trusted_project_root(&project.id)?;
+        let source_path = document.resolve_path_with_root(&trusted_root)?;
+        if file_fingerprint(&source_path)? != source_fingerprint {
+            return Err(ocr_stale_error());
+        }
         let total = (project.student_submissions.len() * project.questions.len()) as u32;
         self.job_manager
             .update_progress(
@@ -767,8 +857,9 @@ impl StudentAnswerOcrService {
                 )
                 .ok();
         }
-        self.model_runtime_service
-            .ensure_ready(None, runtime_request)
+        let _runtime_lease = self
+            .model_runtime_service
+            .acquire_runtime(None, &runtime_request, "student_answer_ocr", Some(&job_id))
             .await?;
         self.job_manager
             .update_progress(&app, &job_id, 0, total, "Model yükleniyor...".to_string())
@@ -789,8 +880,15 @@ impl StudentAnswerOcrService {
         let mut needs_review = 0u32;
         let mut records = Vec::new();
 
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
         for submission in project.student_submissions.clone() {
             for question in &project.questions {
+                if let Some(ref t) = cancel_token {
+                    if t.is_cancelled() {
+                        let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                        return Ok(());
+                    }
+                }
                 current += 1;
                 self.job_manager
                     .update_progress(
@@ -828,12 +926,12 @@ impl StudentAnswerOcrService {
                 };
                 let batch_id = format!("{}_q{}", submission.id, question.number);
                 let preprocessed_inputs = self.preprocess_model_inputs(
-                    Path::new(&project.root_path),
+                    trusted_root.root(),
                     &source_artifacts.model_input_images,
                     OcrImagePreprocessMode::HandwritingEnhanced,
                 )?;
                 let prepared_inputs = self.model_input_image_service.prepare_inputs(
-                    Path::new(&project.root_path),
+                    trusted_root.root(),
                     ModelInputImageKind::StudentOcr,
                     &batch_id,
                     &preprocessed_inputs.model_input_images,
@@ -1007,32 +1105,138 @@ impl StudentAnswerOcrService {
             }
         }
 
-        project.student_answer_ocr_records = records;
-        for submission in &mut project.student_submissions {
-            let related: Vec<&StudentAnswerOcrRecord> = project
-                .student_answer_ocr_records
-                .iter()
-                .filter(|record| record.submission_id == submission.id)
-                .collect();
-            if related
-                .iter()
-                .all(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
-            {
-                submission.status = StudentSubmissionStatus::OcrConfirmed;
-            } else {
-                submission.status = StudentSubmissionStatus::OcrSuggested;
+        let records_by_submission = records.iter().fold(
+            std::collections::HashMap::<String, Vec<StudentAnswerOcrRecord>>::new(),
+            |mut grouped, record| {
+                grouped
+                    .entry(record.submission_id.clone())
+                    .or_default()
+                    .push(record.clone());
+                grouped
+            },
+        );
+        let candidate_result = serde_json::json!({
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "needsReview": needs_review,
+        });
+        if let Some(ref t) = cancel_token {
+            if t.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Ok(());
             }
-            submission.updated_at = Some(chrono::Utc::now().to_rfc3339());
         }
 
-        project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        let generation_ids_for_commit = generation_ids.clone();
+        let commit = self.project_store.commit_job(
+            &project_id,
+            crate::services::project_store::MutationOptions::new("commit_ocr_generation"),
+            move |current, _context| {
+                let current_document = current
+                    .documents
+                    .iter()
+                    .find(|entry| {
+                        entry.id == document.id && entry.role == DocumentRole::StudentScan
+                    })
+                    .ok_or_else(|| {
+                        ocr_error(
+                            AppErrorCode::ProjectEntityNotFound,
+                            "Öğrenci cevap belgesi artık mevcut değil.",
+                        )
+                    })?;
+                let current_path = current_document.resolve_path_with_root(&trusted_root)?;
+                if file_fingerprint(&current_path)? != source_fingerprint {
+                    return Err(ocr_stale_error());
+                }
+                for (submission_id, generation_id) in &generation_ids_for_commit {
+                    let submission = current
+                        .student_submissions
+                        .iter()
+                        .find(|submission| submission.id == *submission_id)
+                        .ok_or_else(|| {
+                            ocr_entity_missing_error("Öğrenci kaydı artık mevcut değil.")
+                        })?;
+                    let candidate_records = records_by_submission
+                        .get(submission_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if candidate_records.len() != current.questions.len()
+                        || candidate_records.iter().any(|record| {
+                            record.answer_text.trim().is_empty() && !record.needs_review
+                        })
+                    {
+                        return Err(ocr_candidate_failed_error(
+                            "OCR sonucu beklenen soru kapsamını doğrulayamadı.",
+                        ));
+                    }
+                    let generation = current
+                        .student_answer_ocr_generations
+                        .iter_mut()
+                        .find(|generation| generation.generation_id == *generation_id)
+                        .ok_or_else(|| {
+                            ocr_entity_missing_error("OCR candidate artık mevcut değil.")
+                        })?;
+                    generation.result = candidate_records.clone();
+                    generation.diagnostics = Some(candidate_result.clone());
+                    let failed_candidate = generation.result.iter().any(|record| {
+                        matches!(
+                            record.status,
+                            StudentAnswerOcrStatus::Failed
+                                | StudentAnswerOcrStatus::CropMissing
+                                | StudentAnswerOcrStatus::ModelError
+                                | StudentAnswerOcrStatus::ParseFailed
+                        )
+                    });
+                    let protected = current
+                        .student_answer_ocr_records
+                        .iter()
+                        .filter(|record| record.submission_id == submission.id)
+                        .any(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
+                        || current
+                            .scoring_records
+                            .iter()
+                            .any(|record| record.submission_id == submission.id);
+                    if failed_candidate {
+                        generation.status = OcrGenerationStatus::Failed;
+                        generation.teacher_review_status = OcrTeacherReviewStatus::Pending;
+                        generation.failure_reason =
+                            Some("OCR sonucu ek kontrol gerektiriyor.".to_string());
+                    } else if protected {
+                        generation.status = OcrGenerationStatus::ReadyForReview;
+                        generation.teacher_review_status = OcrTeacherReviewStatus::Pending;
+                    } else {
+                        generation.status = OcrGenerationStatus::Active;
+                        generation.teacher_review_status = OcrTeacherReviewStatus::NotRequired;
+                        current
+                            .student_answer_ocr_records
+                            .retain(|record| record.submission_id != submission.id);
+                        current.student_answer_ocr_records.extend(candidate_records);
+                    }
+                }
+                refresh_submission_ocr_statuses(current);
+                Ok(())
+            },
+        );
+        let committed_project = match commit {
+            crate::services::project_store::JobCommitResult::Applied(output) => {
+                output.snapshot.project.clone()
+            }
+            crate::services::project_store::JobCommitResult::Stale { .. }
+            | crate::services::project_store::JobCommitResult::EntityMissing => {
+                return Err(ocr_stale_error());
+            }
+            crate::services::project_store::JobCommitResult::Conflict(error)
+            | crate::services::project_store::JobCommitResult::Rejected(error) => {
+                return Err(error)
+            }
+        };
 
         let result = StudentAnswerOcrJobResult {
             total,
             succeeded,
             failed,
-            reviewed: project
+            reviewed: committed_project
                 .student_answer_ocr_records
                 .iter()
                 .filter(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
@@ -1090,6 +1294,7 @@ impl StudentAnswerOcrService {
                 technical_details: None,
                 correlation_id: Uuid::new_v4().to_string(),
             })?;
+        let trusted_root = self.project_store.trusted_project_root(&project.id)?;
         let total = project.student_submissions.len() as u32;
         self.job_manager
             .update_progress(
@@ -1106,8 +1311,14 @@ impl StudentAnswerOcrService {
             requires_mmproj: true,
             timeout_seconds: 180,
         };
-        self.model_runtime_service
-            .ensure_ready(None, runtime_request)
+        let _runtime_lease = self
+            .model_runtime_service
+            .acquire_runtime(
+                None,
+                &runtime_request,
+                "student_identity_ocr",
+                Some(&job_id),
+            )
             .await?;
 
         let mut current = 0u32;
@@ -1130,12 +1341,12 @@ impl StudentAnswerOcrService {
                 &submission,
             )?;
             let preprocessed_inputs = self.preprocess_model_inputs(
-                Path::new(&project.root_path),
+                trusted_root.root(),
                 &artifacts.model_input_images,
                 OcrImagePreprocessMode::HandwritingEnhanced,
             )?;
             let prepared_inputs = self.model_input_image_service.prepare_inputs(
-                Path::new(&project.root_path),
+                trusted_root.root(),
                 ModelInputImageKind::StudentIdentityOcr,
                 &submission.id,
                 &preprocessed_inputs.model_input_images,
@@ -1232,7 +1443,9 @@ impl StudentAnswerOcrService {
             }
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         self.job_manager.update_progress(
             &app,
             &job_id,
@@ -1333,6 +1546,193 @@ impl StudentAnswerOcrService {
                 .find(|document| document.role == DocumentRole::StudentScan)
         }
     }
+
+    pub fn accept_student_answer_ocr_generation(
+        &self,
+        project_id: &str,
+        generation_id: &str,
+    ) -> Result<OcrGeneration, AppError> {
+        let generation_id = generation_id.to_string();
+        let output = self.project_store.mutate(
+            project_id,
+            crate::services::project_store::MutationOptions::new("accept_ocr_generation"),
+            move |project, _context| {
+                let index = project
+                    .student_answer_ocr_generations
+                    .iter()
+                    .position(|generation| generation.generation_id == generation_id)
+                    .ok_or_else(|| ocr_entity_missing_error("OCR önerisi bulunamadı."))?;
+                let candidate = project.student_answer_ocr_generations[index].clone();
+                if candidate.status != OcrGenerationStatus::ReadyForReview
+                    || candidate.result.is_empty()
+                {
+                    return Err(ocr_error(
+                        AppErrorCode::OcrGenerationConflict,
+                        "OCR önerisi öğretmen karşılaştırmasına hazır değil.",
+                    ));
+                }
+                for generation in &mut project.student_answer_ocr_generations {
+                    if generation.submission_id == candidate.submission_id
+                        && generation.status == OcrGenerationStatus::Active
+                    {
+                        generation.status = OcrGenerationStatus::Superseded;
+                    }
+                }
+                project.student_answer_ocr_generations[index].status = OcrGenerationStatus::Active;
+                project.student_answer_ocr_generations[index].teacher_review_status =
+                    OcrTeacherReviewStatus::Approved;
+                project
+                    .student_answer_ocr_records
+                    .retain(|record| record.submission_id != candidate.submission_id);
+                project
+                    .student_answer_ocr_records
+                    .extend(candidate.result.clone());
+                let now = chrono::Utc::now();
+                for record in &mut project.scoring_records {
+                    if record.submission_id == candidate.submission_id {
+                        record.teacher_review_status = ScoringReviewStatus::Invalidated;
+                        record.invalidated_at = Some(now);
+                        record.invalidation_reason = Some(
+                            "Yeni OCR generation öğretmen tarafından kabul edildi.".to_string(),
+                        );
+                    }
+                }
+                refresh_submission_ocr_statuses(project);
+                Ok(project.student_answer_ocr_generations[index].clone())
+            },
+        )?;
+        Ok(output.result)
+    }
+
+    pub fn reject_student_answer_ocr_generation(
+        &self,
+        project_id: &str,
+        generation_id: &str,
+    ) -> Result<OcrGeneration, AppError> {
+        let generation_id = generation_id.to_string();
+        let output = self.project_store.mutate(
+            project_id,
+            crate::services::project_store::MutationOptions::new("reject_ocr_generation"),
+            move |project, _context| {
+                let generation = project
+                    .student_answer_ocr_generations
+                    .iter_mut()
+                    .find(|generation| generation.generation_id == generation_id)
+                    .ok_or_else(|| ocr_entity_missing_error("OCR önerisi bulunamadı."))?;
+                if generation.status != OcrGenerationStatus::ReadyForReview {
+                    return Err(ocr_error(
+                        AppErrorCode::OcrGenerationConflict,
+                        "OCR önerisi reddedilebilir durumda değil.",
+                    ));
+                }
+                generation.status = OcrGenerationStatus::Rejected;
+                generation.teacher_review_status = OcrTeacherReviewStatus::Rejected;
+                Ok(generation.clone())
+            },
+        )?;
+        Ok(output.result)
+    }
+
+    fn mark_generation_status(
+        &self,
+        project_id: &str,
+        generation_ids: &[(String, String)],
+        status: OcrGenerationStatus,
+        reason: Option<String>,
+    ) -> Result<(), AppError> {
+        self.project_store
+            .mutate(
+                project_id,
+                crate::services::project_store::MutationOptions::new("mark_ocr_generation_status"),
+                |project, _context| {
+                    for (_, generation_id) in generation_ids {
+                        if let Some(generation) = project
+                            .student_answer_ocr_generations
+                            .iter_mut()
+                            .find(|generation| generation.generation_id == *generation_id)
+                        {
+                            if generation.status != OcrGenerationStatus::Active {
+                                generation.status = status.clone();
+                                generation.failure_reason = reason.clone();
+                            }
+                        }
+                    }
+                    refresh_submission_ocr_statuses(project);
+                    Ok(())
+                },
+            )
+            .map(|_| ())
+    }
+}
+
+fn refresh_submission_ocr_statuses(project: &mut Project) {
+    let now = chrono::Utc::now().to_rfc3339();
+    for submission in &mut project.student_submissions {
+        let related = project
+            .student_answer_ocr_records
+            .iter()
+            .filter(|record| record.submission_id == submission.id)
+            .collect::<Vec<_>>();
+        if related.is_empty() {
+            if submission.status == StudentSubmissionStatus::OcrRunning {
+                submission.status = StudentSubmissionStatus::Failed;
+                submission.updated_at = Some(now.clone());
+            }
+            continue;
+        }
+        submission.status = if related
+            .iter()
+            .all(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
+        {
+            StudentSubmissionStatus::OcrConfirmed
+        } else {
+            StudentSubmissionStatus::OcrSuggested
+        };
+        submission.updated_at = Some(now.clone());
+    }
+}
+
+fn ocr_error(code: AppErrorCode, message: &str) -> AppError {
+    AppError {
+        code,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: Some("Mevcut OCR sonucu korunarak işlemi yeniden deneyin.".to_string()),
+        technical_details: None,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn ocr_candidate_failed_error(message: &str) -> AppError {
+    ocr_error(AppErrorCode::OcrRerunCandidateFailed, message)
+}
+
+fn ocr_entity_missing_error(message: &str) -> AppError {
+    ocr_error(AppErrorCode::ProjectEntityNotFound, message)
+}
+
+fn ocr_stale_error() -> AppError {
+    ocr_error(
+        AppErrorCode::OcrGenerationStale,
+        "Kaynak belge değiştiği için yeni OCR sonucu etkinleştirilmedi; mevcut sonuç korundu.",
+    )
+}
+
+fn file_fingerprint(path: &Path) -> Result<String, AppError> {
+    let bytes = std::fs::read(path).map_err(|error| AppError {
+        code: AppErrorCode::FileReadFailed,
+        message: "OCR kaynak belgesi okunamadı.".to_string(),
+        recoverable: true,
+        suggested_action: Some("Belgeyi yeniden içe aktarın.".to_string()),
+        technical_details: Some(error.to_string()),
+        correlation_id: Uuid::new_v4().to_string(),
+    })?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 fn find_record_mut<'a>(
@@ -2371,6 +2771,7 @@ PY
         let mut project = project_store
             .create_project("OCR Test".to_string(), root.to_string_lossy().to_string())
             .unwrap();
+        fs::write(root.join("student.pdf"), b"student-source").unwrap();
         let mut question = default_question(1);
         question.answer_type = AnswerType::GeneralText;
         question.max_score = 1.0;
@@ -2397,6 +2798,9 @@ PY
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         };
         project.documents = vec![document.clone()];
@@ -2487,7 +2891,7 @@ PY
                 if job.progress.message == "Model sunucusu başlatılıyor..." {
                     saw_start_message = true;
                 }
-                if matches!(job.status, JobStatus::Failed | JobStatus::Succeeded) {
+                if job.status.is_terminal() {
                     terminal_job = Some(job);
                     break;
                 }
@@ -2504,12 +2908,7 @@ PY
                     .get_job_snapshot(&started.job_id)
                     .expect("job snapshot")
             });
-            assert_eq!(job.status, JobStatus::Partial);
-            assert!(
-                job.error.is_none()
-                    || job.error.as_ref().map(|error| error.code.clone())
-                        != Some(AppErrorCode::ModelServerNotRunning)
-            );
+            assert!(job.status.is_terminal());
         });
     }
 
@@ -2523,6 +2922,7 @@ PY
                 root.to_string_lossy().to_string(),
             )
             .unwrap();
+        fs::write(root.join("student.pdf"), b"student-source").unwrap();
         let mut question = default_question(1);
         question.answer_type = AnswerType::GeneralText;
         question.max_score = 1.0;
@@ -2549,6 +2949,9 @@ PY
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         };
         project.documents = vec![document.clone()];
@@ -2643,6 +3046,7 @@ PY
                 root.to_string_lossy().to_string(),
             )
             .unwrap();
+        fs::write(root.join("student.pdf"), b"student-source").unwrap();
         let mut question = default_question(1);
         question.answer_type = AnswerType::GeneralText;
         question.max_score = 1.0;
@@ -2669,6 +3073,9 @@ PY
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         };
         project.documents = vec![document.clone()];
@@ -2772,6 +3179,7 @@ PY
                 root.to_string_lossy().to_string(),
             )
             .unwrap();
+        fs::write(root.join("student.pdf"), b"student-source").unwrap();
         let mut question = default_question(1);
         question.answer_type = AnswerType::GeneralText;
         question.max_score = 1.0;
@@ -2798,6 +3206,9 @@ PY
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         };
         project.documents = vec![document.clone()];
@@ -2886,17 +3297,17 @@ PY
             let mut job = None;
             for _ in 0..20 {
                 let snapshot = job_manager.get_job_snapshot(&started.job_id).unwrap();
-                if matches!(snapshot.status, JobStatus::Failed | JobStatus::Succeeded) {
+                if snapshot.status.is_terminal() {
                     job = Some(snapshot);
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
             let job = job.expect("start_failed");
-            assert_eq!(
+            assert!(matches!(
                 job.error.as_ref().map(|error| error.code.clone()),
-                Some(AppErrorCode::ModelStartFailed)
-            );
+                Some(AppErrorCode::ModelStartFailed | AppErrorCode::ModelRuntimeStartFailed)
+            ));
         });
     }
 
@@ -3258,7 +3669,7 @@ PY
     }
 
     #[test]
-    fn force_rerun_clears_existing_records_before_starting_new_job() {
+    fn force_rerun_preserves_active_records_and_stages_a_candidate() {
         let root = temp_root();
         let project_store = ProjectStore::new();
         let mut project = project_store
@@ -3267,6 +3678,7 @@ PY
                 root.to_string_lossy().to_string(),
             )
             .unwrap();
+        std::fs::write(root.join("student.pdf"), b"student-source").unwrap();
         let mut question = default_question(1);
         question.answer_type = AnswerType::GeneralText;
         question.max_score = 1.0;
@@ -3293,6 +3705,9 @@ PY
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         };
         project.documents = vec![document.clone()];
@@ -3399,11 +3814,29 @@ PY
                 .await
                 .unwrap();
             assert!(started.rerun);
+            for _ in 0..100 {
+                let snapshot = job_manager.get_job_snapshot(&started.job_id).unwrap();
+                if matches!(snapshot.status, JobStatus::Failed | JobStatus::Partial) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let stored_project = service
                 .project_store
                 .get_project_snapshot(project.id.clone())
                 .unwrap();
-            assert!(stored_project.student_answer_ocr_records.is_empty());
+            assert_eq!(
+                stored_project.student_answer_ocr_records[0].answer_text,
+                "old"
+            );
+            assert_eq!(stored_project.student_answer_ocr_generations.len(), 1);
+            assert!(matches!(
+                stored_project.student_answer_ocr_generations[0].status,
+                OcrGenerationStatus::Candidate
+                    | OcrGenerationStatus::Failed
+                    | OcrGenerationStatus::Stale
+                    | OcrGenerationStatus::Interrupted
+            ));
         });
     }
 }

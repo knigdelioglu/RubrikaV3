@@ -87,9 +87,9 @@ export function hasApprovedStudentAnswerOcrRecords(records: StudentAnswerOcrReco
 
 export function getStudentAnswerOcrRerunConfirmMessage(hasApprovedRecords: boolean) {
   if (hasApprovedRecords) {
-    return 'Bu OCR onaylı. Yeniden OCR yapmak istiyor musunuz? Mevcut OCR sonuçları silinip yeniden üretilecek.';
+    return 'Bu OCR onaylı. Yeniden OCR yapmak istiyor musunuz? Mevcut onaylı sonuç korunacak ve yeni sonuç öğretmen karşılaştırmasına sunulacak.';
   }
-  return 'Mevcut OCR sonuçları silinip yeniden üretilecek. Devam edilsin mi?';
+  return 'OCR yeniden çalıştırılacak. Mevcut sonuç korunacak; yeni sonuç hazır olduğunda karşılaştırabilirsiniz. Devam edilsin mi?';
 }
 
 export function getStudentAnswerOcrPreviewMode(record: StudentAnswerOcrRecord) {

@@ -1,8 +1,11 @@
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::domain::assessment::TeachingAssignment;
 use crate::domain::document::{Document, DocumentRole};
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::project::Project;
@@ -16,6 +19,9 @@ use crate::domain::student::{
 };
 use crate::platform::file_access::{remove_dir_within, remove_file_within};
 use crate::services::project_store::ProjectStore;
+use crate::services::student_scan_service::{
+    persisted_dependency_jobs, scan_submission_dependencies_with_jobs,
+};
 use crate::services::workflow_engine;
 
 #[derive(Clone)]
@@ -105,6 +111,29 @@ pub struct ListClassStudentsInput {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CreateClassStudentInput {
+    pub project_id: String,
+    pub class_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClassStudentInput {
+    pub project_id: String,
+    pub class_id: String,
+    pub student_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportStudentScanBatchInput {
     pub project_id: String,
     pub class_id: String,
@@ -161,6 +190,54 @@ pub struct RemoveStudentScanBatchInput {
     pub batch_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListAssessmentClassesInput {
+    pub project_id: String,
+    pub academic_year_id: String,
+    pub course_id: String,
+    pub grade_level: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTeachingAssignmentsInput {
+    pub project_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub academic_year_id: Option<String>,
+    #[serde(default)]
+    pub include_inactive: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchCreateTeachingAssignmentsInput {
+    pub project_id: String,
+    pub academic_year_id: String,
+    pub course_id: String,
+    pub course_name: String,
+    pub class_section_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTeachingAssignmentInput {
+    pub project_id: String,
+    pub academic_year_id: String,
+    pub course_id: String,
+    pub course_name: String,
+    pub class_section_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeachingAssignmentIdInput {
+    pub project_id: String,
+    pub assignment_id: String,
+}
+
 impl SchoolClassService {
     pub fn new(project_store: ProjectStore) -> Self {
         Self { project_store }
@@ -182,6 +259,207 @@ impl SchoolClassService {
         Ok(classes)
     }
 
+    /// The single source used by every assessment type when selecting classes.
+    /// Assignment filtering deliberately happens here, next to the canonical class read.
+    pub fn list_assessment_classes(
+        &self,
+        input: ListAssessmentClassesInput,
+    ) -> Result<Vec<SchoolClass>, AppError> {
+        let project = self.load_project(&input.project_id)?;
+        let mut classes = project
+            .school_classes
+            .iter()
+            .filter(|school_class| {
+                school_class.status == SchoolClassStatus::Active
+                    && class_matches_academic_year(school_class, &input.academic_year_id)
+                    && school_class.grade_level == Some(input.grade_level)
+                    && project.teaching_assignments.iter().any(|assignment| {
+                        assignment.is_active
+                            && assignment.academic_year_id == input.academic_year_id
+                            && assignment.course_id == input.course_id
+                            && assignment.class_section_id == school_class.id
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_classes(&mut classes);
+        Ok(classes)
+    }
+
+    pub fn list_teaching_assignments(
+        &self,
+        input: ListTeachingAssignmentsInput,
+    ) -> Result<Vec<TeachingAssignment>, AppError> {
+        let project = self.load_project(&input.project_id)?;
+        let mut assignments = project
+            .teaching_assignments
+            .into_iter()
+            .filter(|assignment| {
+                input
+                    .academic_year_id
+                    .as_ref()
+                    .map_or(true, |year| &assignment.academic_year_id == year)
+                    && (input.include_inactive || assignment.is_active)
+            })
+            .collect::<Vec<_>>();
+        assignments.sort_by(|left, right| {
+            left.course_name
+                .cmp(&right.course_name)
+                .then_with(|| left.class_section_id.cmp(&right.class_section_id))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(assignments)
+    }
+
+    pub fn batch_create_teaching_assignments(
+        &self,
+        input: BatchCreateTeachingAssignmentsInput,
+    ) -> Result<Vec<TeachingAssignment>, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let academic_year_id = required_text(input.academic_year_id, "academic_year_id")?;
+        let course_id = required_text(input.course_id, "course_id")?;
+        let course_name = required_text(input.course_name, "course_name")?;
+
+        let mut created_assignments = Vec::new();
+        let now = chrono::Utc::now().to_rfc3339();
+
+        for class_id in input.class_section_ids {
+            let class_id = class_id.trim().to_string();
+            if class_id.is_empty() {
+                continue;
+            }
+            let class_index = match class_index(&project, &class_id) {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
+            let school_class = &project.school_classes[class_index];
+            if school_class.status != SchoolClassStatus::Active {
+                continue;
+            }
+
+            if project.teaching_assignments.iter().any(|assignment| {
+                assignment.is_active
+                    && assignment.academic_year_id == academic_year_id
+                    && assignment.course_id == course_id
+                    && assignment.class_section_id == class_id
+            }) {
+                continue;
+            }
+
+            let assignment = TeachingAssignment {
+                id: uuid::Uuid::new_v4().to_string(),
+                academic_year_id: academic_year_id.clone(),
+                course_id: course_id.clone(),
+                course_name: course_name.clone(),
+                class_section_id: class_id,
+                teacher_id: None,
+                is_active: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            project.teaching_assignments.push(assignment.clone());
+            created_assignments.push(assignment);
+        }
+
+        if !created_assignments.is_empty() {
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
+        }
+
+        Ok(created_assignments)
+    }
+
+    pub fn create_teaching_assignment(
+        &self,
+        input: CreateTeachingAssignmentInput,
+    ) -> Result<TeachingAssignment, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let academic_year_id = required_text(input.academic_year_id, "academic_year_id")?;
+        let course_id = required_text(input.course_id, "course_id")?;
+        let course_name = required_text(input.course_name, "course_name")?;
+        let class_index = class_index(&project, &input.class_section_id)?;
+        let school_class = &project.school_classes[class_index];
+        if school_class.status != SchoolClassStatus::Active {
+            return Err(app_error(
+                AppErrorCode::SchoolClassArchived,
+                "Arşivlenmiş sınıfa ders görevlendirmesi yapılamaz.",
+                Some(format!("class_id={}", input.class_section_id)),
+                Some("Önce sınıfı yeniden etkinleştirin.".to_string()),
+            ));
+        }
+        if !class_matches_academic_year(school_class, &academic_year_id) {
+            return Err(app_error(
+                AppErrorCode::TeachingAssignmentInvalid,
+                "Sınıf, seçilen eğitim yılına bağlı değil.",
+                Some(format!(
+                    "class_id={}; academic_year_id={academic_year_id}",
+                    input.class_section_id
+                )),
+                Some("Kurulum → Sınıflar bölümünde aynı eğitim yılını seçin.".to_string()),
+            ));
+        }
+        if project.teaching_assignments.iter().any(|assignment| {
+            assignment.is_active
+                && assignment.academic_year_id == academic_year_id
+                && assignment.course_id == course_id
+                && assignment.class_section_id == input.class_section_id
+        }) {
+            return Err(app_error(
+                AppErrorCode::TeachingAssignmentAlreadyExists,
+                "Bu ders ve sınıf görevlendirmesi zaten mevcut.",
+                Some(format!(
+                    "course_id={course_id}; class_id={}",
+                    input.class_section_id
+                )),
+                Some("Mevcut görevlendirmeyi kullanın.".to_string()),
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let assignment = TeachingAssignment {
+            id: Uuid::new_v4().to_string(),
+            academic_year_id,
+            course_id,
+            course_name,
+            class_section_id: input.class_section_id,
+            teacher_id: normalize_optional(input.teacher_id),
+            is_active: true,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        project.teaching_assignments.push(assignment.clone());
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
+        Ok(assignment)
+    }
+
+    pub fn archive_teaching_assignment(
+        &self,
+        input: TeachingAssignmentIdInput,
+    ) -> Result<TeachingAssignment, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let assignment = project
+            .teaching_assignments
+            .iter_mut()
+            .find(|assignment| assignment.id == input.assignment_id)
+            .ok_or_else(|| {
+                app_error(
+                    AppErrorCode::TeachingAssignmentNotFound,
+                    "Ders görevlendirmesi bulunamadı.",
+                    Some(format!("assignment_id={}", input.assignment_id)),
+                    Some("Görevlendirme listesini yenileyin.".to_string()),
+                )
+            })?;
+        assignment.is_active = false;
+        assignment.updated_at = chrono::Utc::now().to_rfc3339();
+        let archived = assignment.clone();
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
+        Ok(archived)
+    }
+
     pub fn create_school_class(
         &self,
         input: CreateSchoolClassInput,
@@ -190,6 +468,7 @@ impl SchoolClassService {
         let normalized_name = require_normalized_name(&input.name)?;
         ensure_active_name_unique(&project, &normalized_name, None)?;
         let now = chrono::Utc::now().to_rfc3339();
+        let academic_year = normalize_optional(input.academic_year);
         let display_order = input.display_order.unwrap_or_else(|| {
             project
                 .school_classes
@@ -202,8 +481,10 @@ impl SchoolClassService {
         let school_class = SchoolClass {
             id: Uuid::new_v4().to_string(),
             name: normalized_name.clone(),
+            display_name: normalized_name.clone(),
             normalized_name,
-            academic_year: normalize_optional(input.academic_year),
+            academic_year: academic_year.clone(),
+            academic_year_id: academic_year,
             grade_level: input.grade_level,
             section: normalize_optional(input.section).map(|value| value.to_uppercase()),
             display_order,
@@ -213,7 +494,9 @@ impl SchoolClassService {
         };
         project.school_classes.push(school_class.clone());
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(school_class)
     }
 
@@ -238,10 +521,12 @@ impl SchoolClassService {
         let school_class = &mut project.school_classes[class_index];
         if let Some(normalized_name) = next_name {
             school_class.name = normalized_name.clone();
+            school_class.display_name = normalized_name.clone();
             school_class.normalized_name = normalized_name;
         }
         if input.academic_year.is_some() {
             school_class.academic_year = normalize_optional(input.academic_year);
+            school_class.academic_year_id = school_class.academic_year.clone();
         }
         if let Some(grade_level) = input.grade_level {
             school_class.grade_level = Some(grade_level);
@@ -268,7 +553,9 @@ impl SchoolClassService {
                 }
             }
         }
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -304,6 +591,99 @@ impl SchoolClassService {
         students_for_class(&project, &input.class_id)
     }
 
+    pub fn create_class_student(
+        &self,
+        input: CreateClassStudentInput,
+    ) -> Result<Student, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let school_class = require_active_class(&project, &input.class_id)?.clone();
+        let display_name = normalize_optional(input.display_name);
+        let number = normalize_optional(input.number);
+        validate_student_identity(&display_name, &number)?;
+        ensure_student_number_unique(&project, &input.class_id, number.as_deref(), None)?;
+
+        let student = Student {
+            id: Uuid::new_v4().to_string(),
+            display_name,
+            number,
+            class_name: Some(school_class.normalized_name),
+            warnings: vec![],
+            identity_ocr: None,
+        };
+        project.students.push(student.clone());
+        project
+            .assessment_activities
+            .iter_mut()
+            .for_each(|activity| {
+                activity
+                    .class_applications
+                    .iter_mut()
+                    .for_each(|application| {
+                        if application.school_class_id == input.class_id
+                            && application.status
+                                != crate::domain::assessment::ClassApplicationStatus::Archived
+                        {
+                            application.student_scope_ids.push(student.id.clone());
+                            application.updated_at = chrono::Utc::now().to_rfc3339();
+                            activity.updated_at = application.updated_at.clone();
+                        }
+                    });
+            });
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
+        Ok(student)
+    }
+
+    pub fn update_class_student(
+        &self,
+        input: UpdateClassStudentInput,
+    ) -> Result<Student, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let school_class = require_active_class(&project, &input.class_id)?.clone();
+        let student_index = project
+            .students
+            .iter()
+            .position(|student| student.id == input.student_id)
+            .ok_or_else(|| {
+                student_error(
+                    AppErrorCode::StudentNotFound,
+                    "Öğrenci bulunamadı.",
+                    "student_id not found.",
+                )
+            })?;
+        let is_member = students_for_class(&project, &input.class_id)?
+            .iter()
+            .any(|student| student.id == input.student_id);
+        if !is_member {
+            return Err(student_error(
+                AppErrorCode::StudentNotFound,
+                "Öğrenci bu sınıfta kayıtlı değil.",
+                "student is not a member of the requested class.",
+            ));
+        }
+        let display_name = normalize_optional(input.display_name);
+        let number = normalize_optional(input.number);
+        validate_student_identity(&display_name, &number)?;
+        ensure_student_number_unique(
+            &project,
+            &input.class_id,
+            number.as_deref(),
+            Some(&input.student_id),
+        )?;
+
+        let student = &mut project.students[student_index];
+        student.display_name = display_name;
+        student.number = number;
+        student.class_name = Some(school_class.normalized_name);
+        student.warnings.clear();
+        let updated = student.clone();
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
+        Ok(updated)
+    }
+
     pub fn import_student_scan_batch(
         &self,
         input: ImportStudentScanBatchInput,
@@ -312,7 +692,14 @@ impl SchoolClassService {
         let school_class = require_active_class(&project, &input.class_id)?.clone();
         validate_pages_per_student(input.pages_per_student)?;
 
-        let source = Path::new(&input.source_path);
+        let source = std::fs::canonicalize(Path::new(&input.source_path)).map_err(|error| {
+            app_error(
+                AppErrorCode::DocumentImportFailed,
+                "Seçilen öğrenci PDF’i okunamadı.",
+                Some(error.to_string()),
+                Some("Geçerli bir PDF dosyası seçin.".to_string()),
+            )
+        })?;
         if !source.is_file() {
             return Err(app_error(
                 AppErrorCode::DocumentImportFailed,
@@ -327,20 +714,26 @@ impl SchoolClassService {
             .unwrap_or("student-scan.pdf")
             .to_string();
         let document_id = Uuid::new_v4().to_string();
-        let destination = Path::new(&project.root_path)
-            .join("documents")
-            .join(format!("{document_id}_{original_file_name}"));
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                app_error(
-                    AppErrorCode::DocumentImportFailed,
-                    "Proje belge klasörü hazırlanamadı.",
-                    Some(error.to_string()),
-                    Some("Proje klasörü izinlerini kontrol edin.".to_string()),
-                )
-            })?;
-        }
-        std::fs::copy(source, &destination).map_err(|error| {
+        let trusted_root = self.project_store.trusted_project_root(&input.project_id)?;
+        let safe_file_name = original_file_name
+            .chars()
+            .map(|character| match character {
+                '/' | '\\' | '\0' => '_',
+                _ => character,
+            })
+            .collect::<String>();
+        let safe_file_name = if safe_file_name.trim().is_empty()
+            || safe_file_name == "."
+            || safe_file_name == ".."
+        {
+            "student-scan.pdf".to_string()
+        } else {
+            safe_file_name
+        };
+        let managed_path =
+            trusted_root.managed(&format!("documents/{document_id}_{safe_file_name}"))?;
+        let destination = trusted_root.prepare_write_target(&managed_path)?;
+        copy_selected_source(&source, &destination).map_err(|error| {
             app_error(
                 AppErrorCode::DocumentImportFailed,
                 "Öğrenci PDF’i proje klasörüne kopyalanamadı.",
@@ -354,7 +747,7 @@ impl SchoolClassService {
             id: document_id.clone(),
             role: DocumentRole::StudentScan,
             file_name: original_file_name.clone(),
-            stored_path: destination.to_string_lossy().to_string(),
+            stored_path: managed_path.as_str().to_string(),
             page_count: 0,
             added_at: now.clone(),
             checksum: None,
@@ -372,9 +765,8 @@ impl SchoolClassService {
         project.student_scan_batches.push(batch.clone());
         set_legacy_active_batch(&mut project, &batch);
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        if let Err(error) = self.project_store.save_project(&project) {
-            let documents_dir = Path::new(&project.root_path).join("documents");
-            let _ = remove_file_within(&documents_dir, &destination);
+        if let Err(error) = self.project_store.commit_snapshot_cas(&project).map(|_| ()) {
+            let _ = remove_file_within(trusted_root.root(), &destination);
             return Err(error);
         }
         Ok(ImportStudentScanBatchOutput { document, batch })
@@ -425,7 +817,9 @@ impl SchoolClassService {
         project.student_scan_batches.push(batch.clone());
         set_legacy_active_batch(&mut project, &batch);
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(batch)
     }
 
@@ -479,7 +873,9 @@ impl SchoolClassService {
         }
 
         let updated = project.student_scan_batches[batch_index].clone();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -487,77 +883,146 @@ impl SchoolClassService {
         &self,
         input: RemoveStudentScanBatchInput,
     ) -> Result<StudentScanBatch, AppError> {
-        let mut project = self.load_project(&input.project_id)?;
-        let batch_index = batch_index(&project, &input.batch_id)?;
-        let batch = project.student_scan_batches[batch_index].clone();
-        let dependent_submission_ids = project
-            .student_submissions
-            .iter()
-            .filter(|submission| {
-                submission.scan_batch_id.as_deref() == Some(batch.id.as_str())
-                    || submission.document_id == batch.document_id
-            })
-            .map(|submission| submission.id.clone())
-            .collect::<Vec<_>>();
-        let ocr_count = project
-            .student_answer_ocr_records
-            .iter()
-            .filter(|record| dependent_submission_ids.contains(&record.submission_id))
-            .count();
-        let scoring_count = project
-            .scoring_records
-            .iter()
-            .filter(|record| dependent_submission_ids.contains(&record.submission_id))
-            .count();
-        if !dependent_submission_ids.is_empty() || ocr_count > 0 || scoring_count > 0 {
-            return Err(app_error(
-                AppErrorCode::StudentScanBatchInUse,
-                "Öğrenci paketi mevcut öğrenci işlemleri nedeniyle silinemez.",
-                Some(format!(
-                    "batch_id={}; submissions={}; ocr_records={ocr_count}; scoring_records={scoring_count}",
-                    batch.id,
-                    dependent_submission_ids.len()
-                )),
-                Some("Öğrenci, OCR ve notlandırma kayıtlarını koruyarak paketi kullanmaya devam edin.".to_string()),
-            ));
-        }
-
-        project.student_scan_batches.remove(batch_index);
+        let project = self.load_project(&input.project_id)?;
+        let batch = project.student_scan_batches[batch_index(&project, &input.batch_id)?].clone();
         let removed_document = project
             .documents
             .iter()
-            .position(|document| document.id == batch.document_id)
-            .map(|index| project.documents.remove(index));
-        if project.student_scan_document_id.as_deref() == Some(batch.document_id.as_str()) {
-            project.student_scan_document_id = None;
-            project.student_grouping_mode = None;
-            project.student_pages_per_student = None;
-            project.student_grouping_complete_at = None;
-        }
-        project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+            .find(|document| document.id == batch.document_id)
+            .cloned();
+        let batch_id = batch.id.clone();
+        let document_id = batch.document_id.clone();
+        let output = self.project_store.commit_job(
+            &input.project_id,
+            crate::services::project_store::MutationOptions::new("remove_student_scan_batch"),
+            move |current, _context| {
+                let current_batch_index = batch_index(current, &batch_id)?;
+                let current_batch = current.student_scan_batches[current_batch_index].clone();
+                let dependent_submission_ids = current
+                    .student_submissions
+                    .iter()
+                    .filter(|submission| {
+                        submission.scan_batch_id.as_deref() == Some(batch_id.as_str())
+                            || submission.document_id == document_id
+                    })
+                    .map(|submission| submission.id.clone())
+                    .collect::<Vec<_>>();
+                let jobs = persisted_dependency_jobs(current)?;
+                let dependency_scan = scan_submission_dependencies_with_jobs(
+                    current,
+                    &dependent_submission_ids,
+                    &jobs,
+                );
+                if !dependent_submission_ids.is_empty() || dependency_scan.is_blocked() {
+                    return Err(app_error(
+                        AppErrorCode::StudentScanBatchInUse,
+                        "Öğrenci paketi mevcut öğrenci işlemleri nedeniyle silinemez.",
+                        Some(format!(
+                            "batch_id={}; submissions={}; ocr_records={}; ocr_generations={}; scoring_records={}; running_jobs={}",
+                            current_batch.id,
+                            dependent_submission_ids.len(),
+                            dependency_scan.ocr_record_count,
+                            dependency_scan.ocr_generation_count,
+                            dependency_scan.scoring_record_count,
+                            dependency_scan.running_job_count
+                        )),
+                        Some("Öğrenci, OCR ve notlandırma kayıtlarını koruyarak paketi kullanmaya devam edin.".to_string()),
+                    ));
+                }
+
+                current.student_submissions.retain(|submission| {
+                    !(submission.scan_batch_id.as_deref() == Some(batch_id.as_str())
+                        || submission.document_id == document_id)
+                });
+                let referenced_student_ids = current
+                    .student_submissions
+                    .iter()
+                    .map(|submission| submission.student_id.clone())
+                    .collect::<std::collections::HashSet<_>>();
+                current
+                    .students
+                    .retain(|student| referenced_student_ids.contains(&student.id));
+                current.student_scan_batches.remove(current_batch_index);
+                current.documents.retain(|document| document.id != document_id);
+                if current.student_scan_document_id.as_deref() == Some(document_id.as_str()) {
+                    current.student_scan_document_id = None;
+                    current.student_grouping_mode = None;
+                    current.student_pages_per_student = None;
+                    current.student_grouping_complete_at = None;
+                }
+                current.workflow = workflow_engine::evaluate_workflow(current);
+                Ok(current_batch)
+            },
+        );
+        let removed_batch = match output {
+            crate::services::project_store::JobCommitResult::Applied(output) => output.result,
+            crate::services::project_store::JobCommitResult::Conflict(error)
+            | crate::services::project_store::JobCommitResult::Rejected(error) => {
+                return Err(error)
+            }
+            crate::services::project_store::JobCommitResult::Stale { reason } => {
+                return Err(app_error(
+                    AppErrorCode::SubmissionDeleteConflict,
+                    "Öğrenci paketi silinemedi; bağlı veri durumu değişti.",
+                    Some(reason),
+                    Some("Listeyi yenileyip bağımlılıkları tekrar kontrol edin.".to_string()),
+                ))
+            }
+            crate::services::project_store::JobCommitResult::EntityMissing => {
+                return Err(app_error(
+                    AppErrorCode::StudentScanBatchNotFound,
+                    "Öğrenci paketi artık mevcut değil.",
+                    None,
+                    Some("Listeyi yenileyin.".to_string()),
+                ))
+            }
+        };
 
         if let Some(document) = removed_document {
-            let documents_dir = Path::new(&project.root_path).join("documents");
-            if let Err(error) = remove_file_within(&documents_dir, Path::new(&document.stored_path))
-            {
+            let trusted_root = self.project_store.trusted_project_root(&input.project_id)?;
+            let document_path = document.resolve_path_with_root(&trusted_root);
+            let document_cleanup = match document_path {
+                Ok(path) => remove_file_within(trusted_root.root(), &path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = document_cleanup {
                 log::warn!(
                     "Sınıf paketi kaydı kaldırıldı ancak belge artığı güvenle silinemedi: document_id={}; error={error}",
                     document.id
                 );
             }
-            let preview_base = Path::new(&project.root_path)
-                .join("cache")
-                .join("page_previews");
-            let preview_dir = preview_base.join(&document.id);
-            if let Err(error) = remove_dir_within(&preview_base, &preview_dir) {
+            let preview_base = trusted_root.root().join("cache").join("page_previews");
+            let preview_path =
+                trusted_root.managed(&format!("cache/page_previews/{}", document.id));
+            let preview_dir =
+                preview_path.map(|managed| trusted_root.root().join(managed.as_path()));
+            let preview_cleanup = match preview_dir {
+                Ok(path) => remove_dir_within(&preview_base, &path)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = preview_cleanup {
                 log::warn!(
                     "Sınıf paketi kaydı kaldırıldı ancak önizleme artığı güvenle silinemedi: document_id={}; error={error}",
                     document.id
                 );
             }
+            let outputs_base = trusted_root.root().join("outputs").join("previews");
+            if let Ok(managed) = trusted_root.managed(&format!("outputs/previews/{}", document.id))
+            {
+                let output_dir = trusted_root.root().join(managed.as_path());
+                if let Err(error) = remove_dir_within(&outputs_base, &output_dir) {
+                    log::warn!(
+                        "Sınıf paketi kaydı kaldırıldı ancak immutable önizleme artığı silinemedi: document_id={}; error={error}",
+                        document.id
+                    );
+                }
+            }
         }
-        Ok(batch)
+        Ok(removed_batch)
     }
 
     fn set_class_status(
@@ -570,7 +1035,9 @@ impl SchoolClassService {
         project.school_classes[index].status = status;
         project.school_classes[index].updated_at = chrono::Utc::now().to_rfc3339();
         let updated = project.school_classes[index].clone();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -578,6 +1045,30 @@ impl SchoolClassService {
         self.project_store
             .get_project_snapshot(project_id.to_string())
     }
+}
+
+fn copy_selected_source(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let mut input = std::fs::File::open(source)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = (|| {
+        let mut buffer = [0_u8; 128 * 1024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buffer[..read])?;
+        }
+        output.sync_all()
+    })();
+    if result.is_err() {
+        drop(output);
+        let _ = std::fs::remove_file(destination);
+    }
+    result
 }
 
 pub fn students_for_class(project: &Project, class_id: &str) -> Result<Vec<Student>, AppError> {
@@ -872,6 +1363,77 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn validate_student_identity(
+    display_name: &Option<String>,
+    number: &Option<String>,
+) -> Result<(), AppError> {
+    if display_name.is_none() && number.is_none() {
+        return Err(student_error(
+            AppErrorCode::StudentIdentityInvalid,
+            "Öğrenci adı veya okul numarası girilmelidir.",
+            "class student requires display_name or number.",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_student_number_unique(
+    project: &Project,
+    class_id: &str,
+    number: Option<&str>,
+    except_student_id: Option<&str>,
+) -> Result<(), AppError> {
+    let Some(number) = number.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if students_for_class(project, class_id)?
+        .iter()
+        .any(|student| {
+            student.id != except_student_id.unwrap_or_default()
+                && student.number.as_deref().map(str::trim) == Some(number)
+        })
+    {
+        return Err(student_error(
+            AppErrorCode::StudentIdentityInvalid,
+            "Bu okul numarası sınıfta zaten kayıtlı.",
+            "student number is already used in the class.",
+        ));
+    }
+    Ok(())
+}
+
+fn student_error(code: AppErrorCode, message: &str, technical_details: &str) -> AppError {
+    AppError {
+        code,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: Some("Öğrenci bilgilerini kontrol edip tekrar deneyin.".to_string()),
+        technical_details: Some(technical_details.to_string()),
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn required_text(value: String, field: &str) -> Result<String, AppError> {
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        return Err(app_error(
+            AppErrorCode::TeachingAssignmentInvalid,
+            "Görevlendirme için zorunlu alan eksik.",
+            Some(format!("field={field}")),
+            Some("Eğitim yılı, ders ve sınıf bilgilerini doldurun.".to_string()),
+        ));
+    }
+    Ok(value)
+}
+
+fn class_matches_academic_year(school_class: &SchoolClass, academic_year_id: &str) -> bool {
+    school_class
+        .academic_year_id
+        .as_deref()
+        .or(school_class.academic_year.as_deref())
+        == Some(academic_year_id)
+}
+
 fn sort_classes(classes: &mut [SchoolClass]) {
     classes.sort_by(|left, right| {
         left.display_order
@@ -925,6 +1487,45 @@ mod tests {
                 display_order: None,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn class_student_service_persists_roster_and_updates_identity() {
+        let (store, project) = project_for_tests();
+        let service = SchoolClassService::new(store);
+        let school_class = create_class(&service, &project.id, "11-A");
+
+        let created = service
+            .create_class_student(CreateClassStudentInput {
+                project_id: project.id.clone(),
+                class_id: school_class.id.clone(),
+                display_name: Some("Ayşe Yılmaz".to_string()),
+                number: Some("1042".to_string()),
+            })
+            .expect("class student should be created");
+        assert_eq!(created.class_name.as_deref(), Some("11-A"));
+        assert_eq!(
+            service
+                .list_class_students(ListClassStudentsInput {
+                    project_id: project.id.clone(),
+                    class_id: school_class.id.clone(),
+                })
+                .expect("class roster should list")
+                .len(),
+            1
+        );
+
+        let updated = service
+            .update_class_student(UpdateClassStudentInput {
+                project_id: project.id.clone(),
+                class_id: school_class.id,
+                student_id: created.id,
+                display_name: Some("Ayşe Yılmaz Kaya".to_string()),
+                number: Some("1043".to_string()),
+            })
+            .expect("class student should update");
+        assert_eq!(updated.display_name.as_deref(), Some("Ayşe Yılmaz Kaya"));
+        assert_eq!(updated.number.as_deref(), Some("1043"));
     }
 
     fn add_scan_document(store: &ProjectStore, project_id: &str, document_id: &str) {

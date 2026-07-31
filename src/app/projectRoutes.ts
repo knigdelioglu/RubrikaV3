@@ -1,15 +1,16 @@
 export type ProjectArea =
-  | 'projects'
   | 'overview'
+  | 'activities'
+  | 'classes'
+  | 'analysis'
+  | 'settings'
+  | 'projects'
   | 'documents'
   | 'exam'
-  | 'classes'
   | 'students'
-  | 'grading'
-  | 'analysis'
-  | 'settings';
-export type ExamPackageTab = 'question' | 'rubric' | 'freeze';
-export type StudentOperationsTab = 'grouping' | 'identity' | 'crops' | 'ocr' | 'issues';
+  | 'grading';
+export type ExamPackageTab = 'documents' | 'question' | 'rubric' | 'freeze';
+export type StudentOperationsTab = 'roster' | 'grouping' | 'identity' | 'crops' | 'ocr' | 'issues';
 
 export type ProjectNavigationItem = {
   area: ProjectArea;
@@ -20,76 +21,52 @@ export type ProjectNavigationItem = {
 
 export const projectNavigation: ProjectNavigationItem[] = [
   {
-    area: 'projects',
-    label: 'Yeni Proje',
-    description: 'Yeni çalışma alanı oluştur',
-    path: () => '/projects/new',
-  },
-  {
     area: 'overview',
-    label: 'İş Akışı',
-    description: 'İlerleme ve sonraki adım',
+    label: 'Ana Sayfa',
+    description: 'Sınav takibi ve genel ilerleme',
     path: (projectId) => `/project/${encodeURIComponent(projectId)}/overview`,
   },
   {
-    area: 'documents',
-    label: 'Belgeler',
-    description: 'Sınav ve öğrenci PDF’leri',
-    path: (projectId) => `/project/${encodeURIComponent(projectId)}/exam/documents`,
-  },
-  {
-    area: 'exam',
-    label: 'Sınav Paketi',
-    description: 'Sorular, rubrikler ve dondurma',
-    path: (projectId) => `/project/${encodeURIComponent(projectId)}/exam/package`,
+    area: 'activities',
+    label: 'Sınavlar',
+    description: 'Ortak sınavlar ve sınıf uygulamaları',
+    path: (projectId) => `/project/${encodeURIComponent(projectId)}/activities`,
   },
   {
     area: 'classes',
-    label: 'Sınıflar',
-    description: 'Sınıf ve PDF paketleri',
+    label: 'Sınıflar ve Öğrenciler',
+    description: 'Sınıflar, öğrenciler ve görevlendirmeler',
     path: (projectId) => `/project/${encodeURIComponent(projectId)}/classes`,
   },
   {
-    area: 'students',
-    label: 'Öğrenci İşlemleri',
-    description: 'Gruplama, kimlik ve OCR',
-    path: (projectId) => `/project/${encodeURIComponent(projectId)}/students?tab=grouping`,
-  },
-  {
-    area: 'grading',
-    label: 'Notlandırma',
-    description: 'Sonuçlar ve kâğıt inceleme',
-    path: (projectId) => `/project/${encodeURIComponent(projectId)}/grading`,
-  },
-  {
     area: 'analysis',
-    label: 'Analiz',
-    description: 'Grafikler ve Gemma raporu',
+    label: 'Raporlar',
+    description: 'Grafikler ve başarı raporları',
     path: (projectId) => `/project/${encodeURIComponent(projectId)}/analysis`,
   },
   {
     area: 'settings',
-    label: 'Model Durumu',
-    description: 'Yerel model ve sağlık durumu',
+    label: 'Ayarlar',
+    description: 'Model durumu ve sistem ayarları',
     path: (projectId) => `/project/${encodeURIComponent(projectId)}/settings/model`,
   },
 ];
 
 const legacyProjectRouteAreas: Record<string, ProjectArea> = {
   '/workflow': 'overview',
-  '/documents': 'documents',
-  '/pdf-preview': 'documents',
-  '/question-text': 'exam',
-  '/rubric-preparation': 'exam',
-  '/exam-package-review': 'exam',
-  '/student-scans': 'students',
-  '/student-grouping': 'students',
-  '/student-identity': 'students',
-  '/crop-template': 'students',
-  '/student-answer-ocr': 'students',
-  '/student-answer-ocr-issues': 'students',
-  '/scoring': 'grading',
-  '/graded-exam-review': 'grading',
+  '/documents': 'activities',
+  '/pdf-preview': 'activities',
+  '/question-text': 'activities',
+  '/rubric-preparation': 'activities',
+  '/exam-package-review': 'activities',
+  '/student-scans': 'activities',
+  '/student-grouping': 'activities',
+  '/student-identity': 'activities',
+  '/crop-template': 'activities',
+  '/student-answer-ocr': 'activities',
+  '/student-answer-ocr-issues': 'activities',
+  '/scoring': 'activities',
+  '/graded-exam-review': 'activities',
   '/model-status': 'settings',
 };
 
@@ -112,10 +89,13 @@ const legacyProjectRouteSuffixes: Record<string, string> = {
 };
 
 export function getProjectArea(pathname: string): ProjectArea | null {
-  if (/^\/project\/[^/]+\/exam\/(?:documents|preview)(?:\/|$)/.test(pathname)) return 'documents';
-  if (/^\/project\/[^/]+\/(?:students|ocr)(?:\/|$)/.test(pathname)) return 'students';
-  const match = pathname.match(/^\/project\/[^/]+\/(overview|exam|classes|grading|analysis|settings)(?:\/|$)/);
-  return (match?.[1] as ProjectArea | undefined) ?? legacyProjectRouteAreas[pathname] ?? null;
+  if (/^\/project\/[^/]+\/overview(?:\/|$)/.test(pathname)) return 'overview';
+  if (/^\/project\/[^/]+\/activities(?:\/|$)/.test(pathname)) return 'activities';
+  if (/^\/project\/[^/]+\/classes(?:\/|$)/.test(pathname)) return 'classes';
+  if (/^\/project\/[^/]+\/analysis(?:\/|$)/.test(pathname)) return 'analysis';
+  if (/^\/project\/[^/]+\/settings(?:\/|$)/.test(pathname)) return 'settings';
+  if (/^\/project\/[^/]+\/(?:exam|grading|speaking|ocr|students)(?:\/|$)/.test(pathname)) return 'activities';
+  return legacyProjectRouteAreas[pathname] ?? null;
 }
 
 export function getProjectIdFromPathname(pathname: string): string {
@@ -146,6 +126,36 @@ export function resolveLegacyProjectDestination(
   projectId: string,
   rawSearch = '',
 ): string | null {
+  const searchParams = new URLSearchParams(rawSearch);
+  const activityId = searchParams.get('assessmentActivityId');
+
+  if (activityId) {
+    const activityStepMap: Record<string, string> = {
+      '/documents': 'prep',
+      '/pdf-preview': 'prep',
+      '/question-text': 'prep',
+      '/rubric-preparation': 'prep',
+      '/exam-package-review': 'prep',
+      '/student-scans': 'students',
+      '/student-grouping': 'students',
+      '/student-identity': 'students',
+      '/crop-template': 'students',
+      '/student-answer-ocr': 'ocr',
+      '/student-answer-ocr-issues': 'ocr',
+      '/scoring': 'scoring',
+      '/graded-exam-review': 'scoring',
+      '/speaking': 'transcript',
+    };
+
+    const step = activityStepMap[pathname];
+    if (step) {
+      return appendPreservedSearch(
+        `/project/${encodeURIComponent(projectId)}/activities/${encodeURIComponent(activityId)}/${step}`,
+        rawSearch,
+      );
+    }
+  }
+
   const destination = resolveLegacyProjectPath(pathname, projectId);
   if (!destination) return null;
   const defaultTab: Record<string, ExamPackageTab | undefined> = {

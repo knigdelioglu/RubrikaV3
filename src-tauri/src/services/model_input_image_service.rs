@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelInputImage, ModelInputImageKind};
-use crate::platform::file_access::atomic_write;
+use crate::platform::project_paths::TrustedProjectRoot;
 
 const DEFAULT_LONG_EDGE_MAX: u32 = 1800;
 const DEFAULT_JPEG_QUALITY: u8 = 88;
@@ -62,18 +62,14 @@ impl ModelInputImageService {
         document_id: &str,
         sources: &[(u32, PathBuf)],
     ) -> Result<Vec<ModelInputImage>, AppError> {
-        let output_dir = model_inputs_dir(project_root, &kind, document_id);
-        std::fs::create_dir_all(&output_dir).map_err(|error| {
-            app_error(
-                AppErrorCode::FileWriteFailed,
-                "Model giriş klasörü oluşturulamadı.",
-                Some(error.to_string()),
-                Some(
-                    "Project cache permissions should allow writing model input images."
-                        .to_string(),
-                ),
-            )
-        })?;
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
+        let output_relative = trusted_root.managed(&format!(
+            "cache/model_inputs/{}/{document_id}",
+            kind_folder(&kind)
+        ))?;
+        let output_dir = trusted_root.root().join(output_relative.as_path());
+        trusted_root.ensure_managed_directory(&output_dir)?;
 
         let created_at = chrono::Utc::now().to_rfc3339();
         let mut images = Vec::with_capacity(sources.len());
@@ -82,12 +78,14 @@ impl ModelInputImageService {
         let mut total_base64_approx_bytes = 0u64;
 
         for (page_number, source_path) in sources {
+            let source_managed = trusted_root.relative_for_existing(source_path)?;
+            let safe_source_path = trusted_root.resolve_existing_file(&source_managed)?;
             let metadata = prepare_single_image(PrepareSingleImageInput {
                 output_dir: &output_dir,
                 kind: kind.clone(),
                 document_id,
                 page_number: *page_number,
-                source_path,
+                source_path: &safe_source_path,
                 long_edge_max: self.long_edge_max,
                 jpeg_quality: self.jpeg_quality,
                 created_at: &created_at,
@@ -109,7 +107,12 @@ impl ModelInputImageService {
             total_base64_approx_bytes,
             images: images.clone(),
         };
-        write_manifest(&output_dir.join("model_inputs.json"), &manifest)?;
+        let manifest_path =
+            trusted_root.prepare_write_target(&trusted_root.managed(&format!(
+                "cache/model_inputs/{}/{document_id}/model_inputs.json",
+                kind_folder(&manifest.kind)
+            ))?)?;
+        write_manifest(&trusted_root, &manifest_path, &manifest)?;
         Ok(images)
     }
 
@@ -117,15 +120,19 @@ impl ModelInputImageService {
         project_root: &Path,
         kind: &ModelInputImageKind,
         document_id: &str,
-    ) -> PathBuf {
-        model_inputs_dir(project_root, kind, document_id).join("model_inputs.json")
+    ) -> Result<PathBuf, AppError> {
+        Ok(model_inputs_dir(project_root, kind, document_id)?.join("model_inputs.json"))
     }
 
     pub fn load_manifests(project_root: &Path) -> Result<Vec<ModelInputBatchMetadata>, AppError> {
-        let root = project_root.join("cache").join("model_inputs");
-        if !root.exists() {
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
+        let root_managed = trusted_root.managed("cache/model_inputs")?;
+        let root_path = trusted_root.root().join(root_managed.as_path());
+        if !root_path.exists() {
             return Ok(vec![]);
         }
+        let root = trusted_root.resolve_existing_directory(&root_managed)?;
 
         let mut manifests = Vec::new();
         for kind_entry in std::fs::read_dir(&root).map_err(|error| {
@@ -144,10 +151,27 @@ impl ModelInputImageService {
                     Some("Check project cache permissions.".to_string()),
                 )
             })?;
-            if !kind_entry.path().is_dir() {
+            let kind_path = kind_entry.path();
+            let kind_file_type = kind_entry.file_type().map_err(|error| {
+                app_error(
+                    AppErrorCode::FileReadFailed,
+                    "Model input cache okunamadı.",
+                    Some(error.to_string()),
+                    Some("Check project cache permissions.".to_string()),
+                )
+            })?;
+            if kind_file_type.is_symlink() {
+                return Err(app_error(
+                    AppErrorCode::ManagedPathSymlinkEscape,
+                    "Model input cache symlink içeriyor.",
+                    Some(kind_path.to_string_lossy().to_string()),
+                    Some("Rebuild the model input cache.".to_string()),
+                ));
+            }
+            if !kind_file_type.is_dir() {
                 continue;
             }
-            for doc_entry in std::fs::read_dir(kind_entry.path()).map_err(|error| {
+            for doc_entry in std::fs::read_dir(&kind_path).map_err(|error| {
                 app_error(
                     AppErrorCode::FileReadFailed,
                     "Model input cache okunamadı.",
@@ -163,10 +187,32 @@ impl ModelInputImageService {
                         Some("Check project cache permissions.".to_string()),
                     )
                 })?;
-                let manifest_path = doc_entry.path().join("model_inputs.json");
+                let doc_path = doc_entry.path();
+                let doc_file_type = doc_entry.file_type().map_err(|error| {
+                    app_error(
+                        AppErrorCode::FileReadFailed,
+                        "Model input cache okunamadı.",
+                        Some(error.to_string()),
+                        Some("Check project cache permissions.".to_string()),
+                    )
+                })?;
+                if doc_file_type.is_symlink() {
+                    return Err(app_error(
+                        AppErrorCode::ManagedPathSymlinkEscape,
+                        "Model input cache symlink içeriyor.",
+                        Some(doc_path.to_string_lossy().to_string()),
+                        Some("Rebuild the model input cache.".to_string()),
+                    ));
+                }
+                if !doc_file_type.is_dir() {
+                    continue;
+                }
+                let manifest_path = doc_path.join("model_inputs.json");
                 if !manifest_path.exists() {
                     continue;
                 }
+                let manifest_managed = trusted_root.relative_for_existing(&manifest_path)?;
+                let manifest_path = trusted_root.resolve_existing_file(&manifest_managed)?;
                 let content = std::fs::read_to_string(&manifest_path).map_err(|error| {
                     app_error(
                         AppErrorCode::FileReadFailed,
@@ -184,6 +230,7 @@ impl ModelInputImageService {
                             Some("Rebuild the model input cache.".to_string()),
                         )
                     })?;
+                Self::validate_manifest_paths(&trusted_root, &manifest)?;
                 manifests.push(manifest);
             }
         }
@@ -194,6 +241,17 @@ impl ModelInputImageService {
                 .then(a.created_at.cmp(&b.created_at))
         });
         Ok(manifests)
+    }
+
+    pub fn validate_manifest_paths(
+        trusted_root: &TrustedProjectRoot,
+        manifest: &ModelInputBatchMetadata,
+    ) -> Result<(), AppError> {
+        for image in &manifest.images {
+            validate_model_image_path(trusted_root, &image.source_image_path)?;
+            validate_model_image_path(trusted_root, &image.output_image_path)?;
+        }
+        Ok(())
     }
 }
 
@@ -251,14 +309,36 @@ fn prepare_single_image(input: PrepareSingleImageInput<'_>) -> Result<ModelInput
         resize_image(image, source_width, source_height, long_edge_max);
     let output_path = output_dir.join(format!("page_{page_number:03}.jpg"));
 
-    let file = File::create(&output_path).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Model giriş JPEG dosyası oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Check project cache permissions.".to_string()),
-        )
-    })?;
+    if let Ok(metadata) = fs::symlink_metadata(&output_path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(app_error(
+                AppErrorCode::ManagedPathSymlinkEscape,
+                "Model giriş JPEG yazma hedefi güvenli değil.",
+                Some(output_path.to_string_lossy().to_string()),
+                Some("Rebuild the model input cache.".to_string()),
+            ));
+        }
+        fs::remove_file(&output_path).map_err(|error| {
+            app_error(
+                AppErrorCode::FileWriteFailed,
+                "Model giriş JPEG eski dosyası temizlenemedi.",
+                Some(error.to_string()),
+                Some("Check project cache permissions.".to_string()),
+            )
+        })?;
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&output_path)
+        .map_err(|error| {
+            app_error(
+                AppErrorCode::FileWriteFailed,
+                "Model giriş JPEG dosyası oluşturulamadı.",
+                Some(error.to_string()),
+                Some("Check project cache permissions.".to_string()),
+            )
+        })?;
     let mut writer = BufWriter::new(file);
     let mut encoder = JpegEncoder::new_with_quality(&mut writer, jpeg_quality);
     encoder
@@ -319,12 +399,17 @@ fn base64_approx_bytes(bytes: u64) -> u64 {
     bytes.div_ceil(3) * 4
 }
 
-fn model_inputs_dir(project_root: &Path, kind: &ModelInputImageKind, document_id: &str) -> PathBuf {
-    project_root
-        .join("cache")
-        .join("model_inputs")
-        .join(kind_folder(kind))
-        .join(document_id)
+fn model_inputs_dir(
+    project_root: &Path,
+    kind: &ModelInputImageKind,
+    document_id: &str,
+) -> Result<PathBuf, AppError> {
+    let root = TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
+    let managed = root.managed(&format!(
+        "cache/model_inputs/{}/{document_id}",
+        kind_folder(kind)
+    ))?;
+    Ok(root.root().join(managed.as_path()))
 }
 
 fn kind_folder(kind: &ModelInputImageKind) -> &'static str {
@@ -338,6 +423,7 @@ fn kind_folder(kind: &ModelInputImageKind) -> &'static str {
 }
 
 fn write_manifest(
+    trusted_root: &TrustedProjectRoot,
     manifest_path: &Path,
     manifest: &ModelInputBatchMetadata,
 ) -> Result<(), AppError> {
@@ -349,14 +435,25 @@ fn write_manifest(
             None,
         )
     })?;
-    atomic_write(manifest_path, &content).map_err(|error| {
-        app_error(
-            AppErrorCode::ProjectSaveFailed,
-            "Model input metadata yazılamadı.",
-            Some(error.to_string()),
-            Some("Check model input cache permissions.".to_string()),
-        )
-    })
+    let managed = trusted_root.managed_for_path(manifest_path)?;
+    trusted_root
+        .atomic_write(&managed, &content)
+        .map_err(|error| {
+            app_error(
+                AppErrorCode::ProjectSaveFailed,
+                "Model input metadata yazılamadı.",
+                Some(error.to_string()),
+                Some("Check model input cache permissions.".to_string()),
+            )
+        })
+}
+
+fn validate_model_image_path(
+    trusted_root: &TrustedProjectRoot,
+    raw_path: &str,
+) -> Result<(), AppError> {
+    let managed = trusted_root.adapt_legacy_document_path(raw_path)?;
+    trusted_root.resolve_existing_file(&managed).map(|_| ())
 }
 
 fn map_image_error(message: &'static str) -> impl FnOnce(ImageError) -> AppError {
@@ -426,6 +523,7 @@ mod tests {
             &ModelInputImageKind::QuestionText,
             "doc-1"
         )
+        .unwrap()
         .exists());
     }
 

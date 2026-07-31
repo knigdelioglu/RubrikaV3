@@ -23,6 +23,7 @@ use crate::domain::model::{
 use crate::domain::student::{
     OcrCriticalTermWarning, OcrImagePreprocessMode, OcrSuggestedCorrection, OcrUncertainSpan,
 };
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_gateway::ModelGateway;
 
 const QUESTION_TEXT_MAX_TOKENS: u32 = 4096;
@@ -432,7 +433,7 @@ impl ModelGateway for LlamaServerGateway {
             );
             let _ = save_rubric_parse_error(&input, &parse_error, &assistant_content, &cleaned);
             let mut parse_error = parse_error;
-            if let Some(dir) = rubric_artifact_dir(&input) {
+            if let Some(dir) = rubric_artifact_dir(&input)? {
                 parse_error.technical_details = Some(format!(
                     "retry_attempted={}\nraw_response_path={}\nextracted_json_path={}\nparse_error_path={}\nschema_expected=canonical rubric questions schema\n{}",
                     input.strict_json_only,
@@ -453,7 +454,7 @@ impl ModelGateway for LlamaServerGateway {
             Err(error) => {
                 let _ = save_rubric_parse_error(&input, &error, &assistant_content, &cleaned);
                 let mut error = error;
-                if let Some(dir) = rubric_artifact_dir(&input) {
+                if let Some(dir) = rubric_artifact_dir(&input)? {
                     error.technical_details = Some(format!(
                         "retry_attempted={}\nraw_response_path={}\nextracted_json_path={}\nparse_error_path={}\nschema_expected=canonical rubric questions schema\n{}",
                         input.strict_json_only,
@@ -1723,22 +1724,63 @@ fn request_metadata(
     })
 }
 
-fn rubric_artifact_dir(request: &RubricExtractionRequest) -> Option<std::path::PathBuf> {
-    let project_root = request.project_root_path.as_ref()?;
-    let job_id = request.job_id.as_ref()?;
+fn project_artifact_dir(
+    project_root: Option<&String>,
+    relative: &str,
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    let Some(project_root) = project_root else {
+        return Ok(None);
+    };
+    let trusted_root =
+        TrustedProjectRoot::from_canonical_root(std::path::PathBuf::from(project_root), false)?;
+    let managed = trusted_root.managed(relative)?;
+    let directory = trusted_root.root().join(managed.as_path());
+    trusted_root.ensure_managed_directory(&directory)?;
+    Ok(Some(directory))
+}
+
+fn write_project_artifact(
+    project_root: Option<&String>,
+    path: &std::path::Path,
+    content: &str,
+    message: &str,
+) -> Result<(), AppError> {
+    let Some(project_root) = project_root else {
+        return Ok(());
+    };
+    let trusted_root =
+        TrustedProjectRoot::from_canonical_root(std::path::PathBuf::from(project_root), false)?;
+    let managed = trusted_root.managed_for_path(path)?;
+    trusted_root
+        .atomic_write(&managed, content)
+        .map_err(|error| {
+            app_error(
+                AppErrorCode::FileWriteFailed,
+                message,
+                Some(error.message),
+                Some("Proje logs klasörünü kontrol edin.".to_string()),
+            )
+        })
+}
+
+fn rubric_artifact_dir(
+    request: &RubricExtractionRequest,
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    let Some(job_id) = request.job_id.as_ref() else {
+        return Ok(None);
+    };
     let base_job_id = if let Some(idx) = job_id.find("_q") {
         &job_id[..idx]
     } else {
         job_id
     };
-    Some(
-        std::path::Path::new(project_root)
-            .join("logs")
-            .join("model_responses")
-            .join("rubric_import")
-            .join(base_job_id)
-            .join(format!("question_{}", request.target_question_number))
-            .join(format!("attempt_{}", request.attempt.max(1))),
+    project_artifact_dir(
+        request.project_root_path.as_ref(),
+        &format!(
+            "logs/model_responses/rubric_import/{base_job_id}/question_{}/attempt_{}",
+            request.target_question_number,
+            request.attempt.max(1)
+        ),
     )
 }
 
@@ -1750,52 +1792,33 @@ fn save_rubric_import_artifacts(
     raw_response: &str,
     extracted_json: &str,
 ) -> Result<Option<String>, AppError> {
-    let Some(dir) = rubric_artifact_dir(request) else {
+    let Some(dir) = rubric_artifact_dir(request)? else {
         return Ok(None);
     };
-
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Rubrik model artifact klasörü oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
 
     let request_path = dir.join("request.json");
     let raw_path = dir.join("response_raw.txt");
     let extracted_path = dir.join("response_extracted_json.txt");
 
     let request_body = request_metadata(request, extraction_method, raw_text_length, prompt_length);
-    std::fs::write(
+    write_project_artifact(
+        request.project_root_path.as_ref(),
         &request_path,
-        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
-    )
-    .map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Rubrik request artifact kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&raw_path, raw_response).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Rubrik raw response kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Rubrik extracted JSON kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
+        &serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+        "Rubrik request artifact kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &raw_path,
+        raw_response,
+        "Rubrik raw response kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &extracted_path,
+        extracted_json,
+        "Rubrik extracted JSON kaydedilemedi.",
+    )?;
 
     Ok(Some(raw_path.to_string_lossy().to_string()))
 }
@@ -1806,7 +1829,7 @@ fn save_rubric_parse_error(
     raw_response: &str,
     extracted_json: &str,
 ) -> Result<(), AppError> {
-    let Some(dir) = rubric_artifact_dir(request) else {
+    let Some(dir) = rubric_artifact_dir(request)? else {
         return Ok(());
     };
     let parse_error_path = dir.join("parse_error.json");
@@ -1817,34 +1840,27 @@ fn save_rubric_parse_error(
         "rawResponseLength": raw_response.len(),
         "extractedJsonLength": extracted_json.len(),
     });
-    std::fs::write(
+    write_project_artifact(
+        request.project_root_path.as_ref(),
         &parse_error_path,
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
-    )
-    .map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Rubrik parse error artifact kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
+        &serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string()),
+        "Rubrik parse error artifact kaydedilemedi.",
+    )?;
     Ok(())
 }
 
 fn student_answer_ocr_artifact_dir(
     request: &StudentAnswerOcrRequest,
-) -> Option<std::path::PathBuf> {
-    let project_root = request.project_root_path.as_ref()?;
-    let job_id = request.job_id.as_ref()?;
-    Some(
-        std::path::Path::new(project_root)
-            .join("logs")
-            .join("model_responses")
-            .join("student_answer_ocr")
-            .join(job_id)
-            .join(format!("submission_{}", request.submission_id))
-            .join(format!("question_{}", request.question_number)),
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    let Some(job_id) = request.job_id.as_ref() else {
+        return Ok(None);
+    };
+    project_artifact_dir(
+        request.project_root_path.as_ref(),
+        &format!(
+            "logs/model_responses/student_answer_ocr/{job_id}/submission_{}/question_{}",
+            request.submission_id, request.question_number
+        ),
     )
 }
 
@@ -1853,18 +1869,9 @@ fn save_student_answer_ocr_artifacts(
     raw_response: &str,
     extracted_json: &str,
 ) -> Result<Option<String>, AppError> {
-    let Some(dir) = student_answer_ocr_artifact_dir(request) else {
+    let Some(dir) = student_answer_ocr_artifact_dir(request)? else {
         return Ok(None);
     };
-
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student OCR model artifact klasörü oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
 
     let request_path = dir.join("request.json");
     let raw_path = dir.join("response_raw.txt");
@@ -1885,51 +1892,40 @@ fn save_student_answer_ocr_artifacts(
         "jobId": request.job_id,
     });
 
-    std::fs::write(
+    write_project_artifact(
+        request.project_root_path.as_ref(),
         &request_path,
-        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
-    )
-    .map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student OCR request artifact kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&raw_path, raw_response).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student OCR raw response kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student OCR extracted JSON kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
+        &serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+        "Student OCR request artifact kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &raw_path,
+        raw_response,
+        "Student OCR raw response kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &extracted_path,
+        extracted_json,
+        "Student OCR extracted JSON kaydedilemedi.",
+    )?;
 
     Ok(Some(raw_path.to_string_lossy().to_string()))
 }
 
 fn student_answer_issue_correction_artifact_dir(
     request: &StudentAnswerOcrIssueCorrectionRequest,
-) -> Option<std::path::PathBuf> {
-    let project_root = request.project_root_path.as_ref()?;
-    let job_id = request.job_id.as_ref()?;
-    Some(
-        std::path::Path::new(project_root)
-            .join("logs")
-            .join("model_responses")
-            .join("student_answer_ocr_issue_correction")
-            .join(job_id)
-            .join(format!("ocr_record_{}", request.ocr_record_id))
-            .join(format!("question_{}", request.question_number)),
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    let Some(job_id) = request.job_id.as_ref() else {
+        return Ok(None);
+    };
+    project_artifact_dir(
+        request.project_root_path.as_ref(),
+        &format!(
+            "logs/model_responses/student_answer_ocr_issue_correction/{job_id}/ocr_record_{}/question_{}",
+            request.ocr_record_id, request.question_number
+        ),
     )
 }
 
@@ -1938,18 +1934,9 @@ fn save_student_answer_issue_correction_artifacts(
     raw_response: &str,
     extracted_json: &str,
 ) -> Result<Option<String>, AppError> {
-    let Some(dir) = student_answer_issue_correction_artifact_dir(request) else {
+    let Some(dir) = student_answer_issue_correction_artifact_dir(request)? else {
         return Ok(None);
     };
-
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "OCR issue correction model artifact klasörü oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
 
     let request_path = dir.join("request.json");
     let raw_path = dir.join("response_raw.txt");
@@ -1971,50 +1958,40 @@ fn save_student_answer_issue_correction_artifacts(
         "jobId": request.job_id,
     });
 
-    std::fs::write(
+    write_project_artifact(
+        request.project_root_path.as_ref(),
         &request_path,
-        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
-    )
-    .map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "OCR issue correction request artifact kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&raw_path, raw_response).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "OCR issue correction raw response kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "OCR issue correction extracted JSON kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
+        &serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+        "OCR issue correction request artifact kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &raw_path,
+        raw_response,
+        "OCR issue correction raw response kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &extracted_path,
+        extracted_json,
+        "OCR issue correction extracted JSON kaydedilemedi.",
+    )?;
 
     Ok(Some(raw_path.to_string_lossy().to_string()))
 }
 
 fn student_identity_ocr_artifact_dir(
     request: &StudentIdentityOcrRequest,
-) -> Option<std::path::PathBuf> {
-    let project_root = request.project_root_path.as_ref()?;
-    let job_id = request.job_id.as_ref()?;
-    Some(
-        std::path::Path::new(project_root)
-            .join("logs")
-            .join("model_responses")
-            .join("student_identity_ocr")
-            .join(job_id)
-            .join(format!("submission_{}", request.submission_id)),
+) -> Result<Option<std::path::PathBuf>, AppError> {
+    let Some(job_id) = request.job_id.as_ref() else {
+        return Ok(None);
+    };
+    project_artifact_dir(
+        request.project_root_path.as_ref(),
+        &format!(
+            "logs/model_responses/student_identity_ocr/{job_id}/submission_{}",
+            request.submission_id
+        ),
     )
 }
 
@@ -2023,17 +2000,9 @@ fn save_student_identity_ocr_artifacts(
     raw_response: &str,
     extracted_json: &str,
 ) -> Result<Option<String>, AppError> {
-    let Some(dir) = student_identity_ocr_artifact_dir(request) else {
+    let Some(dir) = student_identity_ocr_artifact_dir(request)? else {
         return Ok(None);
     };
-    std::fs::create_dir_all(&dir).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student identity OCR model artifact klasörü oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
     let request_path = dir.join("request.json");
     let raw_path = dir.join("response_raw.txt");
     let extracted_path = dir.join("response_extracted_json.txt");
@@ -2048,34 +2017,24 @@ fn save_student_identity_ocr_artifacts(
         "projectRootPath": request.project_root_path,
         "jobId": request.job_id,
     });
-    std::fs::write(
+    write_project_artifact(
+        request.project_root_path.as_ref(),
         &request_path,
-        serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
-    )
-    .map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student identity OCR request artifact kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&raw_path, raw_response).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student identity OCR raw response kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
-    std::fs::write(&extracted_path, extracted_json).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Student identity OCR extracted JSON kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Proje logs klasörünü kontrol edin.".to_string()),
-        )
-    })?;
+        &serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| request_body.to_string()),
+        "Student identity OCR request artifact kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &raw_path,
+        raw_response,
+        "Student identity OCR raw response kaydedilemedi.",
+    )?;
+    write_project_artifact(
+        request.project_root_path.as_ref(),
+        &extracted_path,
+        extracted_json,
+        "Student identity OCR extracted JSON kaydedilemedi.",
+    )?;
     Ok(Some(raw_path.to_string_lossy().to_string()))
 }
 

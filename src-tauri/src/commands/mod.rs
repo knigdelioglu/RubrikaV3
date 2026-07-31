@@ -1,5 +1,6 @@
 pub mod analysis_commands;
 pub mod app_commands;
+pub mod assessment_organization_commands;
 pub mod document_commands;
 pub mod exam_package_commands;
 pub mod graded_exam_review_commands;

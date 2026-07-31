@@ -3,14 +3,14 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
-import type { OcrImagePreprocessMode } from '../api/types';
+import type { OcrGeneration, OcrImagePreprocessMode } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { PdfPageViewer } from '../components/pdf/PdfPageViewer';
 import { ocrIssueTypeLabels, ocrPreprocessModeLabels, ocrWarningLabels, stageLabels, studentAnswerOcrStatusLabels } from '../utils/labels';
 import { useProjectContext } from '../state/useProjectContext';
 import { tauriClient } from '../api/tauriClient';
-import { PlayCircle, Clock, AlertTriangle, Cpu, Check, AlertCircle, RefreshCcw, FileImage } from 'lucide-react';
+import { PlayCircle, Clock, AlertTriangle, Check, AlertCircle, RefreshCcw, FileImage } from 'lucide-react';
 import {
   getStudentAnswerOcrDraftText,
   getMissingStudentAnswerCropQuestionNumbers,
@@ -58,6 +58,54 @@ const friendlyWarning = (code: string) => {
     default: return ocrWarningLabels[code] ?? ocrIssueTypeLabels[code] ?? code;
   }
 };
+
+function OcrGenerationReviewPanel({
+  generations,
+  activeRecords,
+  onAccept,
+  onReject,
+  disabled,
+}: {
+  generations: OcrGeneration[];
+  activeRecords: import('../api/types').StudentAnswerOcrRecord[];
+  onAccept: (generationId: string) => void;
+  onReject: (generationId: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <section style={{ marginBottom: '1rem', padding: '1rem', border: '1px solid #c7d2fe', borderRadius: '0.75rem', background: '#eef2ff' }}>
+      <div style={{ fontWeight: 700, color: '#3730a3', marginBottom: '0.65rem' }}>Yeni OCR önerileri</div>
+      <div style={{ display: 'grid', gap: '0.65rem' }}>
+        {generations.map((generation) => {
+          const candidate = generation.result[0];
+          const active = activeRecords.find((record) =>
+            record.submissionId === generation.submissionId && record.questionId === candidate?.questionId,
+          );
+          return (
+            <div key={generation.generationId} style={{ padding: '0.75rem', borderRadius: '0.6rem', background: 'white', border: '1px solid #c7d2fe' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                <strong style={{ color: '#334155' }}>Mevcut OCR / Yeni OCR önerisi</strong>
+                <span style={{ fontSize: '0.75rem', color: '#64748b' }}>{generation.status === 'candidate' ? 'Hazırlanıyor' : 'Karşılaştırmaya hazır'}</span>
+              </div>
+              {candidate && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem', marginTop: '0.65rem', fontSize: '0.8125rem' }}>
+                  <div><div style={{ color: '#64748b', fontWeight: 700 }}>Mevcut OCR</div><div>{active?.teacherCorrectedText ?? active?.answerText ?? 'Mevcut sonuç yok'}</div></div>
+                  <div><div style={{ color: '#64748b', fontWeight: 700 }}>Yeni OCR önerisi</div><div>{candidate.answerText || 'Yeni sonuç ek kontrol gerektiriyor.'}</div></div>
+                </div>
+              )}
+              {generation.status === 'ready_for_review' && (
+                <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.7rem' }}>
+                  <button type="button" disabled={disabled} onClick={() => onAccept(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #86efac', borderRadius: '0.45rem', background: '#dcfce7', color: '#166534', fontWeight: 700 }}>Yeni sonucu kabul et</button>
+                  <button type="button" disabled={disabled} onClick={() => onReject(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #fecaca', borderRadius: '0.45rem', background: '#fef2f2', color: '#991b1b', fontWeight: 700 }}>Yeni sonucu reddet</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
 
 export function StudentAnswerOcrPage() {
   const [searchParams] = useSearchParams();
@@ -139,6 +187,21 @@ export function StudentAnswerOcrPage() {
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
     },
+    onError: (err: AppError) => setError(err),
+  });
+
+  const acceptGenerationMutation = useMutation({
+    mutationFn: (generationId: string) => commands.acceptStudentAnswerOcrGeneration({ projectId: projectId!, generationId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
+    },
+    onError: (err: AppError) => setError(err),
+  });
+
+  const rejectGenerationMutation = useMutation({
+    mutationFn: (generationId: string) => commands.rejectStudentAnswerOcrGeneration({ projectId: projectId!, generationId }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] }),
     onError: (err: AppError) => setError(err),
   });
 
@@ -234,7 +297,10 @@ export function StudentAnswerOcrPage() {
   
   const submissions = visibleSubmissions;
   const currentSubmission = submissions[selectedSubmissionIndex];
-  const currentRecords = isOcrRunning ? [] : (currentSubmission ? recordsBySubmission.get(currentSubmission.id) ?? [] : []);
+  const currentRecords = currentSubmission ? recordsBySubmission.get(currentSubmission.id) ?? [] : [];
+  const pendingGenerations = (project?.studentAnswerOcrGenerations ?? []).filter((generation) =>
+    generation.status === 'ready_for_review' || generation.status === 'candidate',
+  );
 
   const handleStartOCR = () => {
     if (isOcrRunning) return;
@@ -313,6 +379,22 @@ export function StudentAnswerOcrPage() {
       </div>
 
       {queryError && <div style={{ marginBottom: '1rem', flexShrink: 0 }}><ErrorBanner error={queryError} /></div>}
+
+      {isOcrRunning && (
+        <div style={{ marginBottom: '1rem', padding: '0.8rem 1rem', border: '1px solid #fde68a', borderRadius: '0.6rem', background: '#fffbeb', color: '#92400e', fontSize: '0.875rem' }}>
+          OCR yeniden çalıştırılıyor. Mevcut onaylı sonuç korunuyor; yeni sonuç hazır olduğunda karşılaştırabilirsiniz.
+        </div>
+      )}
+
+      {pendingGenerations.length > 0 && (
+        <OcrGenerationReviewPanel
+          generations={pendingGenerations}
+          activeRecords={project?.studentAnswerOcrRecords ?? []}
+          onAccept={(generationId) => acceptGenerationMutation.mutate(generationId)}
+          onReject={(generationId) => rejectGenerationMutation.mutate(generationId)}
+          disabled={acceptGenerationMutation.isPending || rejectGenerationMutation.isPending || isOcrRunning}
+        />
+      )}
       
       {modelNotice && (
         <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', border: '1px solid #fde68a', borderRadius: '0.5rem', background: '#fffbeb', color: '#92400e', fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexShrink: 0 }}>
@@ -341,16 +423,18 @@ export function StudentAnswerOcrPage() {
            </div>
            <div style={{ display: 'flex', gap: '1.5rem' }}>
               <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a' }}>{totalRecords}</div>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Toplam Kayıt</div>
+                <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#d97706' }}>{totalRecords - reviewedRecords}</div>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Kontrol Bekleyen</div>
               </div>
               <div style={{ textAlign: 'center' }}>
                 <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#16a34a' }}>{reviewedRecords}</div>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Onaylı</div>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Onaylanan</div>
               </div>
               <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#d97706' }}>{totalRecords - reviewedRecords}</div>
-                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Bekleyen</div>
+                <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#dc2626' }}>
+                  {records.filter((r) => r.needsReview || r.warnings.length > 0).length}
+                </div>
+                <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 500 }}>Sorunlu</div>
               </div>
            </div>
         </div>
@@ -417,16 +501,10 @@ export function StudentAnswerOcrPage() {
 
         {/* Main Panel - OCR Results */}
         <div style={{ flex: 1, background: '#f8fafc', borderRadius: '1rem', border: '1px solid #e2e8f0', display: 'flex', flexDirection: 'column', position: 'relative', overflow: 'hidden' }}>
-          {isOcrRunning && (
-             <div style={{ position: 'absolute', inset: 0, zIndex: 10, background: 'rgba(255,255,255,0.8)', backdropFilter: 'blur(4px)', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', padding: '2rem' }}>
-               <Cpu size={48} color="#4f46e5" style={{ marginBottom: '1rem', animation: 'pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite' }} />
-               <h3 style={{ fontSize: '1.25rem', fontWeight: 700, color: '#0f172a', margin: '0 0 0.5rem 0' }}>Yeni OCR Çalışıyor</h3>
-               <p style={{ fontSize: '0.875rem', color: '#475569', margin: '0 0 1.5rem 0' }}>Lütfen bekleyin, model yanıtları üretiyor...</p>
-               <div style={{ background: 'white', padding: '1rem 1.5rem', borderRadius: '0.75rem', border: '1px solid #e2e8f0', boxShadow: '0 1px 3px 0 rgba(0,0,0,0.1)' }}>
-                  <div style={{ fontSize: '0.875rem', fontWeight: 600, color: '#334155', marginBottom: '0.25rem' }}>{activeJob.progress.message}</div>
-                  <div style={{ fontSize: '0.75rem', color: '#64748b' }}>İlerleme: {activeJob.progress.current} / {activeJob.progress.total}</div>
-               </div>
-             </div>
+          {isOcrRunning && activeJob && (
+            <div style={{ position: 'absolute', right: '1rem', top: '1rem', zIndex: 2, background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: '0.6rem', padding: '0.65rem 0.8rem', fontSize: '0.75rem' }}>
+              {activeJob.progress.message} · {activeJob.progress.current}/{activeJob.progress.total}
+            </div>
           )}
 
           <div style={{ padding: '1rem 1.5rem', borderBottom: '1px solid #e2e8f0', background: 'white', display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>

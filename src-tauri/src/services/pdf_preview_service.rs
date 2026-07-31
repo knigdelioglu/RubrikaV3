@@ -13,9 +13,9 @@ use crate::domain::job::{JobKind, JobStatus};
 use crate::domain::project::Project;
 use crate::jobs::job_manager::JobManager;
 use crate::platform::file_access::atomic_write;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::pdf_service::PdfService;
 use crate::services::project_store::ProjectStore;
-use crate::services::workflow_engine;
 
 #[derive(Clone)]
 pub struct PdfPreviewService {
@@ -83,7 +83,8 @@ impl PdfPreviewService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
         let document = find_pdf_document(&project, document_id)?;
-        let metadata_path = preview_metadata_path(&project, &document.id);
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        let metadata_path = active_preview_metadata_path(&trusted_root, document)?;
         let index = read_preview_index(&metadata_path).ok();
         let job_snapshot = document
             .preview
@@ -177,9 +178,10 @@ impl PdfPreviewService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
         let document = find_pdf_document(&project, document_id)?;
-        let metadata_path = preview_metadata_path(&project, &document.id);
-        read_preview_index(&metadata_path)
-            .map(|index| index.pages)
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        let metadata_path = active_preview_metadata_path(&trusted_root, document)?;
+        read_active_preview_index(&metadata_path, document)
+            .and_then(|index| materialize_preview_pages(&trusted_root, index.pages))
             .map_err(|_| AppError {
                 code: AppErrorCode::PdfPreviewNotFound,
                 message: "Sayfa önizleme önbelleği bulunamadı.".to_string(),
@@ -200,8 +202,9 @@ impl PdfPreviewService {
             .get_project_snapshot(project_id.to_string())?;
         let document = find_pdf_document(&project, document_id)?;
         let preview = document.preview.as_ref();
-        let metadata_path = preview_metadata_path(&project, &document.id);
-        let index = read_preview_index(&metadata_path).map_err(|error| {
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        let metadata_path = active_preview_metadata_path(&trusted_root, document)?;
+        let index = read_active_preview_index(&metadata_path, document).map_err(|error| {
             let detail = error
                 .technical_details
                 .clone()
@@ -242,23 +245,15 @@ impl PdfPreviewService {
             });
         }
 
-        for page in &index.pages {
-            let image_path = Path::new(&page.image_path);
-            if !image_path.exists() || !image_path.is_file() {
-                return Err(AppError {
-                    code: AppErrorCode::PdfPreviewNotReady,
-                    message:
-                        "Soru metni çıkarılmadan önce PDF sayfa önizlemeleri oluşturulmalıdır."
-                            .to_string(),
-                    recoverable: true,
-                    suggested_action: Some("Önce PDF sayfa önizlemelerini oluşturun.".to_string()),
-                    technical_details: Some(format!("missing_preview_image={}", page.image_path)),
-                    correlation_id: Uuid::new_v4().to_string(),
-                });
-            }
-        }
-
-        Ok(index.pages)
+        materialize_preview_pages(&trusted_root, index.pages).map_err(|error| AppError {
+            code: AppErrorCode::PdfPreviewNotReady,
+            message: "Soru metni çıkarılmadan önce PDF sayfa önizlemeleri oluşturulmalıdır."
+                .to_string(),
+            recoverable: true,
+            suggested_action: Some("Önce PDF sayfa önizlemelerini oluşturun.".to_string()),
+            technical_details: error.technical_details,
+            correlation_id: Uuid::new_v4().to_string(),
+        })
     }
 
     pub fn get_pdf_page_preview(
@@ -286,11 +281,15 @@ impl PdfPreviewService {
         project_id: String,
         document_id: String,
     ) -> Result<StartPdfPreviewRenderOutput, AppError> {
-        let mut project = self
+        let project = self
             .project_store
             .get_project_snapshot(project_id.clone())?;
         let document = find_pdf_document(&project, &document_id)?.clone();
-        validate_pdf_source(&document)?;
+        let trusted_root = self.project_store.trusted_project_root(&project_id)?;
+        validate_pdf_source(&document, &trusted_root)?;
+        let source_path = document.resolve_path_with_root(&trusted_root)?;
+        let source_fingerprint = file_fingerprint(&source_path)?;
+        let generation_id = Uuid::new_v4().to_string();
 
         let renderer_status = self.pdf_service.get_renderer_status()?;
         if !renderer_status.available {
@@ -313,22 +312,39 @@ impl PdfPreviewService {
             "PDF önizlemeleri hazırlanıyor...".to_string(),
         )?;
 
-        if let Err(error) = (|| -> Result<(), AppError> {
-            set_document_preview_state(
-                &mut project,
-                &document_id,
-                PdfPreviewState {
-                    status: PdfPreviewStatus::Queued,
-                    rendered_at: None,
-                    page_count: None,
-                    job_id: Some(job.id.clone()),
-                    error_message: None,
+        let queue_result = self
+            .project_store
+            .mutate(
+                &project_id,
+                crate::services::project_store::MutationOptions::new("queue_preview_generation"),
+                |current, _context| {
+                    let current_preview = current
+                        .documents
+                        .iter()
+                        .find(|entry| entry.id == document_id)
+                        .and_then(|entry| entry.preview.clone());
+                    set_document_preview_state(
+                        current,
+                        &document_id,
+                        PdfPreviewState {
+                            status: PdfPreviewStatus::Queued,
+                            rendered_at: current_preview
+                                .as_ref()
+                                .and_then(|value| value.rendered_at.clone()),
+                            page_count: current_preview.as_ref().and_then(|value| value.page_count),
+                            job_id: Some(job.id.clone()),
+                            error_message: None,
+                            active_generation_id: current_preview
+                                .as_ref()
+                                .and_then(|value| value.active_generation_id.clone()),
+                            pending_generation_id: Some(generation_id.clone()),
+                            source_fingerprint: Some(source_fingerprint.clone()),
+                        },
+                    )
                 },
-            )?;
-            project.workflow = workflow_engine::evaluate_workflow(&project);
-            self.project_store.save_project(&project)?;
-            Ok(())
-        })() {
+            )
+            .map(|_| ());
+        if let Err(error) = queue_result {
             let _ = self.job_manager.fail(&app, &job.id, error.clone());
             return Err(error);
         }
@@ -343,6 +359,8 @@ impl PdfPreviewService {
                     job_id.clone(),
                     project_id.clone(),
                     document_id.clone(),
+                    generation_id.clone(),
+                    source_fingerprint.clone(),
                 )
                 .await
             {
@@ -368,6 +386,8 @@ impl PdfPreviewService {
         job_id: String,
         project_id: String,
         document_id: String,
+        generation_id: String,
+        source_fingerprint: String,
     ) -> Result<(), AppError> {
         self.job_manager.set_running(&app, &job_id)?;
 
@@ -375,96 +395,247 @@ impl PdfPreviewService {
             .project_store
             .get_project_snapshot(project_id.clone())?;
         let document = find_pdf_document(&project, &document_id)?.clone();
-        validate_pdf_source(&document)?;
+        let trusted_root = self.project_store.trusted_project_root(&project_id)?;
+        validate_pdf_source(&document, &trusted_root)?;
 
-        let pdf_path = PathBuf::from(&document.stored_path);
-        let preview_dir = preview_dir(&project, &document.id);
-        clear_directory(&preview_dir)?;
-        std::fs::create_dir_all(&preview_dir).map_err(|e| AppError {
-            code: AppErrorCode::FileWriteFailed,
-            message: "PDF önizleme klasörü oluşturulamadı.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
+        let pdf_path = document.resolve_path_with_root(&trusted_root)?;
+        if file_fingerprint(&pdf_path)? != source_fingerprint {
+            return Err(preview_stale_error());
+        }
+        let staging_dir = preview_staging_dir(&trusted_root, &document.id, &generation_id)?;
+        let generation_dir = preview_generation_dir(&trusted_root, &document.id, &generation_id)?;
+        trusted_root.ensure_managed_directory(
+            staging_dir
+                .parent()
+                .ok_or_else(|| preview_write_error("Önizleme staging yolu belirlenemedi."))?,
+        )?;
+        trusted_root.ensure_managed_directory(&staging_dir)?;
+
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                cleanup_preview_directory(&trusted_root, &staging_dir);
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Önizleme işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+
+        let build_result = (|| -> Result<(Vec<PdfPagePreview>, u32, String), AppError> {
+            let rendered = self.pdf_service.render_all_pages(&pdf_path, &staging_dir)?;
+            if rendered.is_empty() {
+                return Err(AppError {
+                    code: AppErrorCode::PreviewGenerationFailed,
+                    message: "PDF önizlemesi oluşturulamadı.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Lütfen geçerli bir PDF deneyin.".to_string()),
+                    technical_details: Some("No rendered pages returned.".to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+            if document.page_count > 0 && rendered.len() as u32 != document.page_count {
+                return Err(AppError {
+                    code: AppErrorCode::PreviewGenerationFailed,
+                    message: "Yeni PDF önizlemesi beklenen sayfa sayısını üretmedi.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Önizlemeyi yeniden oluşturun.".to_string()),
+                    technical_details: Some(format!(
+                        "expected_pages={}; rendered_pages={}",
+                        document.page_count,
+                        rendered.len()
+                    )),
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+            let rendered_at = chrono::Utc::now().to_rfc3339();
+            let page_count = rendered.len() as u32;
+            let mut previews = Vec::new();
+            for (index, image_path) in rendered.iter().enumerate() {
+                if let Some(ref token) = cancel_token {
+                    if token.is_cancelled() {
+                        return Err(AppError {
+                            code: AppErrorCode::JobCancelled,
+                            message: "Önizleme işlemi iptal edildi.".to_string(),
+                            recoverable: true,
+                            suggested_action: None,
+                            technical_details: None,
+                            correlation_id: Uuid::new_v4().to_string(),
+                        });
+                    }
+                }
+
+                validate_rendered_preview_file(&trusted_root, &staging_dir, image_path)?;
+                let file_name = image_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| preview_write_error("Önizleme dosya adı belirlenemedi."))?;
+                if file_name == "."
+                    || file_name == ".."
+                    || file_name.contains('/')
+                    || file_name.contains('\\')
+                {
+                    return Err(AppError {
+                        code: AppErrorCode::ManagedPathOutsideProject,
+                        message: "Önizleme dosya adı güvenli değil.".to_string(),
+                        recoverable: false,
+                        suggested_action: Some("PDF önizlemesini yeniden oluşturun.".to_string()),
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    });
+                }
+                let final_image_path = generation_dir.join(file_name);
+                let (width, height) =
+                    image::image_dimensions(image_path).map_err(|error| AppError {
+                        code: AppErrorCode::PreviewGenerationFailed,
+                        message: "Önizleme görseli okunamadı.".to_string(),
+                        recoverable: true,
+                        suggested_action: Some("PDF önizlemelerini yeniden oluşturun.".to_string()),
+                        technical_details: Some(error.to_string()),
+                        correlation_id: Uuid::new_v4().to_string(),
+                    })?;
+                previews.push(PdfPagePreview {
+                    document_id: document.id.clone(),
+                    page_number: (index + 1) as u32,
+                    image_path: trusted_root
+                        .relative_for_existing(&final_image_path)
+                        .or_else(|_| {
+                            trusted_root.managed(&format!(
+                                "outputs/previews/{}/generations/{}/{}",
+                                document.id, generation_id, file_name
+                            ))
+                        })?
+                        .as_str()
+                        .to_string(),
+                    width,
+                    height,
+                    rendered_at: rendered_at.clone(),
+                });
+                let current = (index + 1) as u32;
+                self.job_manager.update_progress(
+                    &app,
+                    &job_id,
+                    current,
+                    page_count,
+                    format!("Sayfa {current}/{page_count} işleniyor"),
+                )?;
+            }
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    return Err(AppError {
+                        code: AppErrorCode::JobCancelled,
+                        message: "Önizleme işlemi iptal edildi.".to_string(),
+                        recoverable: true,
+                        suggested_action: None,
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    });
+                }
+            }
+            let manifest = PdfPreviewIndex {
+                document_id: document.id.clone(),
+                page_count,
+                rendered_at: rendered_at.clone(),
+                pages: previews.clone(),
+            };
+            write_preview_index(&staging_dir.join("manifest.json"), &manifest)?;
+            Ok((previews, page_count, rendered_at))
+        })();
+
+        let (previews, page_count, rendered_at) = match build_result {
+            Ok(value) => value,
+            Err(error) => {
+                cleanup_preview_directory(&trusted_root, &staging_dir);
+                if error.code == AppErrorCode::JobCancelled {
+                    let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                cleanup_preview_directory(&trusted_root, &staging_dir);
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Önizleme işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+        if file_fingerprint(&pdf_path)? != source_fingerprint {
+            cleanup_preview_directory(&trusted_root, &staging_dir);
+            return Err(preview_stale_error());
+        }
+        trusted_root.ensure_managed_directory(
+            generation_dir
+                .parent()
+                .ok_or_else(|| preview_write_error("Önizleme generation yolu belirlenemedi."))?,
+        )?;
+        std::fs::rename(&staging_dir, &generation_dir).map_err(|error| {
+            cleanup_preview_directory(&trusted_root, &staging_dir);
+            AppError {
+                code: AppErrorCode::PreviewGenerationFailed,
+                message: "Yeni PDF önizlemesi etkinleştirilemedi.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Önizlemeyi yeniden oluşturun.".to_string()),
+                technical_details: Some(error.to_string()),
+                correlation_id: Uuid::new_v4().to_string(),
+            }
         })?;
 
-        let rendered = self.pdf_service.render_all_pages(&pdf_path, &preview_dir)?;
-
-        if rendered.is_empty() {
-            return Err(AppError {
-                code: AppErrorCode::PdfRenderFailed,
-                message: "PDF önizlemesi oluşturulamadı.".to_string(),
-                recoverable: true,
-                suggested_action: Some("Lütfen geçerli bir PDF deneyin.".to_string()),
-                technical_details: Some("No rendered pages returned.".to_string()),
-                correlation_id: Uuid::new_v4().to_string(),
-            });
-        }
-
-        let rendered_at = chrono::Utc::now().to_rfc3339();
-        let page_count = rendered.len() as u32;
-        let mut previews = Vec::new();
-        for (index, image_path) in rendered.iter().enumerate() {
-            let (width, height) = image::image_dimensions(image_path).map_err(|e| AppError {
-                code: AppErrorCode::PdfRenderFailed,
-                message: "Önizleme görseli okunamadı.".to_string(),
-                recoverable: true,
-                suggested_action: Some("PDF önizlemelerini yeniden oluşturun.".to_string()),
-                technical_details: Some(e.to_string()),
-                correlation_id: Uuid::new_v4().to_string(),
-            })?;
-
-            previews.push(PdfPagePreview {
-                document_id: document.id.clone(),
-                page_number: (index + 1) as u32,
-                image_path: image_path.to_string_lossy().to_string(),
-                width,
-                height,
-                rendered_at: rendered_at.clone(),
-            });
-
-            let current = (index + 1) as u32;
-            self.job_manager.update_progress(
-                &app,
-                &job_id,
-                current,
-                page_count,
-                format!("Sayfa {current}/{page_count} işleniyor"),
-            )?;
-        }
-
-        let metadata = PdfPreviewIndex {
-            document_id: document.id.clone(),
-            page_count,
-            rendered_at: rendered_at.clone(),
-            pages: previews.clone(),
-        };
-        write_preview_index(&preview_metadata_path(&project, &document.id), &metadata)?;
-
-        let mut updated_project = self
-            .project_store
-            .get_project_snapshot(project_id.clone())?;
-        if let Some(document_entry) = updated_project
-            .documents
-            .iter_mut()
-            .find(|entry| entry.id == document.id)
-        {
-            document_entry.page_count = page_count;
-        }
-        set_document_preview_state(
-            &mut updated_project,
-            &document_id,
-            PdfPreviewState {
-                status: PdfPreviewStatus::Ready,
-                rendered_at: Some(rendered_at.clone()),
-                page_count: Some(page_count),
-                job_id: Some(job_id.clone()),
-                error_message: None,
+        let commit = self.project_store.commit_job(
+            &project_id,
+            crate::services::project_store::MutationOptions::new("activate_preview_generation"),
+            |current, _context| {
+                let current_document = find_pdf_document(current, &document_id)?;
+                let current_path = current_document.resolve_path_with_root(&trusted_root)?;
+                if file_fingerprint(&current_path)? != source_fingerprint {
+                    return Err(preview_stale_error());
+                }
+                if let Some(entry) = current
+                    .documents
+                    .iter_mut()
+                    .find(|entry| entry.id == document_id)
+                {
+                    entry.page_count = page_count;
+                    entry.preview = Some(PdfPreviewState {
+                        status: PdfPreviewStatus::Ready,
+                        rendered_at: Some(rendered_at.clone()),
+                        page_count: Some(page_count),
+                        job_id: Some(job_id.clone()),
+                        error_message: None,
+                        active_generation_id: Some(generation_id.clone()),
+                        pending_generation_id: None,
+                        source_fingerprint: Some(source_fingerprint.clone()),
+                    });
+                }
+                Ok(())
             },
-        )?;
-        updated_project.workflow = workflow_engine::evaluate_workflow(&updated_project);
-        self.project_store.save_project(&updated_project)?;
+        );
+        match commit {
+            crate::services::project_store::JobCommitResult::Applied(_) => {}
+            crate::services::project_store::JobCommitResult::Stale { .. }
+            | crate::services::project_store::JobCommitResult::EntityMissing => {
+                cleanup_preview_directory(&trusted_root, &generation_dir);
+                return Err(preview_stale_error());
+            }
+            crate::services::project_store::JobCommitResult::Conflict(error)
+            | crate::services::project_store::JobCommitResult::Rejected(error) => {
+                cleanup_preview_directory(&trusted_root, &generation_dir);
+                return Err(error);
+            }
+        }
 
         self.job_manager.succeed(
             &app,
@@ -487,22 +658,42 @@ impl PdfPreviewService {
         job_id: &str,
         error: AppError,
     ) -> Result<(), AppError> {
-        let mut project = self
-            .project_store
-            .get_project_snapshot(project_id.to_string())?;
-        set_document_preview_state(
-            &mut project,
-            document_id,
-            PdfPreviewState {
-                status: PdfPreviewStatus::Failed,
-                rendered_at: None,
-                page_count: None,
-                job_id: Some(job_id.to_string()),
-                error_message: Some(error.message.clone()),
-            },
-        )?;
-        project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        let error_message = error.message.clone();
+        self.project_store
+            .mutate(
+                project_id,
+                crate::services::project_store::MutationOptions::new(
+                    "mark_preview_generation_failed",
+                ),
+                |project, _context| {
+                    let previous = project
+                        .documents
+                        .iter()
+                        .find(|document| document.id == document_id)
+                        .and_then(|document| document.preview.clone());
+                    set_document_preview_state(
+                        project,
+                        document_id,
+                        PdfPreviewState {
+                            status: PdfPreviewStatus::Failed,
+                            rendered_at: previous
+                                .as_ref()
+                                .and_then(|value| value.rendered_at.clone()),
+                            page_count: previous.as_ref().and_then(|value| value.page_count),
+                            job_id: Some(job_id.to_string()),
+                            error_message: Some(error_message.clone()),
+                            active_generation_id: previous
+                                .as_ref()
+                                .and_then(|value| value.active_generation_id.clone()),
+                            pending_generation_id: None,
+                            source_fingerprint: previous
+                                .as_ref()
+                                .and_then(|value| value.source_fingerprint.clone()),
+                        },
+                    )
+                },
+            )
+            .map(|_| ())?;
         self.job_manager.fail(app, job_id, error)?;
         Ok(())
     }
@@ -532,44 +723,96 @@ fn find_pdf_document<'a>(
         })
 }
 
-fn validate_pdf_source(document: &Document) -> Result<(), AppError> {
-    let path = Path::new(&document.stored_path);
-    if !path.exists() || !path.is_file() {
-        return Err(AppError {
-            code: AppErrorCode::PdfDocumentNotFound,
+fn validate_pdf_source(
+    document: &Document,
+    trusted_root: &TrustedProjectRoot,
+) -> Result<(), AppError> {
+    document
+        .resolve_path_with_root(trusted_root)
+        .map(|_| ())
+        .map_err(|error| AppError {
+            code: error.code,
             message: "Sınav PDF dosyası bulunamadı.".to_string(),
             recoverable: true,
             suggested_action: Some("PDF dosyasını tekrar içe aktarın.".to_string()),
-            technical_details: Some(document.stored_path.clone()),
+            technical_details: error.technical_details,
+            correlation_id: Uuid::new_v4().to_string(),
+        })
+}
+
+#[cfg(test)]
+fn preview_dir(trusted_root: &TrustedProjectRoot, document_id: &str) -> Result<PathBuf, AppError> {
+    let managed = trusted_root.managed(&format!("cache/page_previews/{document_id}"))?;
+    Ok(trusted_root.root().join(managed.as_path()))
+}
+
+fn preview_generations_dir(
+    trusted_root: &TrustedProjectRoot,
+    document_id: &str,
+) -> Result<PathBuf, AppError> {
+    let managed = trusted_root.managed(&format!("outputs/previews/{document_id}/generations"))?;
+    Ok(trusted_root.root().join(managed.as_path()))
+}
+
+fn preview_generation_dir(
+    trusted_root: &TrustedProjectRoot,
+    document_id: &str,
+    generation_id: &str,
+) -> Result<PathBuf, AppError> {
+    let parent = preview_generations_dir(trusted_root, document_id)?;
+    let managed = trusted_root.managed(&format!(
+        "outputs/previews/{document_id}/generations/{generation_id}"
+    ))?;
+    let candidate = trusted_root.root().join(managed.as_path());
+    if candidate.parent() != Some(parent.as_path()) {
+        return Err(AppError {
+            code: AppErrorCode::UnsafeManagedPath,
+            message: "Önizleme generation yolu güvenli değil.".to_string(),
+            recoverable: false,
+            suggested_action: Some("Önizlemeyi yeniden oluşturun.".to_string()),
+            technical_details: None,
             correlation_id: Uuid::new_v4().to_string(),
         });
     }
-    Ok(())
+    Ok(candidate)
 }
 
-fn preview_dir(project: &Project, document_id: &str) -> PathBuf {
-    Path::new(&project.root_path)
-        .join("cache")
-        .join("page_previews")
-        .join(document_id)
+fn preview_staging_dir(
+    trusted_root: &TrustedProjectRoot,
+    document_id: &str,
+    generation_id: &str,
+) -> Result<PathBuf, AppError> {
+    let managed = trusted_root.managed(&format!(
+        "outputs/previews/{document_id}/.staging/{generation_id}"
+    ))?;
+    Ok(trusted_root.root().join(managed.as_path()))
 }
 
-fn preview_metadata_path(project: &Project, document_id: &str) -> PathBuf {
-    preview_dir(project, document_id).join("page_previews.json")
-}
-
-fn clear_directory(path: &Path) -> Result<(), AppError> {
-    if path.exists() {
-        std::fs::remove_dir_all(path).map_err(|e| AppError {
-            code: AppErrorCode::FileWriteFailed,
-            message: "Eski önizleme önbelleği temizlenemedi.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+fn active_preview_metadata_path(
+    trusted_root: &TrustedProjectRoot,
+    document: &Document,
+) -> Result<PathBuf, AppError> {
+    if let Some(generation_id) = document
+        .preview
+        .as_ref()
+        .and_then(|preview| preview.active_generation_id.as_deref())
+    {
+        return Ok(
+            preview_generation_dir(trusted_root, &document.id, generation_id)?
+                .join("manifest.json"),
+        );
     }
-    Ok(())
+    preview_metadata_path(trusted_root, &document.id)
+}
+
+fn preview_metadata_path(
+    trusted_root: &TrustedProjectRoot,
+    document_id: &str,
+) -> Result<PathBuf, AppError> {
+    let managed = trusted_root.managed(&format!(
+        "cache/page_previews/{document_id}/page_previews.json"
+    ))?;
+    Ok(trusted_root.root().join(managed.as_path()))
 }
 
 fn write_preview_index(path: &Path, index: &PdfPreviewIndex) -> Result<(), AppError> {
@@ -591,6 +834,88 @@ fn write_preview_index(path: &Path, index: &PdfPreviewIndex) -> Result<(), AppEr
     })
 }
 
+fn validate_rendered_preview_file(
+    trusted_root: &TrustedProjectRoot,
+    staging_dir: &Path,
+    image_path: &Path,
+) -> Result<(), AppError> {
+    if !image_path.starts_with(staging_dir) {
+        return Err(AppError {
+            code: AppErrorCode::ManagedPathOutsideProject,
+            message: "Önizleme çıktısı güvenilen staging alanının dışında.".to_string(),
+            recoverable: false,
+            suggested_action: Some("PDF önizlemesini yeniden oluşturun.".to_string()),
+            technical_details: None,
+            correlation_id: Uuid::new_v4().to_string(),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(image_path).map_err(|error| AppError {
+        code: AppErrorCode::PreviewGenerationFailed,
+        message: "Önizleme sayfası oluşturulamadı.".to_string(),
+        recoverable: true,
+        suggested_action: Some("PDF önizlemelerini yeniden oluşturun.".to_string()),
+        technical_details: Some(error.to_string()),
+        correlation_id: Uuid::new_v4().to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err(AppError {
+            code: AppErrorCode::PreviewGenerationFailed,
+            message: "Önizleme sayfası boş veya güvenli bir dosya değil.".to_string(),
+            recoverable: true,
+            suggested_action: Some("PDF önizlemelerini yeniden oluşturun.".to_string()),
+            technical_details: None,
+            correlation_id: Uuid::new_v4().to_string(),
+        });
+    }
+    trusted_root.relative_for_existing(image_path).map(|_| ())
+}
+
+fn cleanup_preview_directory(trusted_root: &TrustedProjectRoot, directory: &Path) {
+    if directory.exists() {
+        let _ = crate::platform::file_access::remove_dir_within(trusted_root.root(), directory);
+    }
+}
+
+fn preview_write_error(message: &str) -> AppError {
+    AppError {
+        code: AppErrorCode::PreviewGenerationFailed,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: Some("PDF önizlemelerini yeniden oluşturun.".to_string()),
+        technical_details: None,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn preview_stale_error() -> AppError {
+    AppError {
+        code: AppErrorCode::PreviewGenerationStale,
+        message: "PDF değiştiği için yeni önizleme etkinleştirilmedi; önceki önizleme korundu."
+            .to_string(),
+        recoverable: true,
+        suggested_action: Some("Belgeyi yenileyip önizlemeyi yeniden oluşturun.".to_string()),
+        technical_details: None,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn file_fingerprint(path: &Path) -> Result<String, AppError> {
+    let bytes = std::fs::read(path).map_err(|error| AppError {
+        code: AppErrorCode::FileReadFailed,
+        message: "PDF kaynak dosyası okunamadı.".to_string(),
+        recoverable: true,
+        suggested_action: Some("Belgeyi yeniden içe aktarın.".to_string()),
+        technical_details: Some(error.to_string()),
+        correlation_id: Uuid::new_v4().to_string(),
+    })?;
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 fn read_preview_index(path: &Path) -> Result<PdfPreviewIndex, AppError> {
     let content = std::fs::read_to_string(path).map_err(|e| AppError {
         code: AppErrorCode::FileReadFailed,
@@ -608,6 +933,44 @@ fn read_preview_index(path: &Path) -> Result<PdfPreviewIndex, AppError> {
         technical_details: Some(e.to_string()),
         correlation_id: Uuid::new_v4().to_string(),
     })
+}
+
+fn read_active_preview_index(
+    path: &Path,
+    document: &Document,
+) -> Result<PdfPreviewIndex, AppError> {
+    if document
+        .preview
+        .as_ref()
+        .and_then(|preview| preview.active_generation_id.as_ref())
+        .is_some()
+        && !path.exists()
+    {
+        return Err(AppError {
+            code: AppErrorCode::PreviewActiveGenerationMissing,
+            message: "Aktif PDF önizlemesi bulunamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("PDF önizlemesini yeniden oluşturun.".to_string()),
+            technical_details: None,
+            correlation_id: Uuid::new_v4().to_string(),
+        });
+    }
+    read_preview_index(path)
+}
+
+fn materialize_preview_pages(
+    trusted_root: &TrustedProjectRoot,
+    pages: Vec<PdfPagePreview>,
+) -> Result<Vec<PdfPagePreview>, AppError> {
+    pages
+        .into_iter()
+        .map(|mut page| {
+            let managed = trusted_root.adapt_legacy_document_path(&page.image_path)?;
+            let resolved = trusted_root.resolve_existing_file(&managed)?;
+            page.image_path = resolved.to_string_lossy().to_string();
+            Ok(page)
+        })
+        .collect()
 }
 
 fn set_document_preview_state(
@@ -665,12 +1028,19 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             root_path: temp_project_root().to_string_lossy().to_string(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -690,10 +1060,34 @@ mod tests {
                 summary: crate::domain::workflow::WorkflowSummary::default(),
             },
         };
-        let dir = preview_dir(&project, "doc-1");
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false)
+                .unwrap();
+        let dir = preview_dir(&trusted_root, "doc-1").unwrap();
         assert!(dir.ends_with("cache/page_previews/doc-1"));
-        let metadata = preview_metadata_path(&project, "doc-1");
+        let metadata = preview_metadata_path(&trusted_root, "doc-1").unwrap();
         assert!(metadata.ends_with("cache/page_previews/doc-1/page_previews.json"));
+    }
+
+    #[test]
+    fn failed_staging_cleanup_preserves_active_preview_bytes() {
+        let root = temp_project_root();
+        let trusted_root = TrustedProjectRoot::from_canonical_root(root, false).unwrap();
+        let active = preview_generation_dir(&trusted_root, "doc-1", "active-generation").unwrap();
+        let staging = preview_staging_dir(&trusted_root, "doc-1", "failed-generation").unwrap();
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        let manifest = active.join("manifest.json");
+        let page = active.join("page-001.png");
+        std::fs::write(&manifest, b"active-manifest").unwrap();
+        std::fs::write(&page, b"active-page").unwrap();
+        std::fs::write(staging.join("partial-page.png"), b"partial").unwrap();
+
+        cleanup_preview_directory(&trusted_root, &staging);
+
+        assert_eq!(std::fs::read(&manifest).unwrap(), b"active-manifest");
+        assert_eq!(std::fs::read(&page).unwrap(), b"active-page");
+        assert!(!staging.exists());
     }
 
     #[test]
@@ -706,12 +1100,19 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             root_path: temp_project_root().to_string_lossy().to_string(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -757,6 +1158,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: Some("job".into()),
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             },
         )
         .expect("preview state");
@@ -795,6 +1199,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: Some("job".into()),
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         store.save_project(&project).expect("save");
@@ -814,7 +1221,10 @@ mod tests {
             .create_project("p".into(), root.to_string_lossy().to_string())
             .expect("project");
         project.student_scan_document_id = None;
-        let preview_dir = preview_dir(&project, "doc-1");
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false)
+                .unwrap();
+        let preview_dir = preview_dir(&trusted_root, "doc-1").unwrap();
         std::fs::create_dir_all(&preview_dir).expect("preview dir");
         let image_path = preview_dir.join("page_1.png");
         let metadata = PdfPreviewIndex {
@@ -830,8 +1240,11 @@ mod tests {
                 rendered_at: "now".into(),
             }],
         };
-        write_preview_index(&preview_metadata_path(&project, "doc-1"), &metadata)
-            .expect("metadata");
+        write_preview_index(
+            &preview_metadata_path(&trusted_root, "doc-1").unwrap(),
+            &metadata,
+        )
+        .expect("metadata");
         project.documents.push(Document {
             id: "doc-1".into(),
             role: DocumentRole::ExamSource,
@@ -846,6 +1259,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: Some("job".into()),
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         store.save_project(&project).expect("save");
@@ -855,5 +1271,101 @@ mod tests {
             .require_ready_page_previews(&project.id, "doc-1")
             .expect_err("image should be missing");
         assert_eq!(error.code, AppErrorCode::PdfPreviewNotReady);
+    }
+
+    #[test]
+    fn proof_5_preview_cancel_preserves_active_generation() {
+        use crate::domain::job::DuplicatePolicy;
+        use crate::jobs::job_manager::JobRegistrationInput;
+
+        let store = ProjectStore::new();
+        let root = temp_project_root();
+        let mut project = store
+            .create_project("proj_p5".into(), root.to_string_lossy().to_string())
+            .expect("project");
+        let pdf_path = root.join("multi_page.pdf");
+        std::fs::write(&pdf_path, b"%PDF-1.4 dummy content for test").expect("write pdf");
+        let fingerprint = file_fingerprint(&pdf_path).unwrap();
+
+        let doc_id = "doc-p5";
+        project.documents.push(Document {
+            id: doc_id.into(),
+            role: DocumentRole::ExamSource,
+            file_name: "multi_page.pdf".into(),
+            stored_path: pdf_path.to_string_lossy().to_string(),
+            page_count: 2,
+            added_at: "now".into(),
+            checksum: None,
+            preview: Some(PdfPreviewState {
+                status: PdfPreviewStatus::Ready,
+                rendered_at: Some("now".into()),
+                page_count: Some(2),
+                job_id: Some("initial_job".into()),
+                error_message: None,
+                active_generation_id: Some("gen_v1".into()),
+                pending_generation_id: None,
+                source_fingerprint: Some(fingerprint.clone()),
+            }),
+        });
+        store.save_project(&project).expect("save project");
+
+        let jm = Arc::new(JobManager::new());
+        let pdf_service = Arc::new(SystemPdfService);
+        let service = PdfPreviewService::new(store.clone(), pdf_service, jm.clone());
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &handle,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::PdfPreviewRender,
+                    display_label: Some("Preview Render".into()),
+                    total: 2,
+                    message: "Rendering".into(),
+                    correlation_id: Some("corr-p5".into()),
+                    idempotency_key: Some("key-p5".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation before run_render
+        jm.cancel_job(&handle, &reg.snapshot.id).unwrap();
+
+        // Perform run_render with cancellation requested
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(service.run_render(
+            handle.clone(),
+            reg.snapshot.id.clone(),
+            project.id.clone(),
+            doc_id.to_string(),
+            "gen_v2".to_string(),
+            fingerprint,
+        ));
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify active preview in project snapshot remains gen_v1
+        let updated_project = store.get_project_snapshot(project.id).unwrap();
+        let doc = updated_project
+            .documents
+            .iter()
+            .find(|d| d.id == doc_id)
+            .unwrap();
+        assert_eq!(
+            doc.preview
+                .as_ref()
+                .and_then(|p| p.active_generation_id.as_deref()),
+            Some("gen_v1")
+        );
     }
 }

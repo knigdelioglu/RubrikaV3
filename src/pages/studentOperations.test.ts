@@ -76,6 +76,7 @@ const students: Student[] = [
 ];
 
 test('student workspace normalizes tabs and rejects a batch from another selected class', () => {
+  assert.equal(normalizeStudentOperationsTab('roster'), 'roster');
   assert.equal(normalizeStudentOperationsTab('issues'), 'issues');
   assert.equal(normalizeStudentOperationsTab('unknown'), 'grouping');
   assert.deepEqual(

@@ -1,6 +1,6 @@
 use crate::domain::errors::AppError;
 use crate::domain::project::Project;
-use crate::domain::student::OcrImagePreprocessMode;
+use crate::domain::student::{OcrGeneration, OcrImagePreprocessMode};
 use crate::domain::student::{
     StudentAnswerCropTemplateItem, StudentAnswerOcrRecord, StudentIdentityCropTemplate,
 };
@@ -36,6 +36,13 @@ pub struct MarkStudentAnswerOcrReviewedInput {
     pub project_id: String,
     pub submission_id: String,
     pub question_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrGenerationInput {
+    pub project_id: String,
+    pub generation_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -116,6 +123,26 @@ pub async fn mark_all_student_answer_ocr_reviewed(
     state
         .student_answer_ocr_service
         .mark_all_student_answers_reviewed(&input.project_id)
+}
+
+#[tauri::command]
+pub async fn accept_student_answer_ocr_generation(
+    state: State<'_, AppState>,
+    input: OcrGenerationInput,
+) -> Result<OcrGeneration, AppError> {
+    state
+        .student_answer_ocr_service
+        .accept_student_answer_ocr_generation(&input.project_id, &input.generation_id)
+}
+
+#[tauri::command]
+pub async fn reject_student_answer_ocr_generation(
+    state: State<'_, AppState>,
+    input: OcrGenerationInput,
+) -> Result<OcrGeneration, AppError> {
+    state
+        .student_answer_ocr_service
+        .reject_student_answer_ocr_generation(&input.project_id, &input.generation_id)
 }
 
 #[tauri::command]

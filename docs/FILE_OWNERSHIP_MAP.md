@@ -12,6 +12,7 @@ Bu doküman, spesifik bir işi yaparken hangi dosyaları değiştirmeniz gerekti
 | **Model path / port config değiştirmek** | `model_config_service.rs`, `model_process_manager.rs` | `model_config_service.rs` (JSON konfigürasyon kaydı) | `llama_server_gateway.rs` (Gateway sadece verilen URL'ye istek atar) | `cargo test` |
 | **İş akışı (Workflow) sırasını veya engellerini düzeltmek** | `workflow_engine.rs`, `workflow.rs` | `workflow_engine.rs` (Sıralı if/else blokları) | React sayfaları (Örn: UI üzerinden butonu aktifleştirmeye çalışmayın!) | `cargo test` (Özellikle workflow birim testleri) |
 | **Yeni bir asenkron Job eklemek** | `job_manager.rs`, `job.rs` | `job.rs` (`JobKind` enum), komutu başlatan servis dosyası | - | `cargo test` |
+| **Job persistence, rehydration, cancellation ve duplicate prevention** | `job_manager.rs`, `job.rs`, `JOB_LIFECYCLE_AND_CANCELLATION.md` | `job_manager.rs`, `job_commands.rs`, `JobSnapshot` DTO, cancellation token checkpoints, GlobalJobCenter UI | Model runtime lease mimarisi, transactional ProjectStore | `cargo test`, `npm run typecheck` |
 | **Yeni bir Tauri Command eklemek** | `commands.ts` (Frontend API), `commands/` klasörü altındaki uygun dosya (Örn: `project_commands.rs`), `main.rs` | Yeni command fonksiyonu (Rust), Frontend'e sarmalayıcı (TS), `main.rs` (İlklendirme) | Domain modelleri | `npm run typecheck`, `cargo clippy` |
 | **Frontend sayfasına yeni bir alan (UI öğesi) eklemek** | İlgili sayfa (Örn: `StudentAnswerOcrPage.tsx`), `types.ts` | Sayfa dosyası, `types.ts` (Eğer API'den ek veri geliyorsa) | Backend Domain / Service (Eğer sadece görsel/UI state bir alan ise) | `npm run lint` |
 | **Domain modeline (Örn: `Project` veya `Student`) yeni bir alan eklemek** | `domain/project.rs`, `types.ts` (TS), `project_store.rs` | İlgili Rust domain dosyası, `types.ts` (TypeScript eşleniği), ProjectStore serde/default uyumluluğu | Backend mantığı bozulmadıkça servislerin kendisi | `cargo test`, `npm run typecheck` |
@@ -32,10 +33,13 @@ Bu doküman, spesifik bir işi yaparken hangi dosyaları değiştirmeniz gerekti
 | **Yeni frontend API type eklemek** | `types.ts`, Rust DTO'ları | TS: `types.ts`, Rust: İlgili struct üzerine `#[derive(Serialize, Deserialize)]` | Katı Domain nesneleri (Frontend DTO'ları core entity olmak zorunda değildir, clone'lanmış DTO'lar kullanılabilir). | `npm run typecheck` |
 | **Project.json geriye dönük uyumluluk / yükleme onarımı** | `project_store.rs`, `domain/project.rs`, `domain/student.rs`, `domain/scoring.rs`, `domain/model.rs` | `project_store.rs` içinde iki aşamalı JSON normalize+deserialize akışı, serde path diagnostics, enum fallback/default alanları | UI'da “JSON bozuk” diye yanıltıcı tek mesaj, veri silen otomatik repair | `cargo test`, `cargo clippy` |
 | **AI Studio tasarım referansından frontend modernizasyonu** | İlgili `src/pages/*.tsx`, `src/design-reference/ai-studio/*.tsx` | İlgili frontend sayfası. Tasarım aktarılır. | Mock stateler, backend/workflow kurguları. Sadece görsel yapı referans alınmalıdır. | `npm run lint`, `npm run typecheck` |
-| **Frontend navigation/app shell erişimi** | `src/app/App.tsx`, `src/app/AppLayout.tsx` | Sayfa yönlendirmeleri, layout yapısı ve proje menüsü navigasyonu. | Geçici state yönetimi. Navigasyon yalnızca aktif proje bağlamında çalışır. | `npm run typecheck`, `npm run lint` |
+| **Frontend navigation/app shell erişimi** | `src/app/App.tsx`, `src/app/AppLayout.tsx`, `src/app/projectRoutes.ts` | 5-menülü global sol navigasyon (Ana Sayfa, Sınavlar, Sınıflar ve Öğrenciler, Raporlar, Ayarlar), top-header ders alanı sunumu, global mode toggle kaldırılması | Geçici state yönetimi. Navigasyon yalnızca aktif proje bağlamında çalışır. | `npm run typecheck`, `npm run lint`, `npm test` |
 | **Workflow UI modernizasyonu** | `WorkflowPage.tsx`, `WorkflowPanel.tsx`, `NextActions.tsx` | Workflow ekranının görsel düzeni. | İş akışı state'leri backend snapshot'tan beslenir. Frontend'de sahte durumlar oluşturulamaz. | `npm run typecheck`, `npm run lint` |
 | **Canonical Sınav Paketi workspace’ini değiştirmek** | `ExamPackageWorkspacePage.tsx`, `examPackageWorkspace.ts`, `projectRoutes.ts`, `App.tsx`, `RubricQuestionCard.tsx`, `NextActions.tsx` | Soru listesi/view-model, question/rubric/freeze sekmeleri, query-param deep-link, compatibility redirect ve package summary sunumu | `WorkflowSnapshot.summary.readiness.examPackageFreeze`, `confirm_all_rubrics` backend gate’i, `ExamPackageFreeze` hash içeriği, ProjectStore persistence ve scoring gate frontend’de yeniden hesaplanamaz/değiştirilemez | `npm test`, `npm run build`, `cargo test` |
 | **Student PDF preview UI modernizasyonu** | `StudentScansPage.tsx`, `PdfPreviewPage.tsx`, `PdfPageViewer.tsx`, `AppLayout.tsx`, `commands.ts`, `types.ts` | Öğrenci PDF önizleme ekranının UI modernizasyonu. | Gerçek PdfPageViewer ve preview cache akışı korunmalıdır. | `npm run typecheck`, `npm run lint` |
+
+| **Proje/document path security** | `src-tauri/src/platform/project_paths.rs`, `project_store.rs`, `document.rs`, `document_service.rs`, `pdf_preview_service.rs`, `diagnostics.rs` | `TrustedProjectRoot`, `ManagedProjectPath`, canonical root session, managed relative document storage, containment/symlink/overwrite gates, doctor counters | Frontend absolute path, `Project.root_path` üzerinden save hedefi, UI-only validation, QEP/scoring gates | `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `npm run check:all` |
+| **Model runtime ownership / process safety** | `model_process_manager.rs`, `model_runtime_service.rs`, `platform/process_inspector.rs`, `domain/model.rs`, `domain/errors.rs` | Verified `Child` ownership, persisted identity, startup single-flight, lease registry, profile compatibility, idle shutdown, draining, exit recovery | OCR/scoring/rubric/speaking/analysis servislerinde doğrudan process start/stop, PID-only kill, UI readiness hesabı | `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `npm run check:all` |
 
 ---
 
@@ -57,3 +61,34 @@ Model status UI modernizasyonu: ModelStatusPage.tsx, commands.ts, types.ts, mode
 Student identity verification UI/backend persistence: StudentIdentityPage.tsx, AppLayout.tsx, commands.ts, types.ts, student.rs, workflow_engine.rs
 
 Student identity crop/OCR/persistence: StudentIdentityPage.tsx, CropTemplatePage.tsx, PdfPageViewer.tsx, commands.ts, types.ts, student.rs, project.rs, student_answer_crop_service.rs, llama_server_gateway.rs, workflow_engine.rs
+## Faz 2 persistence ownership
+
+| Sorumluluk | Tek sahibi | Yazma sınırı |
+| --- | --- | --- |
+| Proje JSON serialization, revision, fingerprint, per-root lock, atomic replace | `src-tauri/src/services/project_store.rs` | `mutate` / `commit_job`; frontend veya servis doğrudan `project.json` yazmaz |
+| Kısa domain mutation | İlgili domain service + `ProjectStore::mutate` | Güncel entity ID'si üzerinde dar closure; await/model/render yok |
+| Uzun job commit'i | İlgili job service + `ProjectStore::commit_job` | Snapshot sonrası yalnız owned fields ve source-generation precondition |
+| Conflict DTO ve öğretmen mesajı | `src-tauri/src/domain/errors.rs` + API error mapping | Revision/external/entity stale teknik hash veya path sızdırmaz |
+| Persistence diagnostics | `ProjectStore::persistence_diagnostics` + `diagnostics.rs` | Sayaçlar runtime diagnostics'te; öğrenci payload'ı eklenmez |
+
+Production writer envanteri ve servis başına owned fields [`docs/PROJECTSTORE_CONCURRENCY.md`](PROJECTSTORE_CONCURRENCY.md) içindedir. `save_project(Project)` yalnız `#[cfg(test)]` fixture uyumluluk yoludur.
+
+## Faz 3 generation ownership
+
+| Alan | Tek sahibi | Güvenli yazma sınırı |
+| --- | --- | --- |
+| OCR generation geçmişi ve active projection | `student_answer_ocr_service.rs` | Queue/status için `mutate`; model sonucu için `commit_job`; flat active kayıt yalnız validated candidate veya teacher accept sırasında güncellenir |
+| Preview staging/generation dosyaları | `pdf_preview_service.rs` + `TrustedProjectRoot` | Staging'e render, manifest/page validation, immutable generation rename; active pointer yalnız `commit_job` sonrasında değişir |
+| Submission dependency scan ve delete | `student_scan_service.rs` | Scan önce ve transaction closure içinde; dependency varsa `StudentSubmissionInUse`, cascade yok |
+| Batch delete | `school_class_service.rs` | Single delete ile aynı OCR/scoring/job scan; metadata commit'ten sonra best-effort artifact cleanup |
+| Generation diagnostics/GC adayları | `diagnostics.rs` ve ilgili servisler | Sadece PII'siz sayaçlar; active/pending/referenced generation silinmez |
+
+## Faz 5 / 5B job ownership
+
+| Sorumluluk | Tek sahibi | Güvenli yazma sınırı |
+| --- | --- | --- |
+| Job lifecycle state machine & persistence | `jobs/job_manager.rs` | 7 canonical states, `cancellation_token` map, atomic duplicate check |
+| Job execution guard & panic protection | `JobTaskGuard` (`job_manager.rs`) | Background task drop sonrasında otomatik `Cancelled` veya `Failed` geçişi |
+| Job retry & correlation chain | `JobManager::retry_job` | Terminal işten yeni job ID, `retry_of_job_id` takibi, taze `correlation_id` |
+| History retention cleanup | `JobManager::cleanup_job_history` | Active ve retry-referenced işlerin korunması, top `N` terminal job saklanması |
+| Controlled app shutdown | `JobManager::shutdown_all_jobs` | `accepting_new_jobs = false`, cancel signal ve `Interrupted` rehydration |

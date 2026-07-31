@@ -15,7 +15,7 @@
 
 Bu dokümanda projenin temel özelliklerinin uçtan uca akışı, ilgili dosyaları, riskli alanları (invariants) ve hata kodları yer almaktadır.
 
-> **UI Modernizasyonu Notu:** Önce app shell/navigasyon erişimi stabilize edilir; ekran modernizasyonu aşamalı yapılır. AI Studio prototipleri tasarım referansı olarak kullanılır; workflow/backend kararları taşınmaz. Workflow ekranı AI Studio referansından görsel olarak modernize edildi; workflow kararları backend snapshot kaynaklı kalır.
+> **UI Modernizasyonu ve Navigasyon:** Global navigasyon 5 ana teacher-facing bölüme indirgenmiştir (`1. Ana Sayfa`, `2. Sınavlar`, `3. Sınıflar ve Öğrenciler`, `4. Raporlar`, `5. Ayarlar`). Global Yazılı/Dinleme/Konuşma mod değiştiricisi üst çubuktan kaldırılmış, ders alanı başlığı sadeleştirilmiş ve teknik proje klasör yolu/ID bilgileri yalnızca Ayarlar / Gelişmiş Ayrıntılar paneline taşınmıştır. AI Studio prototipleri tasarım referansı olarak kullanılır; backend/workflow doğruluk kaynakları korunur.
 
 ---
 
@@ -555,8 +555,116 @@ UI → command → service → issue crop seçimi → model runtime ensure_ready
 
 ### Konuşma sınavı kurulumu ve çoklu sınıf ataması
 
-Konuşma sınavı çalışma alanı 2 kolonlu öğretmen odaklı kurulum sunar (Sol: Temel Bilgiler, Çoklu Sınıf Seçimi `assignedClassIds`, Görev Metni, Dk/Sn Süre Ayarları, Değerlendirme Özeti, Kompakt Sistem Durumu; Sağ: Canlı Sınav Özeti ve Sınavı Oluştur Aksiyonu). Bir sınav birden fazla sınıfa bağlanabilir (`assigned_class_ids: Vec<String>`). Yürütme ekranında üst sınıf Toolbar'ı sadece bu sınava atanmış sınıfları filtreler. Legacy `class_id` projeleri otomatik olarak `assignedClassIds = [classId]` şeklinde normalize edilir.
+Kurulum `/project/:projectId/classes` altındaki canonical setup workspace’inde yürür: proje bilgileri, sınıflar ve `TeachingAssignment` kayıtları burada yönetilir. `AssessmentOrganizationPage` liste-first sınav yönetimi ve açıkça istenince açılan create mode sunar. Create mode ders/eğitim yılı seçeneklerini aktif görevlendirmelerden, sınıf seçeneklerini aktif görevlendirme + aktif `SchoolClass` kesişiminden alır; sınıf düzeyi seçilen sınıflardan türetilir. `create_assessment_activity` tek `AssessmentActivity` ve seçilen her sınıf için bir `ClassApplication` yaratır. Ana sınav sınıf başına kopyalanmaz.
+
+Sınav açıldığında (`/project/:projectId/activities/:activityId/:step`) global menü sabit kalır. `CanonicalExamWorkspaceHeader` sınav türüne özel 5 işlemi (Yazılı, Dinleme, Konuşma) adım çubuğu olarak sunar. Adım durumları backend `WorkflowSnapshot` ve attempt durumlarından türetilir. Üst sınıf seçici yalnız activity’nin aktif `classApplications` kayıtlarını gösterir; sınıf değişiminde `classApplicationId` güncellenir, önceki sınıfın görünüm state'i temizlenir. `Devam Et` aksiyonu backend-derived en anlamlı adıma yönlendirir. Legacy route'lar deep link context'i koruyarak canonical adımlara yönlenir.
+
+Eski `SpeakingExam.assignedClassIds`/`classId` alanları yalnız legacy deserialize ve unambiguous ProjectStore migration için okunur. Yeni production write yolunda bağımsız sınıf listesi yazılmaz. Konuşma runtime aggregate’ı save sırasında canonical ClassApplication attempt kayıtlarına projekte edilir.
 
 ### Konuşma sınavı cleanup ve evidence değerlendirmesi
 
 Whisper segmentleri → `SpeakingExamService` → tek Gemma 4 12B text-only runtime → deterministic cleanup gate → `transcript_for_scoring` segment JSON → v4 positive/counter evidence seçimi → evidence ID validation → v2 frozen ceiling/reconciliation → integer puan → öğretmen onayı. Cleanup başarısızlığı, eksik evidence, eksik alt gösterge ve tamamlanmamış reconciliation job’u tamamlanmış göstermez. Aynı evaluation hash + eksiksiz canonical sonuç model çağrısını production cache ile atlar.
+## 18. ProjectStore concurrency ve conflict-safe persistence
+
+### Kısa mutation
+
+```text
+Command minimal DTO
+→ ProjectStore::mutate
+→ trusted root bazlı lock
+→ güncel project.json yeniden oku
+→ expected revision/fingerprint doğrula
+→ kısa, await içermeyen entity mutation
+→ invariant + workflow doğrula
+→ revision +1
+→ trusted-root temp write + fsync + atomic replace
+→ güncel snapshot/result
+```
+
+### Uzun job
+
+```text
+Güncel snapshot + source generation/hash al
+→ lock olmadan OCR/model/render çalıştır
+→ candidate üret
+→ ProjectStore::commit_job
+→ güncel project'i yeniden oku
+→ source/entity precondition kontrolü
+→ yalnız owned fields merge et
+→ Applied veya Stale/Conflict sonucu
+```
+
+Revision conflict veya harici fingerprint değişikliği sessiz last-write-wins değildir. UI yerel formu korur ve kullanıcıya son durumu yenileme aksiyonu sunar. Job `Stale` sonucu başarı/applied event'i değildir. Persistence ownership ve mutation matrisi [`docs/PROJECTSTORE_CONCURRENCY.md`](PROJECTSTORE_CONCURRENCY.md) içindedir.
+
+## Faz 3 — OCR generation / preview / submission safety
+
+### OCR rerun
+
+```text
+StudentAnswerOcrPage
+→ start_student_answer_ocr(force_rerun)
+→ ProjectStore::mutate(queue_ocr_generation)
+→ active OCR görünür kalır; model/crop işi lock dışında çalışır
+→ ProjectStore::commit_job(commit_ocr_generation)
+→ source/entity/result validation
+→ active veya ready_for_review generation
+→ teacher accept/reject
+```
+
+Onaylı veya scoring'e bağlı OCR otomatik overwrite edilmez. Candidate kabulünde active pointer ve flat read projection transaction içinde değişir; scoring kayıtları invalidated olur. Başarısız/stale/interrupted candidate active OCR'a dokunmaz.
+
+### Preview rerender
+
+```text
+DocumentsPage
+→ start_*_preview_render
+→ outputs/previews/<document>/.staging/<generation>
+→ tüm sayfaları render + manifest/page/fingerprint/containment validation
+→ generations/<generation> immutable rename
+→ commit_job(activate_preview_generation)
+→ active_generation_id pointer değişir
+```
+
+Render devam ederken eski active generation viewer tarafından okunur. Staging veya commit hatasında eski manifest ve dosyalar değiştirilmez. Legacy cache yalnız compatibility read path'tir.
+
+### Submission delete
+
+Single ve batch silme aynı dependency scan'i kullanır: OCR history/review, scoring/approval, frozen input, artifact ve persisted running job. Scan veya transaction closure dependency bulursa typed blocker döner; metadata ve artifact silinmez. Başarılı metadata commit sonrasında cleanup best-effort/deferred çalışır.
+
+Bu akışların recovery, retention/GC ve regression kanıtı [`docs/GENERATION_AND_ROLLBACK_SAFETY.md`](GENERATION_AND_ROLLBACK_SAFETY.md) içindedir.
+
+## Faz 4 — ortak model runtime akışı
+
+```text
+Job başlar
+→ ModelRuntimeService::acquire_runtime
+→ ModelProcessManager startup lock / identity / readiness
+→ lease registry'ye runtime instance + lease yazılır
+→ ModelGateway request'leri
+→ dar ProjectStore commit
+→ lease.release veya Drop fallback
+→ son lease için idle timer / draining stop
+```
+
+OCR, scoring, rubric, speaking ve analysis job'ları aynı verified runtime'ı
+paylaşabilir. Bir job'ın tamamlanması yalnız kendi lease'ini bırakır; başka aktif
+job'ların runtime'ı kapanmaz. Persisted PID recovery, PID reuse ve unverified
+process politikası [`docs/MODEL_RUNTIME_OWNERSHIP.md`](MODEL_RUNTIME_OWNERSHIP.md)
+içinde tanımlıdır.
+
+## Faz 5 / 5C — production job lifecycle, cancellation and correlation flow
+
+```text
+Tauri Command (Correlation ID)
+→ JobManager::register_or_get_active_job (Atomic Duplicate Check)
+→ JobSnapshot & Tokio CancellationToken
+→ Background Tokio Task + JobTaskGuard Panic Protection
+→ Periodic cancellation_token.is_cancelled() Checkpoints
+→ ModelRuntimeLease & ModelGateway Requests
+→ Safe Checkpoint Reached OR Cancellation Signal Received
+→ On Cancel: Staging cleanup + Lease Release + ProjectStore Commit Bypass
+→ Terminal Event Emission (job_cancelled, job_succeeded, job_partial, job_failed, job_interrupted)
+→ Controlled Shutdown (ExitRequested -> shutdown_all_jobs -> zero orphan Running jobs)
+```
+
+Tüm job iptal senaryoları, correlation ID eşitliği, retention temizliği ve 16 production proof testi [`docs/JOB_LIFECYCLE_AND_CANCELLATION.md`](JOB_LIFECYCLE_AND_CANCELLATION.md) içinde tanımlıdır.

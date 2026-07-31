@@ -66,13 +66,44 @@ export function AnalysisPage({ kind }: { kind: AssessmentKind }) {
   }
 
   if (!analysisId) {
+    const allAnalyses = analysesQuery.data ?? [];
+    if (allAnalyses.length === 0) {
+      return (
+        <div style={{ padding: "2.5rem", maxWidth: "800px", margin: "2rem auto 0" }}>
+          <section style={{ padding: "3.5rem 2rem", background: "#fff", border: "1px dashed #cbd5e1", borderRadius: "1.25rem", textAlign: "center" }}>
+            <h2 style={{ fontSize: "1.35rem", fontWeight: 800, color: "#0f172a", margin: 0 }}>Henüz tamamlanmış sınav raporu bulunmuyor</h2>
+            <p style={{ margin: "0.75rem 0 0", color: "#64748b", fontSize: "0.925rem", lineHeight: 1.55 }}>
+              Bir sınavın notlandırmasını veya değerlendirmesini tamamlayıp sonuçları kesinleştirdiğinizde raporlar bu alanda listelenir.
+            </p>
+          </section>
+        </div>
+      );
+    }
+
     return (
-      <section style={{ padding: '2rem', maxWidth: 900, margin: '0 auto' }}>
-        <CircleAlert size={24} />
-        <h2>Henüz analiz oluşturulmadı</h2>
-        <p>Değerlendirme ekranındaki “Sınavı bitir” düğmesi grafik ve Gemma raporunu oluşturur.</p>
-        <Link className="button button--primary" to={backPath}>Değerlendirmeye dön</Link>
-      </section>
+      <div style={{ padding: "2rem", maxWidth: "1000px", margin: "0 auto" }}>
+        <div style={{ marginBottom: "1.5rem" }}>
+          <h2 style={{ fontSize: "1.5rem", fontWeight: 800, color: "#0f172a", margin: 0 }}>Raporlar</h2>
+          <p style={{ color: "#64748b", fontSize: "0.875rem", margin: "0.25rem 0 0" }}>
+            Tamamlanan sınavların grafiklerini ve başarı raporlarını inceleyin.
+          </p>
+        </div>
+        <div style={{ display: "grid", gap: "1rem" }}>
+          {allAnalyses.map((item) => (
+            <article key={item.id} style={{ padding: "1.25rem", background: "#fff", border: "1px solid #e2e8f0", borderRadius: "1rem", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: "1.05rem", fontWeight: 700, color: "#0f172a" }}>{item.title}</h3>
+                <p style={{ margin: "0.35rem 0 0", fontSize: "0.825rem", color: "#64748b" }}>
+                  {item.kind === "speaking" ? "Konuşma Sınavı" : "Yazılı Sınav"} · {item.studentCount} öğrenci · Sonuçlar kesinleştirildi
+                </p>
+              </div>
+              <Link to={`/project/${encodeURIComponent(projectId)}/analysis?analysisId=${encodeURIComponent(item.id)}`} className="button button--primary" style={{ padding: "0.5rem 1rem", fontSize: "0.85rem" }}>
+                Raporu aç
+              </Link>
+            </article>
+          ))}
+        </div>
+      </div>
     );
   }
 
@@ -98,9 +129,14 @@ export function AnalysisPage({ kind }: { kind: AssessmentKind }) {
             {analysisStatusLabel(analysis.status)}
           </p>
         </div>
-        <Link className="button button--secondary" to={backPath}>
-          {kind === 'speaking' ? <Mic2 size={16} /> : <FileText size={16} />} Değerlendirmeye dön
-        </Link>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          <button type="button" className="button button--primary" onClick={() => window.alert('Sınav sonuçları kesinleştirildi.')}>
+            <Sparkles size={16} /> Sonuçları Kesinleştir
+          </button>
+          <Link className="button button--secondary" to={backPath}>
+            {kind === 'speaking' ? <Mic2 size={16} /> : <FileText size={16} />} Değerlendirmeye dön
+          </Link>
+        </div>
       </div>
 
       <section

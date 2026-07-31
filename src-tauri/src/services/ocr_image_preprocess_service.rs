@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::student::{OcrImagePreprocessDiagnostics, OcrImagePreprocessMode};
+use crate::platform::project_paths::TrustedProjectRoot;
 
 const OCR_PREPROCESS_VERSION: &str = "ocr_image_preprocess_v2";
 const CLEAN_GRAY_BACKGROUND_RADIUS: f32 = 24.0;
@@ -47,11 +48,23 @@ impl OcrImagePreprocessService {
         input_image_path: &Path,
         mode: OcrImagePreprocessMode,
     ) -> Result<OcrImagePreprocessResult, AppError> {
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
+        if !input_image_path.exists() {
+            return Err(app_error(
+                AppErrorCode::FileReadFailed,
+                "OCR görüntüsü bulunamadı.",
+                Some(input_image_path.to_string_lossy().to_string()),
+                Some("OCR crop cache must exist before preprocessing.".to_string()),
+            ));
+        }
+        let input_managed = trusted_root.relative_for_existing(input_image_path)?;
+        let input_image_path = trusted_root.resolve_existing_file(&input_managed)?;
         if mode == OcrImagePreprocessMode::Original {
-            return self.build_original_result(input_image_path);
+            return self.build_original_result(&input_image_path);
         }
 
-        let source_metadata = fs::metadata(input_image_path).map_err(|error| {
+        let source_metadata = fs::metadata(&input_image_path).map_err(|error| {
             app_error(
                 AppErrorCode::FileReadFailed,
                 "OCR görüntüsü bulunamadı.",
@@ -60,7 +73,7 @@ impl OcrImagePreprocessService {
             )
         })?;
         let source_bytes = source_metadata.len();
-        let source_content = fs::read(input_image_path).map_err(|error| {
+        let source_content = fs::read(&input_image_path).map_err(|error| {
             app_error(
                 AppErrorCode::FileReadFailed,
                 "OCR görüntüsü okunamadı.",
@@ -68,7 +81,7 @@ impl OcrImagePreprocessService {
                 Some("OCR crop cache must exist before preprocessing.".to_string()),
             )
         })?;
-        let source_image = image::open(input_image_path).map_err(|error| {
+        let source_image = image::open(&input_image_path).map_err(|error| {
             app_error(
                 AppErrorCode::OcrFailed,
                 "OCR görüntüsü açılamadı.",
@@ -78,14 +91,16 @@ impl OcrImagePreprocessService {
         })?;
         let (source_width, source_height) = source_image.dimensions();
         let cache_path = preprocess_cache_path(
-            project_root,
-            input_image_path,
+            &trusted_root,
+            &input_image_path,
             &mode,
             stable_preprocess_hash(&source_content),
             OCR_PREPROCESS_VERSION,
-        );
+        )?;
 
         if cache_path.exists() {
+            let cache_managed = trusted_root.managed_for_path(&cache_path)?;
+            let cache_path = trusted_root.resolve_existing_file(&cache_managed)?;
             let (output_width, output_height) =
                 image::image_dimensions(&cache_path).map_err(|error| {
                     app_error(
@@ -121,14 +136,7 @@ impl OcrImagePreprocessService {
         }
 
         if let Some(parent) = cache_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                app_error(
-                    AppErrorCode::FileWriteFailed,
-                    "OCR preprocess cache dizini oluşturulamadı.",
-                    Some(error.to_string()),
-                    Some("Check project cache permissions.".to_string()),
-                )
-            })?;
+            trusted_root.ensure_managed_directory(parent)?;
         }
 
         let preprocessed = match mode {
@@ -179,7 +187,7 @@ impl OcrImagePreprocessService {
         };
 
         let output_image = DynamicImage::ImageLuma8(preprocessed);
-        write_png_atomic(&cache_path, &output_image)?;
+        write_png_atomic(&trusted_root, &cache_path, &output_image)?;
         let (output_width, output_height) =
             image::image_dimensions(&cache_path).map_err(|error| {
                 app_error(
@@ -402,21 +410,19 @@ fn apply_percentile_autocontrast(image: &GrayImage, clip_range: (f32, f32)) -> G
 }
 
 fn preprocess_cache_path(
-    project_root: &Path,
+    trusted_root: &TrustedProjectRoot,
     input_image_path: &Path,
     mode: &OcrImagePreprocessMode,
     content_hash: u64,
     preprocess_version: &str,
-) -> PathBuf {
+) -> Result<PathBuf, AppError> {
     let mode_dir = preprocess_mode_dir_name(mode);
     let fingerprint =
         stable_preprocess_fingerprint(input_image_path, mode, content_hash, preprocess_version);
-    project_root
-        .join("cache")
-        .join("preprocessed")
-        .join(preprocess_version)
-        .join(mode_dir)
-        .join(format!("{fingerprint}.png"))
+    let managed = trusted_root.managed(&format!(
+        "cache/preprocessed/{preprocess_version}/{mode_dir}/{fingerprint}.png"
+    ))?;
+    Ok(trusted_root.root().join(managed.as_path()))
 }
 
 fn preprocess_mode_dir_name(mode: &OcrImagePreprocessMode) -> &'static str {
@@ -464,7 +470,11 @@ fn stable_preprocess_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn write_png_atomic(path: &Path, image: &DynamicImage) -> Result<(), AppError> {
+fn write_png_atomic(
+    trusted_root: &TrustedProjectRoot,
+    path: &Path,
+    image: &DynamicImage,
+) -> Result<(), AppError> {
     let parent = path.parent().ok_or_else(|| {
         app_error(
             AppErrorCode::FileWriteFailed,
@@ -473,14 +483,7 @@ fn write_png_atomic(path: &Path, image: &DynamicImage) -> Result<(), AppError> {
             Some("The preprocess output path must have a parent directory.".to_string()),
         )
     })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "OCR preprocess cache dizini oluşturulamadı.",
-            Some(error.to_string()),
-            Some("Check project cache permissions.".to_string()),
-        )
-    })?;
+    trusted_root.ensure_managed_directory(parent)?;
     let mut bytes = Vec::new();
     {
         let mut cursor = Cursor::new(&mut bytes);
@@ -495,24 +498,8 @@ fn write_png_atomic(path: &Path, image: &DynamicImage) -> Result<(), AppError> {
                 )
             })?;
     }
-    let tmp_path = path.with_extension(format!("png.tmp-{}", Uuid::new_v4()));
-    fs::write(&tmp_path, &bytes).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Preprocess çıktısı yazılamadı.",
-            Some(error.to_string()),
-            Some("Check disk permissions.".to_string()),
-        )
-    })?;
-    fs::rename(&tmp_path, path).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Preprocess çıktısı taşınamadı.",
-            Some(error.to_string()),
-            Some("Check disk permissions.".to_string()),
-        )
-    })?;
-    Ok(())
+    let managed = trusted_root.managed_for_path(path)?;
+    trusted_root.atomic_write_bytes(&managed, &bytes)
 }
 
 fn app_error(
@@ -555,7 +542,12 @@ mod tests {
             .preprocess_image(&root, &image_path, OcrImagePreprocessMode::Original)
             .unwrap();
 
-        assert_eq!(result.output_image_path, image_path.to_string_lossy());
+        assert_eq!(
+            result.output_image_path,
+            std::fs::canonicalize(&image_path)
+                .unwrap()
+                .to_string_lossy()
+        );
         assert!(!result.diagnostics.applied);
         assert_eq!(
             result.diagnostics.preprocess_version,

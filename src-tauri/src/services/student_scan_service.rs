@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::domain::document::{Document, DocumentRole, PdfPagePreview, PdfPreviewStatus};
 use crate::domain::errors::{AppError, AppErrorCode};
+use crate::domain::job::{JobKind, JobSnapshot, JobStatus};
 use crate::domain::project::Project;
 use crate::domain::question::Question;
 use crate::domain::student::{
@@ -13,6 +14,7 @@ use crate::domain::student::{
     StudentAnswerSlot, StudentAnswerSlotStatus, StudentScanReadinessSnapshot, StudentSubmission,
     StudentSubmissionStatus,
 };
+use crate::jobs::job_manager::load_persisted_jobs;
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
 use crate::services::workflow_engine;
@@ -87,6 +89,136 @@ pub struct GetOcrReadinessInput {
     pub project_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmissionDependencyScan {
+    pub submission_count: usize,
+    pub ocr_record_count: usize,
+    pub ocr_generation_count: usize,
+    pub ocr_review_count: usize,
+    pub scoring_record_count: usize,
+    pub approved_scoring_count: usize,
+    pub artifact_ref_count: usize,
+    pub running_job_count: usize,
+}
+
+impl SubmissionDependencyScan {
+    pub fn is_blocked(&self) -> bool {
+        self.ocr_record_count > 0
+            || self.ocr_generation_count > 0
+            || self.scoring_record_count > 0
+            || self.artifact_ref_count > 0
+            || self.running_job_count > 0
+    }
+}
+
+pub fn scan_submission_dependencies(
+    project: &Project,
+    submission_ids: &[String],
+) -> SubmissionDependencyScan {
+    let in_scope = |id: &str| submission_ids.iter().any(|candidate| candidate == id);
+    let mut scan = SubmissionDependencyScan {
+        submission_count: project
+            .student_submissions
+            .iter()
+            .filter(|submission| in_scope(&submission.id))
+            .count(),
+        ..Default::default()
+    };
+    scan.ocr_record_count = project
+        .student_answer_ocr_records
+        .iter()
+        .filter(|record| in_scope(&record.submission_id))
+        .count();
+    scan.ocr_review_count = project
+        .student_answer_ocr_records
+        .iter()
+        .filter(|record| {
+            in_scope(&record.submission_id)
+                && (record.needs_review
+                    || record.status
+                        == crate::domain::student::StudentAnswerOcrStatus::TeacherApproved)
+        })
+        .count();
+    scan.ocr_generation_count = project
+        .student_answer_ocr_generations
+        .iter()
+        .filter(|generation| in_scope(&generation.submission_id))
+        .count();
+    scan.scoring_record_count = project
+        .scoring_records
+        .iter()
+        .filter(|record| in_scope(&record.submission_id))
+        .count();
+    scan.approved_scoring_count = project
+        .scoring_records
+        .iter()
+        .filter(|record| {
+            in_scope(&record.submission_id)
+                && matches!(
+                    record.teacher_review_status,
+                    crate::domain::scoring::ScoringReviewStatus::Approved
+                        | crate::domain::scoring::ScoringReviewStatus::Edited
+                )
+        })
+        .count();
+    scan.artifact_ref_count = project
+        .student_answer_ocr_records
+        .iter()
+        .filter(|record| in_scope(&record.submission_id))
+        .map(|record| {
+            record.source_image_refs.len()
+                + record.crop_refs.len()
+                + record.original_crop_refs.len()
+                + record.preprocessed_crop_refs.len()
+                + record.full_page_preview_refs.len()
+        })
+        .sum();
+    scan
+}
+
+pub fn scan_submission_dependencies_with_jobs(
+    project: &Project,
+    submission_ids: &[String],
+    jobs: &[JobSnapshot],
+) -> SubmissionDependencyScan {
+    let mut scan = scan_submission_dependencies(project, submission_ids);
+    scan.running_job_count = jobs
+        .iter()
+        .filter(|job| {
+            matches!(job.kind, JobKind::StudentAnswerOcr | JobKind::Scoring)
+                && matches!(job.status, JobStatus::Queued | JobStatus::Running)
+        })
+        .count();
+    scan
+}
+
+pub fn persisted_dependency_jobs(project: &Project) -> Result<Vec<JobSnapshot>, AppError> {
+    load_persisted_jobs(std::path::Path::new(&project.root_path))
+}
+
+fn submission_in_use_error(scan: &SubmissionDependencyScan) -> AppError {
+    AppError {
+        code: AppErrorCode::StudentSubmissionInUse,
+        message: "Bu öğrenci kaydına bağlı OCR veya puanlama verileri bulunduğu için silinemiyor."
+            .to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Önce ilgili sınav verilerini kaldırın ya da öğrenciyi uygulamadan çıkarın."
+                .to_string(),
+        ),
+        technical_details: Some(format!(
+            "ocr_records={}; ocr_generations={}; scoring_records={}; artifacts={}; running_jobs={}",
+            scan.ocr_record_count,
+            scan.ocr_generation_count,
+            scan.scoring_record_count,
+            scan.artifact_ref_count,
+            scan.running_job_count
+        )),
+        correlation_id: Uuid::new_v4().to_string(),
+    }
 }
 
 impl StudentScanService {
@@ -202,6 +334,8 @@ impl StudentScanService {
                 id: student_id.clone(),
                 display_name: None,
                 number: None,
+                // A grouped submission is not yet a roster match. The teacher-confirmed
+                // identity step attaches it to the canonical class roster.
                 class_name: None,
                 warnings: vec!["Öğrenci kimliği henüz girilmedi.".to_string()],
                 identity_ocr: None,
@@ -240,7 +374,9 @@ impl StudentScanService {
         }
 
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         Ok(CreateStudentPageGroupsOutput {
             groups_created: project
@@ -273,21 +409,50 @@ impl StudentScanService {
             .student_id
             .clone();
         let student_index = find_student_index(&project, &student_id)?;
-
-        {
+        let submission_class_id = project.student_submissions[submission_index]
+            .class_id
+            .clone();
+        let display_name = normalize_optional(input.display_name);
+        let number = normalize_optional(input.number);
+        let canonical_class_name = submission_class_id.as_ref().and_then(|class_id| {
+            project
+                .school_classes
+                .iter()
+                .find(|school_class| school_class.id == *class_id)
+                .map(|school_class| school_class.normalized_name.clone())
+        });
+        let matched_roster_index = find_matching_roster_student_index(
+            &project,
+            submission_class_id.as_deref(),
+            &student_id,
+            display_name.as_deref(),
+            number.as_deref(),
+        );
+        let effective_student_index = if let Some(matched_index) = matched_roster_index {
+            let matched_student_id = project.students[matched_index].id.clone();
+            let matched_student = &mut project.students[matched_index];
+            matched_student.display_name = display_name.clone();
+            matched_student.number = number.clone();
+            matched_student.class_name = canonical_class_name.clone();
+            matched_student.warnings.clear();
+            project.students[student_index].class_name = None;
+            project.student_submissions[submission_index].student_id = matched_student_id;
+            matched_index
+        } else {
             let student = &mut project.students[student_index];
-            student.display_name = normalize_optional(input.display_name);
-            student.number = normalize_optional(input.number);
-            student.class_name = normalize_optional(input.class_name);
+            student.display_name = display_name;
+            student.number = number;
+            student.class_name = canonical_class_name.or(normalize_optional(input.class_name));
             student.warnings = if student_identity_is_missing(student) {
                 vec!["Öğrenci kimliği eksik.".to_string()]
             } else {
                 vec![]
             };
-        }
+            student_index
+        };
 
         let updated_submission = {
-            let student = &project.students[student_index];
+            let student = &project.students[effective_student_index];
             let submission = &mut project.student_submissions[submission_index];
             submission.status =
                 if student_identity_is_missing(student) || submission.page_numbers.is_empty() {
@@ -306,7 +471,9 @@ impl StudentScanService {
             &now,
         );
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated_submission)
     }
 
@@ -345,7 +512,9 @@ impl StudentScanService {
             &now,
         );
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated_submission)
     }
 
@@ -353,38 +522,101 @@ impl StudentScanService {
         &self,
         input: DeleteStudentSubmissionInput,
     ) -> Result<(), AppError> {
-        let mut project = self.load_project(&input.project_id)?;
-        let submission_index = project
+        let project = self.load_project(&input.project_id)?;
+        let submission = project
             .student_submissions
             .iter()
-            .position(|submission| submission.id == input.submission_id)
+            .find(|submission| submission.id == input.submission_id)
+            .cloned()
             .ok_or_else(|| AppError {
                 code: AppErrorCode::StudentSubmissionNotFound,
-                message: "Öğrenci submission'ı bulunamadı.".to_string(),
+                message: "Öğrenci kaydı bulunamadı.".to_string(),
                 recoverable: true,
-                suggested_action: Some("Submission listesini yenileyin.".to_string()),
-                technical_details: Some(format!("submission_id={}", input.submission_id)),
+                suggested_action: Some("Öğrenci listesini yenileyin.".to_string()),
+                technical_details: None,
                 correlation_id: Uuid::new_v4().to_string(),
             })?;
-        let submission = project.student_submissions.remove(submission_index);
-        let student_has_other_submissions = project
-            .student_submissions
-            .iter()
-            .any(|candidate| candidate.student_id == submission.student_id);
-        if !student_has_other_submissions {
-            project
-                .students
-                .retain(|student| student.id != submission.student_id);
+        let submission_ids = vec![submission.id.clone()];
+        let jobs = persisted_dependency_jobs(&project).map_err(|error| AppError {
+            code: AppErrorCode::SubmissionDeleteConflict,
+            message: "Öğrenci kaydının bağlı işlemleri doğrulanamadı; silme engellendi."
+                .to_string(),
+            recoverable: true,
+            suggested_action: Some("İşlem geçmişini yenileyip tekrar deneyin.".to_string()),
+            technical_details: error.technical_details,
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        let scan = scan_submission_dependencies_with_jobs(&project, &submission_ids, &jobs);
+        if scan.is_blocked() {
+            return Err(submission_in_use_error(&scan));
         }
-        invalidate_grouping_completion(
-            &mut project,
-            submission.scan_batch_id.as_deref(),
-            &submission.document_id,
-            &chrono::Utc::now().to_rfc3339(),
+        let submission_id = submission.id.clone();
+        let student_id = submission.student_id.clone();
+        let batch_id = submission.scan_batch_id.clone();
+        let document_id = submission.document_id.clone();
+        let output = self.project_store.commit_job(
+            &input.project_id,
+            crate::services::project_store::MutationOptions::new("delete_student_submission"),
+            move |current, _context| {
+                let current_jobs = persisted_dependency_jobs(current)?;
+                let current_scan = scan_submission_dependencies_with_jobs(
+                    current,
+                    std::slice::from_ref(&submission_id),
+                    &current_jobs,
+                );
+                if current_scan.is_blocked() {
+                    return Err(submission_in_use_error(&current_scan));
+                }
+                let index = current
+                    .student_submissions
+                    .iter()
+                    .position(|candidate| candidate.id == submission_id)
+                    .ok_or_else(|| AppError {
+                        code: AppErrorCode::StudentSubmissionNotFound,
+                        message: "Öğrenci kaydı artık mevcut değil.".to_string(),
+                        recoverable: true,
+                        suggested_action: Some("Listeyi yenileyip tekrar deneyin.".to_string()),
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    })?;
+                current.student_submissions.remove(index);
+                if !current
+                    .student_submissions
+                    .iter()
+                    .any(|candidate| candidate.student_id == student_id)
+                {
+                    current.students.retain(|student| student.id != student_id);
+                }
+                invalidate_grouping_completion(
+                    current,
+                    batch_id.as_deref(),
+                    &document_id,
+                    &chrono::Utc::now().to_rfc3339(),
+                );
+                Ok(())
+            },
         );
-        project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
-        Ok(())
+        match output {
+            crate::services::project_store::JobCommitResult::Applied(_) => Ok(()),
+            crate::services::project_store::JobCommitResult::Conflict(error)
+            | crate::services::project_store::JobCommitResult::Rejected(error) => Err(error),
+            crate::services::project_store::JobCommitResult::Stale { reason } => Err(AppError {
+                code: AppErrorCode::SubmissionDeleteConflict,
+                message: "Öğrenci kaydı silinemedi; bağlı veri durumu değişti.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Listeyi yenileyip tekrar deneyin.".to_string()),
+                technical_details: Some(reason),
+                correlation_id: Uuid::new_v4().to_string(),
+            }),
+            crate::services::project_store::JobCommitResult::EntityMissing => Err(AppError {
+                code: AppErrorCode::StudentSubmissionNotFound,
+                message: "Öğrenci kaydı artık mevcut değil.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Listeyi yenileyin.".to_string()),
+                technical_details: None,
+                correlation_id: Uuid::new_v4().to_string(),
+            }),
+        }
     }
 
     pub fn mark_student_grouping_complete(
@@ -408,7 +640,9 @@ impl StudentScanService {
         project.student_scan_document_id = Some(scope.document_id.clone());
         project.student_grouping_complete_at = Some(now);
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -886,6 +1120,54 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn find_matching_roster_student_index(
+    project: &Project,
+    class_id: Option<&str>,
+    current_student_id: &str,
+    display_name: Option<&str>,
+    number: Option<&str>,
+) -> Option<usize> {
+    let class_name = class_id.and_then(|id| {
+        project
+            .school_classes
+            .iter()
+            .find(|school_class| school_class.id == id)
+            .map(|school_class| school_class.normalized_name.as_str())
+    });
+    project
+        .students
+        .iter()
+        .enumerate()
+        .find_map(|(index, student)| {
+            if student.id == current_student_id {
+                return None;
+            }
+            let same_class = class_name.is_some_and(|expected| {
+                student
+                    .class_name
+                    .as_deref()
+                    .and_then(crate::domain::school_class::normalize_school_class_name)
+                    .as_deref()
+                    == Some(expected)
+            });
+            if !same_class {
+                return None;
+            }
+            let same_number = number.is_some_and(|candidate| {
+                student.number.as_deref().map(str::trim) == Some(candidate.trim())
+            });
+            let same_name = display_name.is_some_and(|candidate| {
+                student
+                    .display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_lowercase)
+                    == Some(candidate.trim().to_lowercase())
+            });
+            (same_number || same_name).then_some(index)
+        })
+}
+
 fn find_student<'a>(project: &'a Project, student_id: &str) -> Result<&'a Student, AppError> {
     project
         .students
@@ -938,6 +1220,7 @@ mod tests {
     use crate::domain::project::Project;
     use crate::domain::question::default_question;
     use crate::domain::school_class::{SchoolClass, SchoolClassStatus, StudentScanBatch};
+    use crate::domain::student::{OcrGeneration, OcrGenerationStatus, OcrTeacherReviewStatus};
     use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
     use crate::jobs::job_manager::JobManager;
     use crate::services::pdf_service::SystemPdfService;
@@ -1022,6 +1305,9 @@ mod tests {
                 page_count: Some(page_count),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
     }
@@ -1068,6 +1354,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
@@ -1274,8 +1563,10 @@ mod tests {
             SchoolClass {
                 id: "class-a".to_string(),
                 name: "11-A".to_string(),
+                display_name: "11-A".to_string(),
                 normalized_name: "11-A".to_string(),
                 academic_year: None,
+                academic_year_id: None,
                 grade_level: Some(11),
                 section: Some("A".to_string()),
                 display_order: 0,
@@ -1286,8 +1577,10 @@ mod tests {
             SchoolClass {
                 id: "class-b".to_string(),
                 name: "11-B".to_string(),
+                display_name: "11-B".to_string(),
                 normalized_name: "11-B".to_string(),
                 academic_year: None,
+                academic_year_id: None,
                 grade_level: Some(11),
                 section: Some("B".to_string()),
                 display_order: 1,
@@ -1398,5 +1691,49 @@ mod tests {
             .iter()
             .all(|batch| batch.grouping_completed_at.is_some()));
         assert_eq!(after_b.workflow.current_stage, WorkflowStage::OcrReady);
+    }
+
+    #[test]
+    fn submission_dependency_scan_blocks_history_even_when_candidate_was_rejected() {
+        let (store, mut project) = ready_project();
+        let submission_id = Uuid::new_v4().to_string();
+        let student_id = Uuid::new_v4().to_string();
+        project.student_submissions.push(StudentSubmission {
+            id: submission_id.clone(),
+            student_id,
+            document_id: "scan".to_string(),
+            class_id: None,
+            scan_batch_id: None,
+            class_membership_source: None,
+            page_numbers: vec![1],
+            status: StudentSubmissionStatus::Grouped,
+            answer_slots: vec![],
+            warnings: vec![],
+            updated_at: None,
+        });
+        let empty_generation = OcrGeneration {
+            generation_id: Uuid::new_v4().to_string(),
+            submission_id: submission_id.clone(),
+            source_fingerprint: "source".to_string(),
+            created_at: chrono::Utc::now(),
+            model_name: None,
+            prompt_version: "test".to_string(),
+            status: OcrGenerationStatus::Rejected,
+            result: vec![],
+            diagnostics: None,
+            teacher_review_status: OcrTeacherReviewStatus::Rejected,
+            created_by_job_id: "job".to_string(),
+            source_document_id: "scan".to_string(),
+            source_storage_revision: 0,
+            failure_reason: None,
+        };
+        project
+            .student_answer_ocr_generations
+            .push(empty_generation);
+        store.save_project(&project).unwrap();
+
+        let scan = scan_submission_dependencies(&project, &[submission_id]);
+        assert_eq!(scan.ocr_generation_count, 1);
+        assert!(scan.is_blocked());
     }
 }

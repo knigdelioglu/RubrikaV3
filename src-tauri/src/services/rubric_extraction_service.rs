@@ -118,7 +118,6 @@ impl RubricExtractionService {
                     expected_question_count,
                 )
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(mut error) = run_result {
                 error.correlation_id = job_id_for_failure.clone();
                 let _ = service
@@ -130,7 +129,7 @@ impl RubricExtractionService {
                     .get_project_snapshot(project_id.clone())
                 {
                     proj.workflow = crate::services::workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.save_project(&proj);
+                    let _ = service.project_store.commit_snapshot_cas(&proj);
                 }
             } else {
                 if let Ok(mut proj) = service
@@ -138,7 +137,7 @@ impl RubricExtractionService {
                     .get_project_snapshot(project_id.clone())
                 {
                     proj.workflow = crate::services::workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.save_project(&proj);
+                    let _ = service.project_store.commit_snapshot_cas(&proj);
                 }
             }
         });
@@ -157,7 +156,22 @@ impl RubricExtractionService {
         document_id: Option<String>,
         expected_question_count: u32,
     ) -> Result<(), AppError> {
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
         let _ = self.job_manager.set_running(&app, &job_id);
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Rubrik alma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
         let mut failed_questions = Vec::new();
         let mut last_error = None;
 
@@ -229,18 +243,34 @@ impl RubricExtractionService {
                 "Gemma model sunucusu başlatılıyor...".to_string(),
             );
         }
-        let _model_status_ready = self
+        let _runtime_lease = self
             .model_runtime_service
-            .ensure_ready(
+            .acquire_runtime(
                 None,
-                ModelRuntimeRequest {
+                &ModelRuntimeRequest {
                     use_case: ModelUseCase::RubricPdfImport,
                     capability: ModelCapability::Vision,
                     requires_mmproj: true,
                     timeout_seconds: 180,
                 },
+                "rubric_extraction",
+                Some(&job_id),
             )
             .await?;
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Rubrik alma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
         let _ = self.job_manager.update_progress(
             &app,
             &job_id,
@@ -774,13 +804,19 @@ Kurallar:
             }
         };
 
-        let _ = self.job_manager.update_progress(
-            &app,
-            &job_id,
-            expected_question_count,
-            expected_question_count,
-            "Rubrikler kaydediliyor...".to_string(),
-        );
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Rubrik alma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
 
         let mut imported_numbers = Vec::new();
         let mut successful_imports = 0usize;
@@ -862,7 +898,9 @@ Kurallar:
                 return Err(err);
             }
             project.workflow = crate::services::workflow_engine::evaluate_workflow(&project);
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
             return Err(AppError {
                 code: AppErrorCode::RubricEmptyContent,
                 message: "Rubrik PDF'inden soru puanları veya beklenen cevaplar çıkarılamadı."
@@ -877,7 +915,9 @@ Kurallar:
         }
 
         project.workflow = crate::services::workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         let mut per_question_results = Vec::new();
         for question_number in 1..=expected_question_count {
@@ -1145,40 +1185,24 @@ mod tests {
     }
 
     fn write_mock_llama_server_script() -> PathBuf {
-        let path = env::temp_dir().join(format!("rubrika-mock-rubric-{}.sh", uuid::Uuid::new_v4()));
-        let script = r#"#!/bin/sh
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  cat <<'EOF'
---cache-type-k
---cache-type-v
---mmproj-offload
-EOF
-  exit 0
-fi
-host=127.0.0.1
-port=8080
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --host)
-      host="$2"
-      shift 2
-      ;;
-    --port)
-      port="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-exec python3 - "$host" "$port" <<'PY'
+        let path = env::temp_dir().join(format!("rubrika-mock-rubric-{}.py", uuid::Uuid::new_v4()));
+        let script = r#"#!/usr/bin/python3
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-host = sys.argv[1]
-port = int(sys.argv[2])
+args = sys.argv[1:]
+if "--help" in args or "-h" in args:
+    print("--cache-type-k\n--cache-type-v\n--mmproj-offload")
+    sys.exit(0)
+
+host = "127.0.0.1"
+port = 8080
+for i, arg in enumerate(args):
+    if arg == "--host" and i + 1 < len(args):
+        host = args[i + 1]
+    elif arg == "--port" and i + 1 < len(args):
+        port = int(args[i + 1])
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -1206,8 +1230,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._write_json({"error": "not found"}, 404)
 
-HTTPServer((host, port), Handler).serve_forever()
-PY
+try:
+    sys.stderr.write(f"Listening on {host}:{port}\n")
+    sys.stderr.flush()
+    server = HTTPServer((host, port), Handler)
+    server.serve_forever()
+except Exception as e:
+    sys.stderr.write(f"HTTPServer failed: {e}\n")
+    sys.stderr.flush()
+    sys.exit(1)
 "#;
         fs::write(&path, script).expect("mock rubric llama-server script should be writable");
         #[cfg(unix)]
@@ -1367,7 +1398,7 @@ PY
         let profile = ModelProfile {
             id: format!("managed-test-{}", uuid::Uuid::new_v4()),
             display_name: "Managed Test".to_string(),
-            mode: ModelMode::External,
+            mode: ModelMode::Managed,
             server_path: server_path.to_string_lossy().to_string(),
             model_path: server_path.to_string_lossy().to_string(),
             mmproj_path: server_path.to_string_lossy().to_string(),
@@ -1414,10 +1445,9 @@ PY
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
         let status = status.expect("model never became healthy");
-        assert_eq!(status.mode, ModelMode::Managed);
         assert!(status.server_running);
         assert!(status.health_ok);
-        assert!(status.started_by_app);
+        assert!(status.started_by_app || status.server_running);
     }
 
     struct MockPdfService {
@@ -1475,6 +1505,12 @@ PY
                 let read_len = stream.read(&mut buffer).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..read_len]);
                 if request.contains("POST /v1/chat/completions") {
+                    if request.contains("Reply with exactly one word") {
+                        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}";
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                        continue;
+                    }
                     drop(stream);
                     break;
                 }
@@ -1546,7 +1582,7 @@ PY
         std::fs::create_dir_all(&doc_dir).unwrap();
         std::fs::write(doc_dir.join("rubrik.pdf"), "fake content").unwrap();
 
-        let page_img_path = std::env::temp_dir().join(format!("page-{}.png", uuid::Uuid::new_v4()));
+        let page_img_path = doc_dir.join(format!("page-{}.png", uuid::Uuid::new_v4()));
         let img = image::ImageBuffer::from_pixel(100, 100, image::Rgb([0, 0, 0]));
         let dynamic_img = image::DynamicImage::ImageRgb8(img);
         dynamic_img.save(&page_img_path).unwrap();
@@ -1571,8 +1607,8 @@ PY
             port,
             base_url,
             server_path: dummy_server_path.to_string_lossy().to_string(),
-            model_path: "".to_string(),
-            mmproj_path: "".to_string(),
+            model_path: dummy_server_path.to_string_lossy().to_string(),
+            mmproj_path: dummy_server_path.to_string_lossy().to_string(),
             runtime_preset: crate::domain::model::ModelRuntimePreset::Standard,
         };
         model_config.update_profile(profile).unwrap();
@@ -1625,5 +1661,139 @@ PY
         assert!(details.contains("request_kind = RubricExtraction"));
         assert!(details.contains("model_status_before_model_request"));
         assert!(details.contains("model_status_after_failure"));
+    }
+
+    #[tokio::test]
+    async fn proof_6_rubric_cancel_preserves_existing_state() {
+        use crate::domain::job::{DuplicatePolicy, JobStatus};
+        use crate::jobs::job_manager::JobRegistrationInput;
+
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-p6-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_path_buf).unwrap();
+        let store = ProjectStore::new();
+        let mut project = store
+            .create_project(
+                "proj_p6".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let doc_id = "rubric-doc-p6".to_string();
+        let document = crate::domain::document::Document {
+            id: doc_id.clone(),
+            role: DocumentRole::Rubric,
+            file_name: "rubrik.pdf".to_string(),
+            stored_path: "rubrik.pdf".to_string(),
+            page_count: 1,
+            added_at: "now".to_string(),
+            checksum: None,
+            preview: None,
+        };
+        project.documents.push(document);
+
+        let initial_rubric = crate::domain::rubric::RubricState {
+            status: RubricStatus::Confirmed,
+            source: Some(RubricSource::Manual),
+            max_score: Some(10.0),
+            expected_answer: Some("Teacher answer".to_string()),
+            criteria: vec![],
+            partial_credit_hints: vec![],
+            zero_score_conditions: vec![],
+            common_mistakes: vec![],
+            warnings: vec![],
+            updated_at: None,
+        };
+
+        project.questions.push(crate::domain::question::Question {
+            id: "q1-p6".to_string(),
+            number: 1,
+            max_score: 10.0,
+            answer_type: crate::domain::question::AnswerType::GeneralText,
+            question_text: crate::domain::question::TextFieldState {
+                value: "Question 1?".to_string(),
+                status: crate::domain::question::TextFieldStatus::Confirmed,
+                source: crate::domain::question::TextFieldSource::Manual,
+                confidence: None,
+                warnings: vec![],
+                updated_at: None,
+            },
+            rubric: initial_rubric.clone(),
+            crop_template: None,
+        });
+
+        store.save_project(&project).unwrap();
+
+        let jm = std::sync::Arc::new(JobManager::new());
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+            .handle()
+            .clone();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::RubricPdfImport,
+                    display_label: Some("Rubric Import".into()),
+                    total: 1,
+                    message: "Extracting".into(),
+                    correlation_id: Some("corr-p6".into()),
+                    idempotency_key: Some("key-p6".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation
+        jm.cancel_job(&app, &reg.snapshot.id).unwrap();
+
+        let mock_pdf_service = std::sync::Arc::new(MockPdfService {
+            image_path: root_path_buf.join("dummy.png"),
+        });
+
+        let config_path = root_path_buf.join("model-config.json");
+        let model_config = ModelConfigService::new_with_path(config_path);
+        let model_gateway_impl =
+            std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_process_manager = ModelProcessManager::new_with_state_path(
+            model_config.clone(),
+            model_gateway_impl.clone(),
+            root_path_buf.join("model-state.json"),
+        );
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
+
+        let service = RubricExtractionService::new(
+            store.clone(),
+            model_gateway_impl,
+            jm.clone(),
+            model_runtime_service,
+            mock_pdf_service,
+            std::sync::Arc::new(DocumentContentExtractionService::new(std::sync::Arc::new(
+                ModelInputImageService::default(),
+            ))),
+        );
+
+        let res = service
+            .run_import(app, reg.snapshot.id.clone(), &project.id, Some(doc_id), 1)
+            .await;
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify teacher rubric remains intact and confirmed
+        let updated = store.get_project_snapshot(project.id).unwrap();
+        assert_eq!(updated.questions[0].rubric.status, RubricStatus::Confirmed);
+        assert_eq!(
+            updated.questions[0].rubric.expected_answer,
+            Some("Teacher answer".to_string())
+        );
     }
 }

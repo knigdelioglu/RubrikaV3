@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   BarChart3,
@@ -9,7 +9,6 @@ import {
   Clock,
   Mic2,
   Play,
-  Plus,
   Radio,
   Sparkles,
   Users,
@@ -78,6 +77,9 @@ function criterionSourceSummary(criterion: SpeakingCriterion | undefined, score:
 
 export function SpeechExamPage() {
   const { projectId = '' } = useParams<{ projectId: string }>();
+  const [searchParams] = useSearchParams();
+  const assessmentActivityId = searchParams.get('assessmentActivityId') || '';
+  const requestedClassApplicationId = searchParams.get('classApplicationId') || '';
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const restoredRef = useRef(false);
@@ -98,7 +100,6 @@ export function SpeechExamPage() {
   const [maximumMinutes, setMaximumMinutes] = useState('4');
   const [maximumSeconds, setMaximumSeconds] = useState('0');
   const [optionalTeacherNote, setOptionalTeacherNote] = useState('');
-  const [examDate] = useState('');
 
   const [examId, setExamId] = useState('');
   const [selectedStudentId, setSelectedStudentId] = useState('');
@@ -114,6 +115,7 @@ export function SpeechExamPage() {
   const [showRuntimeDetails, setShowRuntimeDetails] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
+  const [classApplicationId, setClassApplicationId] = useState(requestedClassApplicationId);
 
   const projectQuery = useQuery({
     queryKey: ['project-snapshot', projectId],
@@ -121,15 +123,25 @@ export function SpeechExamPage() {
     enabled: Boolean(projectId),
   });
   const project = projectQuery.data;
+  const activityQuery = useQuery({
+    queryKey: ['assessment-activity', projectId, assessmentActivityId],
+    queryFn: () => commands.getAssessmentActivity({ projectId, activityId: assessmentActivityId }),
+    enabled: Boolean(projectId && assessmentActivityId),
+  });
+  const activity = activityQuery.data;
+  const classApplications = useMemo(
+    () => (activity?.classApplications ?? []).filter((application) => application.status !== 'archived'),
+    [activity?.classApplications],
+  );
   const classes = useMemo(
     () => (project?.schoolClasses ?? []).filter((schoolClass) => schoolClass.status === 'active'),
     [project?.schoolClasses],
   );
 
   const studentsQuery = useQuery({
-    queryKey: ['class-students', projectId, classId],
-    queryFn: () => commands.listClassStudents({ projectId, classId }),
-    enabled: Boolean(projectId && classId),
+    queryKey: ['class-application-students', projectId, assessmentActivityId, classApplicationId],
+    queryFn: () => commands.getClassApplicationStudents({ projectId, activityId: assessmentActivityId, applicationId: classApplicationId }),
+    enabled: Boolean(projectId && assessmentActivityId && classApplicationId),
   });
   const students = useMemo(() => studentsQuery.data ?? [], [studentsQuery.data]);
 
@@ -142,9 +154,9 @@ export function SpeechExamPage() {
   const runtimeStatus = runtimeQuery.data;
 
   const speakingExamQuery = useQuery({
-    queryKey: ['speaking-exam', projectId, examId],
-    queryFn: () => commands.getSpeakingExam(projectId, examId),
-    enabled: stage === 'session' && Boolean(projectId && examId),
+    queryKey: ['speaking-exam', projectId, assessmentActivityId, classApplicationId, examId],
+    queryFn: () => commands.getSpeakingExam(projectId, examId, assessmentActivityId, classApplicationId),
+    enabled: stage === 'session' && Boolean(projectId && examId && assessmentActivityId),
     refetchInterval: (query) =>
       query.state.data?.attempts.some((item) =>
         ['finalizing', 'cleaning_transcript', 'evaluating'].includes(item.state),
@@ -155,20 +167,18 @@ export function SpeechExamPage() {
   const speakingExam = speakingExamQuery.data;
 
   const sessionAssignedClasses = useMemo(() => {
-    if (!speakingExam) return classes;
-    const assignedIds = speakingExam.assignedClassIds?.length
-      ? speakingExam.assignedClassIds
-      : speakingExam.classId
-      ? [speakingExam.classId]
-      : [];
-    return classes.filter((sc) => assignedIds.includes(sc.id));
-  }, [classes, speakingExam]);
+    return classApplications
+      .map((application) => classes.find((schoolClass) => schoolClass.id === application.schoolClassId))
+      .filter((schoolClass): schoolClass is NonNullable<typeof schoolClass> => Boolean(schoolClass));
+  }, [classApplications, classes]);
 
   const selectedStudent = students.find((student) => student.id === selectedStudentId);
   const attempt =
     speakingExam?.attempts.find((item) => item.id === currentAttemptId) ??
     speakingExam?.attempts.find(
-      (item) => item.studentId === selectedStudentId && item.state !== 'approved',
+      (item) => item.studentId === selectedStudentId
+        && item.classApplicationId === classApplicationId
+        && item.state !== 'approved',
     ) ??
     speakingExam?.attempts.find((item) => item.studentId === selectedStudentId);
   const attemptId = attempt?.id;
@@ -178,14 +188,39 @@ export function SpeechExamPage() {
   const completedStudentIds = useMemo(
     () =>
       speakingExam?.attempts
-        .filter((item) => item.state === 'approved')
+        .filter((item) => item.state === 'approved' && item.classApplicationId === classApplicationId)
         .map((item) => item.studentId) ?? [],
-    [speakingExam?.attempts],
+    [classApplicationId, speakingExam?.attempts],
   );
 
   useEffect(() => {
-    if (restoredRef.current || !project) return;
+    if (!project) return;
+    if (assessmentActivityId && !activity) return;
+    if (restoredRef.current) return;
     restoredRef.current = true;
+    if (activity) {
+      const configuration = activity.speakingConfiguration;
+      const selectedApplication = classApplications.find((application) => application.id === requestedClassApplicationId)
+        ?? classApplications[0];
+      setExamId(activity.id);
+      setExamName(activity.title || `${activity.term}. Dönem ${activity.sequenceNumber}. Konuşma Sınavı`);
+      setTaskText(configuration?.taskText ?? '');
+      setExamType(configuration?.speakingType === 'impromptu' ? 'impromptu' : 'prepared');
+      const minSec = configuration?.minDurationSeconds ?? 120;
+      const recSec = configuration?.targetDurationSeconds ?? 180;
+      const maxSec = configuration?.maxDurationSeconds ?? 240;
+      setMinimumMinutes(String(Math.floor(minSec / 60)));
+      setMinimumSeconds(String(minSec % 60));
+      setTargetMinutes(String(Math.floor(recSec / 60)));
+      setTargetSeconds(String(recSec % 60));
+      setMaximumMinutes(String(Math.floor(maxSec / 60)));
+      setMaximumSeconds(String(maxSec % 60));
+      setClassApplicationId(selectedApplication?.id ?? '');
+      setClassId(selectedApplication?.schoolClassId ?? '');
+      setStage('session');
+      setStatusMessage('Merkezi AssessmentActivity yürütme bağlamı açıldı.');
+      return;
+    }
     const resumable = [...project.speakingExams]
       .filter((exam) => exam.status !== 'completed')
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
@@ -219,7 +254,7 @@ export function SpeechExamPage() {
       setSelectedClassIds(classes.map((c) => c.id));
       setClassId(classes[0].id);
     }
-  }, [classes, project]);
+  }, [assessmentActivityId, activity, classApplications, classes, project, requestedClassApplicationId]);
 
   useEffect(() => {
     if (stage === 'setup' && selectedClassIds.length === 0 && classes.length > 0) {
@@ -230,8 +265,10 @@ export function SpeechExamPage() {
   useEffect(() => {
     if (!classId && sessionAssignedClasses[0]) {
       setClassId(sessionAssignedClasses[0].id);
+      const application = classApplications.find((item) => item.schoolClassId === sessionAssignedClasses[0]?.id);
+      if (application) setClassApplicationId(application.id);
     }
-  }, [classId, sessionAssignedClasses]);
+  }, [classApplications, classId, sessionAssignedClasses]);
 
   useEffect(() => {
     if (students.length === 0) {
@@ -341,27 +378,16 @@ export function SpeechExamPage() {
 
   async function beginSession() {
     if (!setupReadiness.isReady || isStarting) return;
+    if (!assessmentActivityId) {
+      navigate(`/project/${encodeURIComponent(projectId)}/activities`);
+      return;
+    }
     setPageError(null);
     setIsStarting(true);
     try {
-      const result = await commands.startSpeakingExam({
-        projectId,
-        examName: examName.trim(),
-        examType,
-        taskText: taskText.trim(),
-        minimumSeconds: minSecCalculated,
-        targetSeconds: recSecCalculated,
-        maximumSeconds: maxSecCalculated,
-        assignedClassIds: selectedClassIds,
-        examId: examId || undefined,
-        teacherNote: optionalTeacherNote.trim() || undefined,
-        examDate: examDate.trim() || undefined,
-      });
-      setExamId(result.examId);
-      setStatusMessage(result.message);
+      setExamId(assessmentActivityId);
+      setStatusMessage('Merkezi sınav organizasyonu yürütme ekranına açıldı.');
       setStage('session');
-      await queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
-      await queryClient.invalidateQueries({ queryKey: ['speaking-exam', projectId, result.examId] });
     } catch (error) {
       setPageError(errorMessage(error, 'Konuşma sınavı kaydedilemedi.'));
     } finally {
@@ -377,6 +403,8 @@ export function SpeechExamPage() {
       const result = await commands.toggleSpeakingCapture({
         projectId,
         examId,
+        assessmentActivityId,
+        classApplicationId,
         studentId: selectedStudentId,
         action,
       });
@@ -470,14 +498,21 @@ export function SpeechExamPage() {
     }
   }
 
-  async function switchClass(nextClassId: string) {
-    if (nextClassId === classId || isActiveCapture || isProcessing) return;
+  async function switchClass(nextClassApplicationId: string) {
+    const nextApplication = classApplications.find((item) => item.id === nextClassApplicationId);
+    if (!nextApplication || nextClassApplicationId === classApplicationId || isActiveCapture || isProcessing) return;
     setPageError(null);
     try {
       if (examId) {
-        await commands.selectSpeakingExamClass({ projectId, examId, classId: nextClassId });
+        await commands.selectSpeakingExamClass({
+          projectId,
+          examId,
+          assessmentActivityId,
+          classApplicationId: nextClassApplicationId,
+        });
       }
-      setClassId(nextClassId);
+      setClassApplicationId(nextClassApplicationId);
+      setClassId(nextApplication.schoolClassId);
       setSelectedStudentId('');
       setCurrentAttemptId('');
       await queryClient.invalidateQueries({ queryKey: ['speaking-exam', projectId, examId] });
@@ -491,7 +526,13 @@ export function SpeechExamPage() {
     setCurrentAttemptId('');
     if (!examId) return;
     try {
-      await commands.selectSpeakingExamStudent({ projectId, examId, studentId });
+      await commands.selectSpeakingExamStudent({
+        projectId,
+        examId,
+        assessmentActivityId,
+        classApplicationId,
+        studentId,
+      });
       await queryClient.invalidateQueries({ queryKey: ['speaking-exam', projectId, examId] });
     } catch (error) {
       setPageError(errorMessage(error, 'Aktif öğrenci kaydedilemedi.'));
@@ -530,7 +571,31 @@ export function SpeechExamPage() {
   if (projectQuery.isLoading) {
     return <div className="speech-exam-loading">Konuşma sınavı hazırlanıyor…</div>;
   }
-
+  if (!assessmentActivityId) {
+    return (
+      <div className="speech-exam-empty">
+        <Mic2 size={28} />
+        <h2>Konuşma sınavı organizasyonu seçilmedi</h2>
+        <p>Kurulum ve sınıf uygulamaları artık merkezi AssessmentActivity üzerinden yönetilir.</p>
+        <Link className="button button--primary" to={`/project/${encodeURIComponent(projectId)}/activities?assessmentType=speaking`}>
+          Sınav Organizasyonuna Git
+        </Link>
+      </div>
+    );
+  }
+  if (activityQuery.isLoading) {
+    return <div className="speech-exam-loading">Merkezi konuşma sınavı yükleniyor…</div>;
+  }
+  if (!activity) {
+    return (
+      <div className="speech-exam-empty">
+        <CircleAlert size={28} />
+        <h2>Konuşma sınavı bulunamadı</h2>
+        <p>{errorMessage(activityQuery.error, 'AssessmentActivity yüklenemedi.')}</p>
+        <Link className="button button--secondary" to={`/project/${encodeURIComponent(projectId)}/activities`}>Sınav Organizasyonuna Dön</Link>
+      </div>
+    );
+  }
   return (
     <div className="speech-exam-page">
       <div className="speech-exam-page__header">
@@ -559,21 +624,25 @@ export function SpeechExamPage() {
         <div className="speech-form-note"><Sparkles size={16} /> {statusMessage}</div>
       )}
 
-      {stage === 'session' && sessionAssignedClasses.length > 0 && (
+      {stage === 'session' && classApplications.length > 0 && (
         <div className="speech-class-toolbar">
-          <span className="speech-class-toolbar__label">Atanmış Sınıf:</span>
+          <span className="speech-class-toolbar__label">Sınav sınıfı:</span>
           <div className="speech-class-toolbar__segment">
-            {sessionAssignedClasses.map((schoolClass) => (
+            {classApplications.map((application) => {
+              const schoolClass = classes.find((item) => item.id === application.schoolClassId);
+              if (!schoolClass) return null;
+              return (
               <button
                 type="button"
-                key={schoolClass.id}
-                className={`speech-class-toolbar__btn ${schoolClass.id === classId ? 'is-active' : ''}`}
+                key={application.id}
+                className={`speech-class-toolbar__btn ${application.id === classApplicationId ? 'is-active' : ''}`}
                 disabled={isActiveCapture || isProcessing}
-                onClick={() => void switchClass(schoolClass.id)}
+                onClick={() => void switchClass(application.id)}
               >
-                {schoolClass.name}
+                {schoolClass.displayName || schoolClass.name}
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -667,7 +736,7 @@ export function SpeechExamPage() {
                   to={`/project/${encodeURIComponent(projectId)}/classes`}
                   className="button button--secondary"
                 >
-                  <Plus size={14} /> Yeni Sınıf Ekle
+                  Kurulum → Sınıflar
                 </Link>
               </div>
 

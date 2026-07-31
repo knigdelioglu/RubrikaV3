@@ -1,8 +1,12 @@
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
 pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<()> {
+    atomic_write_bytes(path, content.as_bytes())
+}
+
+pub fn atomic_write_bytes<P: AsRef<Path>>(path: P, content: &[u8]) -> std::io::Result<()> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or(Path::new(""));
     if !parent.exists() && parent != Path::new("") {
@@ -10,11 +14,37 @@ pub fn atomic_write<P: AsRef<Path>>(path: P, content: &str) -> std::io::Result<(
     }
 
     let tmp_path = path.with_extension("tmp");
-    let mut tmp_file = File::create(&tmp_path)?;
-    tmp_file.write_all(content.as_bytes())?;
-    tmp_file.sync_all()?;
+    if let Ok(metadata) = fs::symlink_metadata(&tmp_path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Atomic temporary target is not a regular file.",
+            ));
+        }
+        fs::remove_file(&tmp_path)?;
+    }
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    if let Err(error) = tmp_file
+        .write_all(content)
+        .and_then(|_| tmp_file.sync_all())
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
 
-    fs::rename(tmp_path, path)?;
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    // Persist the directory entry when the platform supports syncing a
+    // directory. The rename is already atomic; this closes the durability
+    // window after a successful replacement.
+    if let Ok(parent_file) = OpenOptions::new().read(true).open(parent) {
+        let _ = parent_file.sync_all();
+    }
     Ok(())
 }
 
@@ -31,7 +61,7 @@ pub fn remove_file_within(base_dir: &Path, candidate: &Path) -> std::io::Result<
     }
     let canonical_base = std::fs::canonicalize(base_dir)?;
     let canonical_candidate = std::fs::canonicalize(candidate)?;
-    if !canonical_candidate.starts_with(&canonical_base) {
+    if canonical_candidate.strip_prefix(&canonical_base).is_err() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Removal target is outside the allowed project directory.",
@@ -54,7 +84,9 @@ pub fn remove_dir_within(base_dir: &Path, candidate: &Path) -> std::io::Result<b
     }
     let canonical_base = std::fs::canonicalize(base_dir)?;
     let canonical_candidate = std::fs::canonicalize(candidate)?;
-    if canonical_candidate == canonical_base || !canonical_candidate.starts_with(&canonical_base) {
+    if canonical_candidate == canonical_base
+        || canonical_candidate.strip_prefix(&canonical_base).is_err()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Removal target is outside the allowed project directory.",

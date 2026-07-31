@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +14,7 @@ use crate::domain::question::{is_question_text_ready, TextFieldStatus};
 use crate::domain::rubric::RubricStatus;
 use crate::domain::workflow::{WorkflowAction, WorkflowSnapshot, WorkflowStage};
 use crate::jobs::job_manager::JobManager;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
 };
@@ -163,13 +163,12 @@ impl ExamPackageBuildService {
                         },
                     };
                     service.write_project_log(
-                        &project.root_path,
                         &project.id,
                         "exam_package_build_failed",
                         &job_id,
                         Some(error.message.as_str()),
                     );
-                    let _ = service.project_store.save_project(&project);
+                    let _ = service.project_store.commit_snapshot_cas(&project);
                 }
             }
         });
@@ -214,7 +213,9 @@ impl ExamPackageBuildService {
 
         if project.expected_question_count != Some(expected_question_count) {
             project.expected_question_count = Some(expected_question_count);
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
         }
 
         let exam_source_exists = project
@@ -249,13 +250,14 @@ impl ExamPackageBuildService {
             });
         }
 
-        self.ensure_root_writable(&project.root_path)?;
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        self.ensure_root_writable(&trusted_root)?;
         Ok(project)
     }
 
-    fn ensure_root_writable(&self, root_path: &str) -> Result<(), AppError> {
-        let probe_path =
-            Path::new(root_path).join(format!(".rubrika-write-probe-{}", Uuid::new_v4()));
+    fn ensure_root_writable(&self, trusted_root: &TrustedProjectRoot) -> Result<(), AppError> {
+        let probe = trusted_root.managed(&format!(".rubrika-write-probe-{}", Uuid::new_v4()))?;
+        let probe_path = trusted_root.prepare_write_target(&probe)?;
         std::fs::write(&probe_path, b"probe").map_err(|error| AppError {
             code: AppErrorCode::ExamPackageBuildPrecheckFailed,
             message: "Proje kök dizinine yazılamıyor.".to_string(),
@@ -285,9 +287,10 @@ impl ExamPackageBuildService {
                 ..Default::default()
             },
         };
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         self.write_project_log(
-            &project.root_path,
             project_id,
             "exam_package_build_started",
             job_id,
@@ -304,6 +307,21 @@ impl ExamPackageBuildService {
         expected_question_count: u32,
     ) -> Result<(), AppError> {
         self.job_manager.set_running(&app, &job_id)?;
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Sınav paketi oluşturma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+
         self.job_manager.update_progress(
             &app,
             &job_id,
@@ -320,6 +338,20 @@ impl ExamPackageBuildService {
             .ensure_exam_preview(&app, &project_id, &project, &exam_source.id)
             .await?;
 
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Sınav paketi oluşturma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+
         self.job_manager.update_progress(
             &app,
             &job_id,
@@ -328,6 +360,20 @@ impl ExamPackageBuildService {
             "Gemma model sunucusu hazırlanıyor...".to_string(),
         )?;
         let model_result = self.ensure_model_ready().await?;
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Sınav paketi oluşturma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
 
         self.job_manager.update_progress(
             &app,
@@ -340,6 +386,20 @@ impl ExamPackageBuildService {
             .ensure_question_texts(&app, &project_id, &project, expected_question_count)
             .await?;
 
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Sınav paketi oluşturma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
+
         self.job_manager.update_progress(
             &app,
             &job_id,
@@ -351,6 +411,20 @@ impl ExamPackageBuildService {
         let _rubric_result = self
             .ensure_rubrics(&app, &project_id, &project, expected_question_count)
             .await?;
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Err(AppError {
+                    code: AppErrorCode::JobCancelled,
+                    message: "Sınav paketi oluşturma işlemi iptal edildi.".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        }
 
         self.job_manager.update_progress(
             &app,
@@ -387,7 +461,9 @@ impl ExamPackageBuildService {
             },
         };
         project.workflow = workflow;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         let result = ExamPackageBuildResult {
             expected_question_count,
@@ -402,7 +478,6 @@ impl ExamPackageBuildService {
         };
 
         self.write_project_log(
-            &project.root_path,
             &project_id,
             "exam_package_build_finished",
             &job_id,
@@ -752,7 +827,8 @@ impl ExamPackageBuildService {
                 JobStatus::Succeeded
                 | JobStatus::Partial
                 | JobStatus::Failed
-                | JobStatus::Cancelled => {
+                | JobStatus::Cancelled
+                | JobStatus::Interrupted => {
                     return Ok(snapshot);
                 }
             }
@@ -782,14 +858,20 @@ impl ExamPackageBuildService {
 
     fn write_project_log(
         &self,
-        root_path: &str,
         project_id: &str,
         event: &str,
         correlation_id: &str,
         message: Option<&str>,
     ) {
-        let log_dir = Path::new(root_path).join("logs");
-        let _ = std::fs::create_dir_all(&log_dir);
+        let Ok(trusted_root) = self.project_store.trusted_project_root(project_id) else {
+            return;
+        };
+        let Ok(path) = trusted_root.managed("logs/events.jsonl") else {
+            return;
+        };
+        let Ok(path) = trusted_root.prepare_write_target(&path) else {
+            return;
+        };
         let entry = serde_json::json!({
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "event": event,
@@ -797,11 +879,10 @@ impl ExamPackageBuildService {
             "correlation_id": correlation_id,
             "message": message,
         });
-        let path = log_dir.join("events.jsonl");
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&path)
         {
             let _ = std::io::Write::write_all(&mut file, format!("{entry}\n").as_bytes());
         }
@@ -852,31 +933,40 @@ mod tests {
     }
 
     fn test_service(project_store: ProjectStore) -> ExamPackageBuildService {
+        test_service_with_job_manager(project_store, Arc::new(JobManager::new()))
+    }
+
+    fn test_service_with_job_manager(
+        project_store: ProjectStore,
+        job_manager: Arc<JobManager>,
+    ) -> ExamPackageBuildService {
         let pdf_preview_service = Arc::new(PdfPreviewService::new(
             project_store.clone(),
             Arc::new(SystemPdfService),
-            Arc::new(JobManager::new()),
+            job_manager.clone(),
         ));
         let model_gateway_impl = Arc::new(LlamaServerGateway::default());
+        let model_config = ModelConfigService::new();
         let model_process_manager =
-            ModelProcessManager::new(ModelConfigService::new(), model_gateway_impl.clone());
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
         let model_runtime_service =
-            ModelRuntimeService::new(ModelConfigService::new(), model_process_manager.clone());
-        let document_content_extraction_service = Arc::new(DocumentContentExtractionService::new(
-            Arc::new(ModelInputImageService::default()),
-        ));
+            ModelRuntimeService::new(model_config, model_process_manager);
+        let model_input_image_service = Arc::new(ModelInputImageService::default());
+        let document_content_extraction_service = Arc::new(
+            DocumentContentExtractionService::new(model_input_image_service),
+        );
         let question_text_service = Arc::new(QuestionTextService::new(
             project_store.clone(),
             model_gateway_impl.clone(),
             model_runtime_service.clone(),
             pdf_preview_service.clone(),
             document_content_extraction_service.clone(),
-            Arc::new(JobManager::new()),
+            job_manager.clone(),
         ));
         let rubric_extraction_service = Arc::new(RubricExtractionService::new(
             project_store.clone(),
             model_gateway_impl,
-            Arc::new(JobManager::new()),
+            job_manager.clone(),
             model_runtime_service.clone(),
             Arc::new(SystemPdfService),
             document_content_extraction_service,
@@ -888,7 +978,7 @@ mod tests {
             model_runtime_service,
             question_text_service,
             rubric_extraction_service,
-            Arc::new(JobManager::new()),
+            job_manager,
         )
     }
 
@@ -980,12 +1070,19 @@ mod tests {
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -1010,5 +1107,78 @@ mod tests {
         assert!(summary.failed.is_empty());
         assert_eq!(summary.imported, vec![1, 2]);
         assert!(!summary.partial_success);
+    }
+
+    #[tokio::test]
+    async fn proof_16_exam_package_build_cancel_preserves_unfrozen_state() {
+        use crate::domain::job::{DuplicatePolicy, JobKind, JobStatus};
+        use crate::jobs::job_manager::{JobManager, JobRegistrationInput};
+
+        let store = ProjectStore::new();
+        let mut project = store
+            .create_project("proj_p16".to_string(), temp_project_root())
+            .unwrap();
+
+        project.documents.push(Document {
+            id: "exam-source-p16".to_string(),
+            role: DocumentRole::ExamSource,
+            file_name: "exam.pdf".to_string(),
+            stored_path: "exam.pdf".to_string(),
+            page_count: 1,
+            added_at: chrono::Utc::now().to_rfc3339(),
+            checksum: None,
+            preview: None,
+        });
+        project.documents.push(Document {
+            id: "rubric-doc-p16".to_string(),
+            role: DocumentRole::AnswerKey,
+            file_name: "rubric.pdf".to_string(),
+            stored_path: "rubric.pdf".to_string(),
+            page_count: 1,
+            added_at: chrono::Utc::now().to_rfc3339(),
+            checksum: None,
+            preview: None,
+        });
+        store.save_project(&project).unwrap();
+
+        let jm = std::sync::Arc::new(JobManager::new());
+        let service = test_service_with_job_manager(store.clone(), jm.clone());
+        let app = mock_app();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::ExamPackageBuild,
+                    display_label: Some("Exam Package Build".into()),
+                    total: 6,
+                    message: "Building".into(),
+                    correlation_id: Some("corr-p16".into()),
+                    idempotency_key: Some("key-p16".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation
+        jm.cancel_job(&app, &reg.snapshot.id).unwrap();
+
+        let res = service
+            .run_build(app, reg.snapshot.id.clone(), project.id.clone(), 1)
+            .await;
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify package freeze is NOT populated
+        let updated = store.get_project_snapshot(project.id).unwrap();
+        assert!(updated.exam_package_freeze.is_none());
     }
 }

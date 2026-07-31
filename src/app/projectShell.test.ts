@@ -35,27 +35,25 @@ const job = (overrides: Partial<JobSnapshot> = {}): JobSnapshot => ({
   ...overrides,
 });
 
-test('project navigation exposes the canonical teacher workspaces including analysis', () => {
-  assert.equal(projectNavigation.length, 9);
+test('project navigation exposes the 5 canonical teacher workspaces', () => {
+  assert.equal(projectNavigation.length, 5);
   assert.deepEqual(projectNavigation.map((item) => item.label), [
-    'Yeni Proje',
-    'İş Akışı',
-    'Belgeler',
-    'Sınav Paketi',
-    'Sınıflar',
-    'Öğrenci İşlemleri',
-    'Notlandırma',
-    'Analiz',
-    'Model Durumu',
+    'Ana Sayfa',
+    'Sınavlar',
+    'Sınıflar ve Öğrenciler',
+    'Raporlar',
+    'Ayarlar',
   ]);
   assert.equal(projectOverviewPath('project 1'), '/project/project%201/overview');
 });
 
 test('nested project routes resolve their active teacher area', () => {
-  assert.equal(getProjectArea('/project/p1/exam/rubrics'), 'exam');
-  assert.equal(getProjectArea('/project/p1/ocr/review'), 'students');
+  assert.equal(getProjectArea('/project/p1/exam/rubrics'), 'activities');
+  assert.equal(getProjectArea('/project/p1/ocr/review'), 'activities');
   assert.equal(getProjectArea('/project/p1/classes'), 'classes');
+  assert.equal(getProjectArea('/project/p1/activities'), 'activities');
   assert.equal(getProjectArea('/project/p1/analysis'), 'analysis');
+  assert.equal(getProjectArea('/project/p1/settings/model'), 'settings');
   assert.equal(getProjectArea('/workflow'), 'overview');
 });
 
@@ -65,8 +63,8 @@ test('a nested project route opened directly retains its project context', () =>
 
   assert.equal(getProjectIdFromPathname(examRoute), 'project 1');
   assert.equal(getProjectIdFromPathname(ocrRoute), 'project 1');
-  assert.equal(getProjectArea(examRoute), 'documents');
-  assert.equal(getProjectArea(ocrRoute), 'students');
+  assert.equal(getProjectArea(examRoute), 'activities');
+  assert.equal(getProjectArea(ocrRoute), 'activities');
 });
 
 test('legacy project routes resolve to their canonical nested routes', () => {
@@ -132,10 +130,10 @@ test('legacy PDF preview deep links preserve document and page selection', () =>
 });
 
 test('sidebar active area follows nested and legacy routes', () => {
-  assert.equal(getProjectArea('/project/p1/students/grouping'), 'students');
-  assert.equal(getProjectArea('/student-scans'), 'students');
-  assert.equal(getProjectArea('/project/p1/grading/papers'), 'grading');
-  assert.equal(getProjectArea('/graded-exam-review'), 'grading');
+  assert.equal(getProjectArea('/project/p1/students/grouping'), 'activities');
+  assert.equal(getProjectArea('/student-scans'), 'activities');
+  assert.equal(getProjectArea('/project/p1/grading/papers'), 'activities');
+  assert.equal(getProjectArea('/graded-exam-review'), 'activities');
 });
 
 test('global jobs expose teacher labels and bounded progress without internal ids', () => {
@@ -155,8 +153,8 @@ test('global jobs expose teacher labels and bounded progress without internal id
 test('global job center keeps showing an active job while the project route changes', () => {
   const jobs = [job()];
 
-  assert.equal(getProjectArea('/project/project-1/exam/documents'), 'documents');
+  assert.equal(getProjectArea('/project/project-1/exam/documents'), 'activities');
   assert.equal(getJobCenterButtonLabel(jobs), 'Öğrenci cevapları okunuyor');
-  assert.equal(getProjectArea('/project/project-1/ocr/review'), 'students');
+  assert.equal(getProjectArea('/project/project-1/ocr/review'), 'activities');
   assert.equal(getJobCenterButtonLabel(jobs), 'Öğrenci cevapları okunuyor');
 });

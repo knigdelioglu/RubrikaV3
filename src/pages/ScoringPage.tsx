@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertCircle, BarChart3, CheckCircle2, Eye, Loader2, RefreshCw, Sparkles } from 'lucide-react';
+import { AlertCircle, CheckCircle2, Eye, Loader2, RefreshCw, Sparkles } from 'lucide-react';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { tauriClient } from '../api/tauriClient';
-import { blockingReasonLabels, jobStatusLabels, scoringWarningLabels, stageLabels } from '../utils/labels';
+import { blockingReasonLabels, jobStatusLabels, scoringWarningLabels } from '../utils/labels';
 import { useProjectContext } from '../state/useProjectContext';
 import type { ScoringRecord } from '../api/types';
 import { ClassSelector } from '../components/student/ClassSelector';
@@ -44,21 +44,25 @@ function formatConfidence(value: number | null | undefined): string {
 
 export function ScoringPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const navigate = useNavigate();
   const { projectId, projectPath, isResolving } = useProjectContext();
   const queryClient = useQueryClient();
   const [error, setError] = useState<AppError | null>(null);
   const [draftScores, setDraftScores] = useState<Record<string, { score: string; notes: string }>>({});
   const [expandedSubmissionIds, setExpandedSubmissionIds] = useState<Set<string>>(new Set());
-  const [isFinishing, setIsFinishing] = useState(false);
 
-  const { data: project, error: projectError, isLoading: projectLoading } = useQuery({
+  const { data: activity } = useQuery({
+    queryKey: ["assessment-activity", projectId, searchParams.get("assessmentActivityId") || ""],
+    queryFn: () => commands.getAssessmentActivity({ projectId: projectId!, activityId: searchParams.get("assessmentActivityId")! }),
+    enabled: !!projectId && !!searchParams.get("assessmentActivityId"),
+  });
+
+  const { data: project, error: projectError } = useQuery({
     queryKey: ['project-snapshot', projectId],
     queryFn: () => commands.getProjectSnapshot(projectId!),
     enabled: !!projectId,
   });
 
-  const { data: workflow, error: workflowError, isLoading: workflowLoading } = useQuery({
+  const { data: workflow, error: workflowError } = useQuery({
     queryKey: ['workflow-snapshot', projectId],
     queryFn: () => commands.getWorkflowSnapshot(projectId!),
     enabled: !!projectId,
@@ -206,19 +210,10 @@ export function ScoringPage() {
   const queryError = (projectError as AppError | null) || (workflowError as AppError | null) || error;
   const scoringReady = workflow?.summary.readiness.scoring ?? false;
   const scoringBlockers = workflow?.blockingReasons ?? [];
-  const scoringStageLabel = workflow ? stageLabels[workflow.currentStage] ?? workflow.currentStage : 'Bilinmiyor';
   const activeJob = jobs.find((job) => job.kind === 'scoring' && (job.status === 'queued' || job.status === 'running'));
   const totalHistoryCount = project.scoringRecords.filter((record) => visibleSubmissionIds.has(record.submissionId)).length;
   const duplicateResultCount = Math.max(0, totalHistoryCount - scoringRecords.length);
   const activeStudentCount = studentRows.filter((row) => row.records.length > 0).length;
-
-  const packageStatusText = activeJob
-    ? `${jobStatusLabels[activeJob.status] ?? activeJob.status} · ${activeJob.progress.message}`
-    : scoringRecords.length > 0
-      ? 'Son notlandırma sonuçları hazır.'
-      : activeScoringRunId
-        ? 'Notlandırma sonuçları bekleniyor.'
-        : 'Henüz notlandırma başlatılmadı.';
 
   const totalRecordCount = scoringRecords.length;
   const approvedCount = scoringRecords.filter((record) => record.teacherReviewStatus === 'approved' || record.teacherReviewStatus === 'edited').length;
@@ -253,21 +248,7 @@ export function ScoringPage() {
     });
   };
 
-  const handleFinishExam = async () => {
-    if (!projectId || scoringRecords.length === 0 || scoringJobActive) return;
-    setIsFinishing(true);
-    setError(null);
-    try {
-      const output = await commands.finishAssessment({ projectId, kind: 'written' });
-      navigate(
-        `/project/${encodeURIComponent(projectId)}/analysis?analysisId=${encodeURIComponent(output.analysisId)}`,
-      );
-    } catch (finishError) {
-      setError(finishError as AppError);
-    } finally {
-      setIsFinishing(false);
-    }
-  };
+
 
   return (
     <div style={{ padding: '2rem', maxWidth: '1440px', margin: '0 auto', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
@@ -283,7 +264,7 @@ export function ScoringPage() {
           <p style={{ margin: '0.35rem 0 0 0', color: '#64748b', fontSize: '0.875rem' }}>
             Öğretmen onaylı OCR, doğrulanmış kimlik ve dondurulmuş sınav paketiyle notlandırma işlemi çalıştırılır.
           </p>
-          <p style={{ margin: '0.35rem 0 0 0', color: '#64748b', fontSize: '0.8125rem' }}>Proje: {project.name}</p>
+          <p style={{ margin: "0.35rem 0 0 0", color: "#64748b", fontSize: "0.875rem" }}>{activity ? `Yazılı · ${activity.classApplications.map((a) => a.schoolClassId).join(", ")}` : `Proje: ${project.name}`}</p>
         </div>
 
         <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
@@ -344,16 +325,7 @@ export function ScoringPage() {
             <RefreshCw size={16} />
             Notlandırmayı Yeniden Çalıştır
           </button>
-          <button
-            type="button"
-            className="button button--primary"
-            onClick={() => void handleFinishExam()}
-            disabled={scoringRecords.length === 0 || scoringJobActive || isFinishing}
-            title={scoringRecords.length === 0 ? 'Analiz için kaydedilmiş puan gerekir.' : undefined}
-          >
-            <BarChart3 size={16} />
-            {isFinishing ? 'Analiz hazırlanıyor…' : 'Sınavı bitir ve analiz oluştur'}
-          </button>
+
         </div>
       </div>
 
@@ -373,25 +345,58 @@ export function ScoringPage() {
 
       {queryError && <ErrorBanner error={queryError} />}
 
-
-      {(projectLoading || workflowLoading) && (
-        <div style={{ marginBottom: '1rem', color: '#64748b', fontSize: '0.875rem' }}>
-          Yükleniyor...
+      {activeJob ? (
+        <div style={{ background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: '1rem', padding: '1.25rem', marginBottom: '1.5rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <strong style={{ color: '#3730a3', fontSize: '1.1rem' }}>
+              Puanlama sürüyor — {activeJob.progress.current} / {activeJob.progress.total} öğrenci
+            </strong>
+            <span style={{ fontSize: '0.875rem', fontWeight: 600, color: '#4338ca' }}>
+              %{Math.round((activeJob.progress.current / (activeJob.progress.total || 1)) * 100)}
+            </span>
+          </div>
+          <div style={{ height: '8px', background: '#c7d2fe', borderRadius: '9999px', overflow: 'hidden', marginBottom: '0.5rem' }}>
+            <div style={{ width: `${Math.round((activeJob.progress.current / (activeJob.progress.total || 1)) * 100)}%`, height: '100%', background: '#4f46e5', transition: 'width 0.3s' }} />
+          </div>
+          <p style={{ margin: 0, color: '#4338ca', fontSize: '0.875rem' }}>{activeJob.progress.message || 'Puanlama modeli yanıtları üretiyor.'}</p>
         </div>
+      ) : (
+        !scoringReady ? (
+          <div style={{ background: "#fff9eb", border: "1px solid #fde68a", borderRadius: "1rem", padding: "1.75rem", marginBottom: "1.5rem", textAlign: "center" }}>
+            <h3 style={{ margin: 0, fontSize: "1.2rem", color: "#92400e", fontWeight: 700 }}>Puanlama henüz hazır değil</h3>
+            <p style={{ margin: "0.5rem 0 1.25rem 0", color: "#b45309", fontSize: "0.9rem" }}>
+              {(project?.studentAnswerOcrRecords ?? []).filter((r) => r.needsReview).length > 0
+                ? `${(project?.studentAnswerOcrRecords ?? []).filter((r) => r.needsReview).length} öğrencinin OCR kontrolünü tamamlayın.`
+                : "Puanlama başlatabilmek için önce sınav hazırlığı ve OCR kontrolü tamamlanmalıdır."}
+            </p>
+            <Link to={`/project/${encodeURIComponent(projectId)}/activities/${encodeURIComponent(searchParams.get("assessmentActivityId") || "")}/ocr`} className="button button--primary" style={{ display: "inline-flex", padding: "0.65rem 1.25rem" }}>
+              OCR ve Kontrole git
+            </Link>
+          </div>
+        ) : (
+          <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: "1rem", padding: "1.25rem", marginBottom: "1.5rem", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "1rem" }}>
+            <div>
+              <h3 style={{ margin: 0, fontSize: "1.25rem", fontWeight: 700, color: "#0f172a" }}>Puanlamaya hazır</h3>
+              <p style={{ margin: "0.25rem 0 0", color: "#64748b", fontSize: "#0.875rem" }}>
+                {project.students.length} öğrenci · {project.questions.length} soru
+              </p>
+            </div>
+            <div>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={startMutation.isPending || scoringJobActive}
+                onClick={() => void handleStart(false)}
+                style={{ padding: "0.75rem 1.5rem", fontSize: "0.95rem" }}
+              >
+                <Sparkles size={18} /> Puanlamayı Başlat
+              </button>
+            </div>
+          </div>
+        )
       )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem', marginBottom: '1.5rem' }}>
-        <div style={{ background: 'white', border: '1px solid #e2e8f0', borderRadius: '1rem', padding: '1rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
-            <strong style={{ color: '#0f172a' }}>Notlandırma hazırlığı</strong>
-            <span style={{ color: scoringReady ? '#15803d' : '#b91c1c', fontWeight: 700 }}>{scoringReady ? 'Açık' : 'Kapalı'}</span>
-          </div>
-          <p style={{ margin: 0, color: '#475569', fontSize: '0.875rem' }}>{scoringStageLabel}</p>
-          <p style={{ margin: '0.35rem 0 0 0', color: '#64748b', fontSize: '0.8125rem' }}>
-            {packageStatusText}
-          </p>
-        </div>
-
         <div style={{ background: 'white', border: '1px solid #e2e8f0', borderRadius: '1rem', padding: '1rem' }}>
           <strong style={{ color: '#0f172a' }}>Sonuç özeti</strong>
           <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.75rem', flexWrap: 'wrap' }}>
@@ -418,7 +423,6 @@ export function ScoringPage() {
             </span>
           </div>
         </div>
-
         <div style={{ background: 'white', border: '1px solid #e2e8f0', borderRadius: '1rem', padding: '1rem' }}>
           <strong style={{ color: '#0f172a' }}>Model durumu</strong>
           <p style={{ margin: '0.5rem 0 0 0', color: '#475569', fontSize: '0.875rem' }}>
@@ -768,7 +772,7 @@ export function ScoringPage() {
       </div>
 
       <details style={{ marginTop: '1rem', padding: '1rem', borderRadius: '1rem', background: '#f8fafc', border: '1px solid #e2e8f0' }}>
-        <summary style={{ cursor: 'pointer', fontWeight: 700, color: '#475569' }}>Geliştirici özeti</summary>
+        <summary style={{ cursor: 'pointer', fontWeight: 700, color: '#475569' }}>Gelişmiş ayrıntılar</summary>
         <pre style={{ marginTop: '1rem', whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: '0.75rem', color: '#334155' }}>
           {JSON.stringify({
             scoringReady,

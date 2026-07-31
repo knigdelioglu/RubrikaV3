@@ -21,15 +21,18 @@ pub struct ProjectIdInput {
 
 #[tauri::command]
 pub async fn import_student_scan_pdf(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: ImportDocumentInput,
 ) -> Result<Document, AppError> {
-    document_service::import_document(
+    document_service::import_document_with_job(
         &state.project_store,
         state.pdf_service.as_ref(),
         &input.project_id,
         &input.source_path,
         crate::domain::document::DocumentRole::StudentScan,
+        Some((state.job_manager.as_ref(), &app)),
+        input.correlation_id,
     )
 }
 

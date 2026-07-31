@@ -312,6 +312,47 @@ fn print_doctor(report: &DoctorReport, json: bool) {
     println!("project_path={}", report.project_path);
     println!("project_file_exists={}", report.project_file_exists);
     println!("project_readable={}", report.project_readable);
+    println!(
+        "project_root_metadata_mismatch={}",
+        report.path_security.project_root_metadata_mismatch
+    );
+    println!(
+        "unsafe_document_path_count={}",
+        report.path_security.unsafe_document_path_count
+    );
+    println!(
+        "unresolved_legacy_document_path_count={}",
+        report.path_security.unresolved_legacy_document_path_count
+    );
+    println!(
+        "external_managed_document_path_count={}",
+        report.path_security.external_managed_document_path_count
+    );
+    println!(
+        "symlink_escape_count={}",
+        report.path_security.symlink_escape_count
+    );
+    println!("storage_revision={}", report.persistence.storage_revision);
+    println!(
+        "project_fingerprint_status={}",
+        report.persistence.project_fingerprint_status
+    );
+    println!(
+        "stale_job_result_count={}",
+        report.persistence.stale_job_result_count
+    );
+    println!(
+        "mutation_conflict_count={}",
+        report.persistence.mutation_conflict_count
+    );
+    println!(
+        "external_modification_detected={}",
+        report.persistence.external_modification_detected
+    );
+    println!(
+        "legacy_project_without_revision={}",
+        report.persistence.legacy_project_without_revision
+    );
     if let Some(project) = &report.project {
         println!("project_id={}", project.project_id);
         println!("project_name={}", project.project_name);
@@ -486,6 +527,58 @@ fn print_doctor(report: &DoctorReport, json: bool) {
         report.scoring_needs_review_count
     );
     println!("scoring_stale_count={}", report.scoring_stale_count);
+    println!(
+        "assessment_activity_count={}",
+        report.speaking.assessment_activity_count
+    );
+    println!(
+        "speaking_activity_count={}",
+        report.speaking.speaking_activity_count
+    );
+    println!(
+        "written_activity_count={}",
+        report.speaking.written_activity_count
+    );
+    println!(
+        "listening_activity_count={}",
+        report.speaking.listening_activity_count
+    );
+    println!(
+        "assessment_class_application_count={}",
+        report.speaking.assessment_class_application_count
+    );
+    println!(
+        "duplicate_activity_class_application_count={}",
+        report.speaking.duplicate_activity_class_application_count
+    );
+    println!(
+        "class_application_without_class_count={}",
+        report.speaking.class_application_without_class_count
+    );
+    println!(
+        "speaking_attempt_without_activity_count={}",
+        report.speaking.speaking_attempt_without_activity_count
+    );
+    println!(
+        "speaking_attempt_without_class_application_count={}",
+        report
+            .speaking
+            .speaking_attempt_without_class_application_count
+    );
+    println!(
+        "speaking_attempt_class_membership_mismatch_count={}",
+        report
+            .speaking
+            .speaking_attempt_class_membership_mismatch_count
+    );
+    println!(
+        "unresolved_legacy_speaking_record_count={}",
+        report.speaking.unresolved_legacy_speaking_record_count
+    );
+    println!(
+        "activity_application_workflow_mismatch_count={}",
+        report.speaking.activity_application_workflow_mismatch_count
+    );
     println!("job_count={}", report.job_summary.jobs.len());
     println!(
         "stale_job_count={}",
@@ -579,6 +672,13 @@ fn print_model(report: &ModelInspectReport) {
     println!("completion_probe_ok={}", report.completion_probe_ok);
     println!("started_by_app={}", report.started_by_app);
     println!("pid={:?}", report.model_managed_process_pid);
+    println!("managed_process_present={}", report.managed_process_present);
+    println!(
+        "process_identity_verification={}",
+        report.process_identity_verification
+    );
+    println!("active_lease_count={}", report.active_lease_count);
+    println!("draining_requested={}", report.draining_requested);
     println!("log_path={:?}", report.log_path);
     println!("can_start_from_app={}", report.can_start_from_app);
     println!("can_stop_from_app={}", report.can_stop_from_app);

@@ -232,7 +232,7 @@ test('approved OCR records keep the start action available for rerun', () => {
   assert.equal(hasApprovedStudentAnswerOcrRecords([baseRecord({ status: 'teacher_approved' })]), true);
   assert.equal(hasApprovedStudentAnswerOcrRecords([baseRecord({ status: 'succeeded' })]), false);
   assert.match(getStudentAnswerOcrRerunConfirmMessage(true), /onaylı/i);
-  assert.match(getStudentAnswerOcrRerunConfirmMessage(false), /silinip yeniden üretilecek/i);
+  assert.match(getStudentAnswerOcrRerunConfirmMessage(false), /mevcut sonuç korunacak/i);
 });
 
 test('crop template summary counts project questions only', () => {

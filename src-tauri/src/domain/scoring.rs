@@ -641,6 +641,10 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             root_path: "/tmp/project".into(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![Student {
                 id: "student-1".into(),
@@ -651,6 +655,8 @@ mod tests {
                 identity_ocr: None,
             }],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![StudentSubmission {
                 id: "submission-1".into(),
@@ -696,6 +702,7 @@ mod tests {
                 render_diagnostics: None,
                 ..Default::default()
             }],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: Some("doc-2".into()),
@@ -728,6 +735,9 @@ mod tests {
                     page_count: Some(2),
                     job_id: None,
                     error_message: None,
+                    active_generation_id: None,
+                    pending_generation_id: None,
+                    source_fingerprint: None,
                 }),
             }],
             questions: vec![Question {

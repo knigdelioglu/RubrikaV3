@@ -6,6 +6,7 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
+use crate::domain::assessment::AssessmentActivity;
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::job::JobKind;
 use crate::domain::model::{
@@ -13,6 +14,7 @@ use crate::domain::model::{
     SPEAKING_ASR_CLEANUP_PROFILE_ID, SPEAKING_RUBRIC_PROFILE_ID,
 };
 use crate::domain::project::Project;
+use crate::domain::school_class::SchoolClassStatus;
 use crate::domain::speaking::{
     default_speaking_scoring_policy, new_exam, SpeakingAttempt, SpeakingAttemptState,
     SpeakingConfidence, SpeakingCriterion, SpeakingCriterionRole, SpeakingCriterionScore,
@@ -21,6 +23,7 @@ use crate::domain::speaking::{
     SpeakingTranscriptCleanupStatus, SpeakingTranscriptSegment, SPEAKING_SCORING_POLICY_VERSION,
 };
 use crate::jobs::job_manager::JobManager;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::llama_server_gateway::LlamaServerGateway;
 use crate::services::model_gateway::ModelGateway;
 use crate::services::model_runtime_service::{
@@ -52,6 +55,59 @@ const FLUENCY_MIN_SAMPLE_RATIO_PERCENT: u64 = 60;
 const SPEAKING_RUNTIME_FINGERPRINT: &str =
     "gemma4-12b:text-only:mmproj-none:temperature-0:top-k-1:parallel-1:turbo3:v2";
 
+fn runtime_exam_from_activity(activity: &AssessmentActivity) -> SpeakingExam {
+    let configuration = activity.speaking_configuration.as_ref();
+    let exam_type = configuration
+        .map(|config| config.speaking_type.as_str())
+        .unwrap_or("prepared");
+    let parsed_type = if exam_type == "impromptu" {
+        SpeakingExamType::Impromptu
+    } else {
+        SpeakingExamType::Prepared
+    };
+    let mut exam = new_exam(
+        if activity.title.trim().is_empty() {
+            activity.display_title()
+        } else {
+            activity.title.clone()
+        },
+        vec![],
+        parsed_type,
+        configuration
+            .map(|config| config.task_text.clone())
+            .unwrap_or_default(),
+        configuration
+            .map(|config| config.target_duration_seconds)
+            .filter(|value| *value > 0)
+            .unwrap_or(180),
+        configuration
+            .map(|config| config.min_duration_seconds)
+            .filter(|value| *value > 0)
+            .unwrap_or(120),
+        configuration
+            .map(|config| config.max_duration_seconds)
+            .filter(|value| *value > 0)
+            .unwrap_or(240),
+    );
+    exam.id = activity.id.clone();
+    exam.assessment_activity_id = Some(activity.id.clone());
+    exam.assigned_class_ids.clear();
+    exam.class_id = None;
+    if let Some(config) = configuration {
+        exam.rubric_version = config.rubric_version.clone();
+        exam.scoring_policy_version = config.scoring_policy_version.clone();
+        exam.cleanup_prompt_version = config.cleanup_prompt_version.clone();
+        exam.evaluation_prompt_version = config.evaluation_prompt_version.clone();
+        exam.frozen_model_file_hash = config.frozen_model_file_hash.clone();
+    }
+    exam.attempts = activity
+        .class_applications
+        .iter()
+        .flat_map(|application| application.speaking_attempts.iter().cloned())
+        .collect();
+    exam
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartSpeakingExamOutput {
@@ -68,6 +124,15 @@ pub struct ToggleSpeakingCaptureOutput {
     pub accepted: bool,
     pub attempt_id: Option<String>,
     pub message: String,
+}
+
+pub struct SpeakingCaptureRequest<'a> {
+    pub project_id: &'a str,
+    pub exam_id: &'a str,
+    pub assessment_activity_id: Option<&'a str>,
+    pub class_application_id: Option<&'a str>,
+    pub student_id: &'a str,
+    pub action: &'a str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +224,7 @@ impl SpeakingExamService {
         project_id: &str,
         title: &str,
         assigned_class_ids: Vec<String>,
+        assessment_activity_id: Option<String>,
         exam_type: &str,
         task_text: &str,
         target_seconds: u32,
@@ -191,19 +257,26 @@ impl SpeakingExamService {
             ));
         }
 
-        let mut clean_assigned_ids = Vec::new();
-        for id in assigned_class_ids {
-            if !id.trim().is_empty() && !clean_assigned_ids.contains(&id) {
-                clean_assigned_ids.push(id);
-            }
-        }
-        if clean_assigned_ids.is_empty() {
+        let _ = assigned_class_ids;
+        let activity_id = assessment_activity_id
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                app_error(
+                    AppErrorCode::AssessmentActivityNotFound,
+                    "Konuşma sınavı artık yalnız merkezi sınav organizasyonundan açılabilir.",
+                    true,
+                    Some("Önce Sınav Organizasyonu ekranından bir konuşma sınavı oluşturun."),
+                    "Canonical speaking activity id is required for new production writes.",
+                )
+            })?;
+
+        if project_id.trim().is_empty() || title.trim().is_empty() || task_text.trim().is_empty() {
             return Err(app_error(
                 AppErrorCode::SpeakingEngineLaunchFailed,
-                "Konuşma sınavı için en az bir sınıf seçilmelidir.",
+                "Konuşma sınavı bilgileri eksik.",
                 true,
-                Some("Sınıf listesinden en az bir sınıf işaretleyin."),
-                "assigned_class_ids is empty.",
+                Some("Sınav adı ve konuşma konusu alanlarını doldurun."),
+                "project_id, title and task_text are required.",
             ));
         }
 
@@ -233,21 +306,51 @@ impl SpeakingExamService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
 
-        let active_classes: Vec<String> = project
-            .school_classes
+        let activity = project
+            .assessment_activities
             .iter()
-            .map(|sc| sc.id.clone())
-            .collect();
-        for class_id in &clean_assigned_ids {
-            if !active_classes.contains(class_id) {
-                return Err(app_error(
-                    AppErrorCode::SpeakingEngineLaunchFailed,
-                    "Seçilen sınıflardan biri projede bulunamadı.",
+            .find(|activity| activity.id == activity_id)
+            .cloned()
+            .ok_or_else(|| {
+                app_error(
+                    AppErrorCode::AssessmentActivityNotFound,
+                    "Konuşma sınavı organizasyonu bulunamadı.",
                     true,
-                    Some("Sınıf listesini kontrol edip tekrar seçin."),
-                    &format!("Class id {} not found in project.", class_id),
-                ));
-            }
+                    Some("Sınav Organizasyonu ekranından konuşma sınavını yeniden açın."),
+                    "assessment_activity_id not found.",
+                )
+            })?;
+        if !activity.is_speaking() {
+            return Err(app_error(
+                AppErrorCode::AssessmentInvalidInput,
+                "Bu etkinlik konuşma sınavı değil.",
+                true,
+                Some("Konuşma türündeki bir sınav seçin."),
+                "assessment_activity_id does not use speaking workflow.",
+            ));
+        }
+        let active_application_ids = activity
+            .class_applications
+            .iter()
+            .filter(|application| {
+                application.status != crate::domain::assessment::ClassApplicationStatus::Archived
+            })
+            .filter(|application| {
+                project.school_classes.iter().any(|school_class| {
+                    school_class.id == application.school_class_id
+                        && school_class.status == SchoolClassStatus::Active
+                })
+            })
+            .map(|application| application.id.clone())
+            .collect::<Vec<_>>();
+        if active_application_ids.is_empty() {
+            return Err(app_error(
+                AppErrorCode::AssessmentClassNotEligible,
+                "Konuşma sınavının aktif sınıf uygulaması bulunmuyor.",
+                true,
+                Some("Sınav organizasyonuna aktif bir sınıf uygulaması ekleyin."),
+                "No active class application for speaking activity.",
+            ));
         }
 
         let existing_exam_idx = if let Some(ref target_id) = exam_id {
@@ -256,8 +359,37 @@ impl SpeakingExamService {
                 .iter()
                 .position(|item| item.id == *target_id)
         } else {
-            None
+            project.speaking_exams.iter().position(|item| {
+                item.assessment_activity_id.as_deref() == Some(activity_id.as_str())
+            })
         };
+
+        let config = activity.speaking_configuration.clone();
+        let effective_title = if activity.title.trim().is_empty() {
+            title.trim().to_string()
+        } else {
+            activity.title.trim().to_string()
+        };
+        let effective_task = config
+            .as_ref()
+            .map(|item| item.task_text.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .unwrap_or_else(|| task_text.trim().to_string());
+        let effective_target = config
+            .as_ref()
+            .map(|item| item.target_duration_seconds)
+            .filter(|item| *item > 0)
+            .unwrap_or(target_seconds);
+        let effective_min = config
+            .as_ref()
+            .map(|item| item.min_duration_seconds)
+            .filter(|item| *item > 0)
+            .unwrap_or(minimum_seconds);
+        let effective_max = config
+            .as_ref()
+            .map(|item| item.max_duration_seconds)
+            .filter(|item| *item > 0)
+            .unwrap_or(maximum_seconds);
 
         if let Some(idx) = existing_exam_idx {
             let existing = &mut project.speaking_exams[idx];
@@ -280,7 +412,11 @@ impl SpeakingExamService {
                         .map(|sc| sc.id.clone());
 
                     if let Some(c_id) = student_class_id {
-                        if !clean_assigned_ids.contains(&c_id) {
+                        if !activity
+                            .class_applications
+                            .iter()
+                            .any(|application| application.school_class_id == c_id)
+                        {
                             return Err(app_error(
                                 AppErrorCode::SpeakingEngineLaunchFailed,
                                 "Bu sınıfta öğrenci kayıtları bulunmaktadır. Sınıf ataması kaldırılamaz.",
@@ -292,9 +428,9 @@ impl SpeakingExamService {
                     }
                 }
 
-                if existing.min_duration_seconds != minimum_seconds
-                    || existing.max_duration_seconds != maximum_seconds
-                    || existing.task_text != task_text.trim()
+                if existing.min_duration_seconds != effective_min
+                    || existing.max_duration_seconds != effective_max
+                    || existing.task_text != effective_task
                     || existing.exam_type != parsed_exam_type
                 {
                     return Err(app_error(
@@ -307,16 +443,19 @@ impl SpeakingExamService {
                 }
             }
 
-            existing.title = title.trim().to_string();
-            existing.assigned_class_ids = clean_assigned_ids.clone();
-            existing.class_id = clean_assigned_ids.first().cloned();
-            existing.target_duration_seconds = target_seconds;
-            existing.min_duration_seconds = minimum_seconds;
-            existing.max_duration_seconds = maximum_seconds;
+            existing.assessment_activity_id = Some(activity.id.clone());
+            existing.title = effective_title;
+            existing.assigned_class_ids.clear();
+            existing.class_id = None;
+            existing.target_duration_seconds = effective_target;
+            existing.min_duration_seconds = effective_min;
+            existing.max_duration_seconds = effective_max;
             existing.updated_at = Utc::now().to_rfc3339();
 
             let target_exam_id = existing.id.clone();
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
 
             Ok(StartSpeakingExamOutput {
                 started: true,
@@ -326,18 +465,24 @@ impl SpeakingExamService {
                     .to_string(),
             })
         } else {
-            let exam = new_exam(
-                title.trim().to_string(),
-                clean_assigned_ids,
+            let mut exam = new_exam(
+                effective_title,
+                vec![],
                 parsed_exam_type,
-                task_text.trim().to_string(),
-                target_seconds,
-                minimum_seconds,
-                maximum_seconds,
+                effective_task,
+                effective_target,
+                effective_min,
+                effective_max,
             );
+            exam.id = activity.id.clone();
+            exam.assessment_activity_id = Some(activity.id.clone());
+            exam.assigned_class_ids.clear();
+            exam.class_id = None;
             let created_exam_id = exam.id.clone();
             project.speaking_exams.push(exam);
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
 
             Ok(StartSpeakingExamOutput {
                 started: true,
@@ -352,11 +497,16 @@ impl SpeakingExamService {
     pub async fn toggle_capture(
         &self,
         app: tauri::AppHandle<impl tauri::Runtime>,
-        project_id: &str,
-        exam_id: &str,
-        student_id: &str,
-        action: &str,
+        request: SpeakingCaptureRequest<'_>,
     ) -> Result<ToggleSpeakingCaptureOutput, AppError> {
+        let SpeakingCaptureRequest {
+            project_id,
+            exam_id,
+            assessment_activity_id,
+            class_application_id,
+            student_id,
+            action,
+        } = request;
         if !matches!(action, "start" | "pause" | "resume" | "stop" | "cancel") {
             return Err(app_error(
                 AppErrorCode::SpeakingEngineLaunchFailed,
@@ -369,10 +519,71 @@ impl SpeakingExamService {
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
+        let resolved_activity_id = assessment_activity_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                project
+                    .speaking_exams
+                    .iter()
+                    .find(|exam| exam.id == exam_id)
+                    .and_then(|exam| exam.assessment_activity_id.clone())
+            });
+        let activity = resolved_activity_id.as_ref().and_then(|activity_id| {
+            project
+                .assessment_activities
+                .iter()
+                .find(|activity| activity.id == *activity_id)
+                .cloned()
+        });
+        let application = match (activity.as_ref(), class_application_id) {
+            (Some(activity), Some(application_id)) => activity
+                .class_applications
+                .iter()
+                .find(|application| application.id == application_id)
+                .cloned(),
+            _ => None,
+        };
+        if resolved_activity_id.is_some() && application.is_none() {
+            return Err(app_error(
+                AppErrorCode::AssessmentClassApplicationNotFound,
+                "Konuşma kaydı için geçerli sınıf uygulaması seçilmedi.",
+                true,
+                Some("Sınavın bağlı sınıflarından birini seçin."),
+                "Canonical speaking capture requires activity and class application.",
+            ));
+        }
+        if application.as_ref().is_some_and(|application| {
+            application.status == crate::domain::assessment::ClassApplicationStatus::Archived
+        }) {
+            return Err(app_error(
+                AppErrorCode::AssessmentClassNotEligible,
+                "Arşivlenmiş sınıf uygulamasında yeni konuşma kaydı başlatılamaz.",
+                true,
+                Some("Aktif bir sınıf uygulaması seçin."),
+                "Archived class application cannot start a new speaking attempt.",
+            ));
+        }
+        if let Some(activity) = activity.as_ref() {
+            let has_runtime_record = project.speaking_exams.iter().any(|exam| {
+                exam.id == activity.id
+                    || exam.assessment_activity_id.as_deref() == Some(activity.id.as_str())
+            });
+            if !has_runtime_record {
+                project
+                    .speaking_exams
+                    .push(runtime_exam_from_activity(activity));
+            }
+        }
         let exam = project
             .speaking_exams
             .iter()
-            .find(|exam| exam.id == exam_id)
+            .find(|exam| {
+                exam.id == exam_id
+                    || resolved_activity_id.as_deref().is_some_and(|activity_id| {
+                        exam.assessment_activity_id.as_deref() == Some(activity_id)
+                    })
+            })
             .cloned()
             .ok_or_else(|| {
                 app_error(
@@ -384,7 +595,14 @@ impl SpeakingExamService {
                 )
             })?;
 
-        let assigned_classes = exam.assigned_class_ids();
+        let canonical_class_id = application
+            .as_ref()
+            .map(|application| application.school_class_id.clone());
+        let assigned_classes = if let Some(class_id) = canonical_class_id.clone() {
+            vec![class_id]
+        } else {
+            exam.assigned_class_ids()
+        };
         if assigned_classes.is_empty() {
             return Err(app_error(
                 AppErrorCode::SpeakingEngineLaunchFailed,
@@ -487,7 +705,9 @@ impl SpeakingExamService {
             }
             exam_mut.active_student_id = Some(student_id.to_string());
             exam_mut.updated_at = Utc::now().to_rfc3339();
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
             return Ok(ToggleSpeakingCaptureOutput {
                 action: action.to_string(),
                 accepted: true,
@@ -558,6 +778,9 @@ impl SpeakingExamService {
                 })?;
             let attempt = SpeakingAttempt {
                 id: Uuid::new_v4().to_string(),
+                assessment_activity_id: resolved_activity_id.clone(),
+                class_application_id: class_application_id.map(str::to_string),
+                school_class_id: canonical_class_id.clone(),
                 exam_id: exam.id.clone(),
                 student_id: student_id.to_string(),
                 attempt_number: exam
@@ -600,6 +823,9 @@ impl SpeakingExamService {
                 model_id: "Whisper → Gemma 4 12B".to_string(),
                 prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
                 rubric_version: exam.rubric_version.clone(),
+                speaking_config_snapshot: activity
+                    .as_ref()
+                    .and_then(|item| item.speaking_configuration.clone()),
             };
             let attempt_id = attempt.id.clone();
             let exam_mut = project
@@ -618,7 +844,7 @@ impl SpeakingExamService {
             exam_mut.attempts.push(attempt);
             exam_mut.active_student_id = Some(student_id.to_string());
             exam_mut.updated_at = Utc::now().to_rfc3339();
-            if let Err(error) = self.project_store.save_project(&project) {
+            if let Err(error) = self.project_store.commit_snapshot_cas(&project).map(|_| ()) {
                 self.engine.fail();
                 return Err(error);
             }
@@ -669,7 +895,9 @@ impl SpeakingExamService {
         attempt.ended_at = Some(Utc::now().to_rfc3339());
         exam_mut.active_student_id = Some(student_id.to_string());
         exam_mut.updated_at = Utc::now().to_rfc3339();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         let service = self.clone();
         let project_id_owned = project_id.to_string();
         let exam_id_owned = exam_id.to_string();
@@ -746,7 +974,20 @@ impl SpeakingExamService {
             .join("audio-original.wav")
             .to_string_lossy()
             .to_string();
-        let artifact_dir = PathBuf::from(&project.root_path).join(&relative_dir);
+        let artifact_dir =
+            match speaking_artifact_dir(&self.project_store, &project_id, &attempt_id) {
+                Ok(path) => path,
+                Err(error) => {
+                    self.save_engine_failure(
+                        &project_id,
+                        &exam_id,
+                        &attempt_id,
+                        &error.to_string(),
+                    );
+                    self.engine.fail();
+                    return;
+                }
+            };
         let audio_path = artifact_dir.join("audio-original.wav");
         if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
             self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
@@ -848,7 +1089,7 @@ impl SpeakingExamService {
             reconcile_speaking_scores(&exam, &attempt.metrics, vec![]).scores;
         attempt.evaluation_error = None;
         attempt.state = SpeakingAttemptState::Finalizing;
-        if let Err(error) = self.project_store.save_project(&project) {
+        if let Err(error) = self.project_store.commit_snapshot_cas(&project).map(|_| ()) {
             remove_uncommitted_speaking_audio(&project.root_path, &relative_audio_path);
             log::error!("Konuşma sonucu kaydedilemedi: {error}");
             return;
@@ -880,7 +1121,7 @@ impl SpeakingExamService {
                         .to_string(),
                 );
                 attempt.model_id = "Speakoflow Embedded Whisper".to_string();
-                let _ = self.project_store.save_project(&project);
+                let _ = self.project_store.commit_snapshot_cas(&project);
             }
         }
         log::error!("Speakoflow engine failure for attempt {attempt_id}: {details}");
@@ -947,7 +1188,9 @@ impl SpeakingExamService {
         }
         attempt_mut.criterion_scores =
             reconcile_speaking_scores(&exam, &attempt_mut.metrics, vec![]).scores;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         let job = match self.job_manager.start_job(
             &app,
@@ -965,7 +1208,9 @@ impl SpeakingExamService {
                 let recovery_attempt = find_exam_attempt_mut(&mut recovery, exam_id, attempt_id)?;
                 recovery_attempt.state = SpeakingAttemptState::TeacherReview;
                 recovery_attempt.evaluation_error = Some(error.message.clone());
-                self.project_store.save_project(&recovery)?;
+                self.project_store
+                    .commit_snapshot_cas(&recovery)
+                    .map(|_| ())?;
                 let (_, recovered_attempt) = find_exam_attempt(&recovery, exam_id, attempt_id)?;
                 return Ok(SpeakingAttemptSyncOutput {
                     ready: true,
@@ -978,7 +1223,9 @@ impl SpeakingExamService {
             .get_project_snapshot(project_id.to_string())?;
         let attempt_mut = find_exam_attempt_mut(&mut project, exam_id, attempt_id)?;
         attempt_mut.evaluation_job_id = Some(job.id.clone());
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         let service = self.clone();
         let app_for_job = app.clone();
         let project_id_owned = project_id.to_string();
@@ -1008,15 +1255,43 @@ impl SpeakingExamService {
         })
     }
 
-    pub fn get_exam(&self, project_id: &str, exam_id: &str) -> Result<SpeakingExam, AppError> {
+    pub fn get_exam(
+        &self,
+        project_id: &str,
+        exam_id: &str,
+        assessment_activity_id: Option<&str>,
+        class_application_id: Option<&str>,
+    ) -> Result<SpeakingExam, AppError> {
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
+        let resolved_activity_id = assessment_activity_id
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                project
+                    .speaking_exams
+                    .iter()
+                    .find(|exam| exam.id == exam_id)
+                    .and_then(|exam| exam.assessment_activity_id.clone())
+            });
+        let activity = resolved_activity_id.as_deref().and_then(|activity_id| {
+            project
+                .assessment_activities
+                .iter()
+                .find(|activity| activity.id == activity_id)
+                .cloned()
+        });
         let mut changed = false;
         let approved_audio_paths = project
             .speaking_exams
             .iter()
-            .find(|exam| exam.id == exam_id)
+            .find(|exam| {
+                exam.id == exam_id
+                    || resolved_activity_id.as_deref().is_some_and(|activity_id| {
+                        exam.assessment_activity_id.as_deref() == Some(activity_id)
+                    })
+            })
             .map(|exam| {
                 exam.attempts
                     .iter()
@@ -1046,11 +1321,12 @@ impl SpeakingExamService {
             }
         }
         if !self.runtime_status().active_session {
-            if let Some(exam) = project
-                .speaking_exams
-                .iter_mut()
-                .find(|exam| exam.id == exam_id)
-            {
+            if let Some(exam) = project.speaking_exams.iter_mut().find(|exam| {
+                exam.id == exam_id
+                    || resolved_activity_id.as_deref().is_some_and(|activity_id| {
+                        exam.assessment_activity_id.as_deref() == Some(activity_id)
+                    })
+            }) {
                 for attempt in &mut exam.attempts {
                     if matches!(
                         attempt.state,
@@ -1117,20 +1393,38 @@ impl SpeakingExamService {
             }
         }
         if changed {
-            self.project_store.save_project(&project)?;
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
         }
-        project
+        let mut result = project
             .speaking_exams
             .into_iter()
-            .find(|exam| exam.id == exam_id)
-            .ok_or_else(|| speaking_not_found("Konuşma sınavı"))
+            .find(|exam| {
+                exam.id == exam_id
+                    || resolved_activity_id.as_deref().is_some_and(|activity_id| {
+                        exam.assessment_activity_id.as_deref() == Some(activity_id)
+                    })
+            })
+            .or_else(|| activity.as_ref().map(runtime_exam_from_activity))
+            .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
+        if let Some(application_id) = class_application_id.filter(|value| !value.trim().is_empty())
+        {
+            result
+                .attempts
+                .retain(|attempt| attempt.class_application_id.as_deref() == Some(application_id));
+            result.active_class_application_id = Some(application_id.to_string());
+        }
+        Ok(result)
     }
 
     pub fn select_exam_class(
         &self,
         project_id: &str,
         exam_id: &str,
-        class_id: &str,
+        assessment_activity_id: Option<&str>,
+        class_application_id: Option<&str>,
+        legacy_class_id: Option<&str>,
     ) -> Result<SpeakingExam, AppError> {
         if self.runtime_status().active_session {
             return Err(app_error(
@@ -1144,6 +1438,100 @@ impl SpeakingExamService {
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
+        let resolved_activity_id = assessment_activity_id
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                project
+                    .speaking_exams
+                    .iter()
+                    .find(|exam| exam.id == exam_id)
+                    .and_then(|exam| exam.assessment_activity_id.as_deref())
+            });
+        if let (Some(activity_id), Some(application_id)) =
+            (resolved_activity_id, class_application_id)
+        {
+            let activity = project
+                .assessment_activities
+                .iter()
+                .find(|activity| activity.id == activity_id)
+                .cloned()
+                .ok_or_else(|| speaking_not_found("Konuşma sınavı organizasyonu"))?;
+            let application = activity
+                .class_applications
+                .iter()
+                .find(|application| application.id == application_id)
+                .cloned()
+                .ok_or_else(|| {
+                    app_error(
+                        AppErrorCode::AssessmentClassApplicationNotFound,
+                        "Seçilen sınıf uygulaması bu sınava bağlı değil.",
+                        true,
+                        Some("Yalnızca bu sınavın sınıf uygulamalarından birini seçin."),
+                        "class_application_id is not owned by assessment activity.",
+                    )
+                })?;
+            if application.status == crate::domain::assessment::ClassApplicationStatus::Archived {
+                return Err(app_error(
+                    AppErrorCode::AssessmentClassNotEligible,
+                    "Arşivlenmiş sınıf uygulaması seçilemez.",
+                    true,
+                    Some("Aktif bir sınıf uygulaması seçin."),
+                    "Archived class application cannot be selected for speaking execution.",
+                ));
+            }
+            let students = students_for_class(&project, &application.school_class_id)?;
+            if students.is_empty() {
+                return Err(app_error(
+                    AppErrorCode::SpeakingEngineLaunchFailed,
+                    "Seçilen sınıfta öğrenci bulunmuyor.",
+                    true,
+                    Some("Sınıfa öğrenci ekleyip tekrar deneyin."),
+                    "Selected canonical speaking class has no students.",
+                ));
+            }
+            if !project.school_classes.iter().any(|school_class| {
+                school_class.id == application.school_class_id
+                    && school_class.status == SchoolClassStatus::Active
+            }) {
+                return Err(app_error(
+                    AppErrorCode::AssessmentClassNotEligible,
+                    "Pasif sınıf yeni konuşma yürütmesine seçilemez.",
+                    true,
+                    Some("Aktif bir sınıf uygulaması seçin."),
+                    "Archived school class cannot be selected for new speaking execution.",
+                ));
+            }
+            if !project.speaking_exams.iter().any(|exam| exam.id == exam_id) {
+                project
+                    .speaking_exams
+                    .push(runtime_exam_from_activity(&activity));
+            }
+            let exam = project
+                .speaking_exams
+                .iter_mut()
+                .find(|exam| exam.id == exam_id)
+                .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
+            exam.assessment_activity_id = Some(activity.id.clone());
+            exam.assigned_class_ids.clear();
+            exam.class_id = None;
+            exam.active_class_application_id = Some(application.id.clone());
+            exam.active_student_id = students.first().map(|student| student.id.clone());
+            exam.updated_at = Utc::now().to_rfc3339();
+            let updated = exam.clone();
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
+            return Ok(updated);
+        }
+        let class_id = legacy_class_id.ok_or_else(|| {
+            app_error(
+                AppErrorCode::AssessmentClassApplicationNotFound,
+                "Konuşma yürütmesi için sınıf uygulaması seçilmedi.",
+                true,
+                Some("Sınavın bağlı sınıf uygulamalarından birini seçin."),
+                "Canonical speaking class selection requires class_application_id.",
+            )
+        })?;
         let students = students_for_class(&project, class_id)?;
         if students.is_empty() {
             return Err(app_error(
@@ -1172,7 +1560,9 @@ impl SpeakingExamService {
         exam.active_student_id = students.first().map(|student| student.id.clone());
         exam.updated_at = Utc::now().to_rfc3339();
         let updated = exam.clone();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -1180,22 +1570,74 @@ impl SpeakingExamService {
         &self,
         project_id: &str,
         exam_id: &str,
+        assessment_activity_id: Option<&str>,
+        class_application_id: Option<&str>,
         student_id: &str,
     ) -> Result<SpeakingExam, AppError> {
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
+        if let Some(activity_id) = assessment_activity_id.filter(|value| !value.trim().is_empty()) {
+            if !project.speaking_exams.iter().any(|exam| exam.id == exam_id) {
+                let activity = project
+                    .assessment_activities
+                    .iter()
+                    .find(|activity| activity.id == activity_id)
+                    .cloned()
+                    .ok_or_else(|| speaking_not_found("Konuşma sınavı organizasyonu"))?;
+                project
+                    .speaking_exams
+                    .push(runtime_exam_from_activity(&activity));
+            }
+        }
         let exam_ref = project
             .speaking_exams
             .iter()
             .find(|exam| exam.id == exam_id)
             .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
-        let assigned_class_ids = exam_ref.assigned_class_ids();
-        let is_valid = assigned_class_ids.iter().any(|c_id| {
-            students_for_class(&project, c_id)
-                .map(|list| list.iter().any(|student| student.id == student_id))
-                .unwrap_or(false)
-        });
+        let is_valid = if let Some(application_id) = class_application_id {
+            let activity_id = assessment_activity_id
+                .or(exam_ref.assessment_activity_id.as_deref())
+                .ok_or_else(|| speaking_not_found("Konuşma sınavı organizasyonu"))?;
+            let application = project
+                .assessment_activities
+                .iter()
+                .find(|activity| activity.id == activity_id)
+                .and_then(|activity| {
+                    activity
+                        .class_applications
+                        .iter()
+                        .find(|application| application.id == application_id)
+                })
+                .ok_or_else(|| {
+                    app_error(
+                        AppErrorCode::AssessmentClassApplicationNotFound,
+                        "Öğrenci seçimi geçerli sınıf uygulamasına bağlı değil.",
+                        true,
+                        Some("Sınavın bağlı sınıf uygulamasından birini seçin."),
+                        "student selection references an unrelated class application.",
+                    )
+                })?;
+            if application.status == crate::domain::assessment::ClassApplicationStatus::Archived {
+                return Err(app_error(
+                    AppErrorCode::AssessmentClassNotEligible,
+                    "Arşivlenmiş sınıf uygulamasında öğrenci seçilemez.",
+                    true,
+                    Some("Aktif bir sınıf uygulaması seçin."),
+                    "Archived class application cannot select a student.",
+                ));
+            }
+            students_for_class(&project, &application.school_class_id)?
+                .iter()
+                .any(|student| student.id == student_id)
+        } else {
+            let assigned_class_ids = exam_ref.assigned_class_ids();
+            assigned_class_ids.iter().any(|c_id| {
+                students_for_class(&project, c_id)
+                    .map(|list| list.iter().any(|student| student.id == student_id))
+                    .unwrap_or(false)
+            })
+        };
         if !is_valid {
             return Err(app_error(
                 AppErrorCode::SpeakingEngineLaunchFailed,
@@ -1211,9 +1653,14 @@ impl SpeakingExamService {
             .find(|exam| exam.id == exam_id)
             .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
         exam.active_student_id = Some(student_id.to_string());
+        if let Some(application_id) = class_application_id {
+            exam.active_class_application_id = Some(application_id.to_string());
+        }
         exam.updated_at = Utc::now().to_rfc3339();
         let updated = exam.clone();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -1265,7 +1712,9 @@ impl SpeakingExamService {
         criterion.teacher_score = Some(score);
         criterion.teacher_level = None;
         criterion.teacher_note = note;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         let (_, updated) = find_exam_attempt(&project, exam_id, attempt_id)?;
         Ok(updated)
     }
@@ -1320,7 +1769,9 @@ impl SpeakingExamService {
         criterion.teacher_level = Some(level);
         criterion.teacher_score = Some(score);
         criterion.teacher_note = note;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         let (_, updated) = find_exam_attempt(&project, exam_id, attempt_id)?;
         Ok(updated)
     }
@@ -1340,7 +1791,9 @@ impl SpeakingExamService {
             let trimmed = note.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         let (_, updated) = find_exam_attempt(&project, exam_id, attempt_id)?;
         Ok(updated)
     }
@@ -1398,7 +1851,9 @@ impl SpeakingExamService {
         attempt.teacher_approved_at = Some(Utc::now().to_rfc3339());
         attempt.state = SpeakingAttemptState::Approved;
         let audio_path = attempt.audio_path.clone();
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         if let Some(relative_audio_path) = audio_path {
             permanently_delete_speaking_audio(&project_root, &relative_audio_path)?;
             let mut cleared_project = self
@@ -1406,7 +1861,9 @@ impl SpeakingExamService {
                 .get_project_snapshot(project_id.to_string())?;
             let cleared_attempt = find_exam_attempt_mut(&mut cleared_project, exam_id, attempt_id)?;
             cleared_attempt.audio_path = None;
-            self.project_store.save_project(&cleared_project)?;
+            self.project_store
+                .commit_snapshot_cas(&cleared_project)
+                .map(|_| ())?;
             let (_, updated) = find_exam_attempt(&cleared_project, exam_id, attempt_id)?;
             return Ok(updated);
         }
@@ -1451,7 +1908,7 @@ impl SpeakingExamService {
                                 reconcile_speaking_scores(exam, &attempt.metrics, vec![]).scores;
                         }
                     }
-                    let _ = self.project_store.save_project(&project);
+                    let _ = self.project_store.commit_snapshot_cas(&project);
                 }
             }
             let _ = self.job_manager.fail(&app, &job_id, error);
@@ -1467,6 +1924,19 @@ impl SpeakingExamService {
         job_id: &str,
     ) -> Result<(), AppError> {
         self.job_manager.set_running(app, job_id)?;
+        let cancel_token = self.job_manager.get_cancellation_token(job_id);
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(app, job_id);
+                return Err(app_error(
+                    AppErrorCode::JobCancelled,
+                    "Konuşma değerlendirme işlemi iptal edildi.",
+                    true,
+                    None,
+                    "",
+                ));
+            }
+        }
         self.job_manager.update_progress(
             app,
             job_id,
@@ -1513,15 +1983,34 @@ impl SpeakingExamService {
             )?;
             return Ok(());
         }
-        self.model_runtime_service
-            .ensure_ready(
+
+        let cancel_token = self.job_manager.get_cancellation_token(job_id);
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(app, job_id);
+                return Err(app_error(
+                    AppErrorCode::JobCancelled,
+                    "Konuşma değerlendirme işlemi iptal edildi.",
+                    true,
+                    None,
+                    "",
+                ));
+            }
+        }
+
+        let _runtime_lease = self
+            .model_runtime_service
+            .acquire_runtime(
                 Some(SPEAKING_RUBRIC_PROFILE_ID),
-                ModelRuntimeRequest {
+                &ModelRuntimeRequest {
                     use_case: ModelUseCase::GeneralText,
                     capability: ModelCapability::Text,
                     requires_mmproj: false,
                     timeout_seconds: 60,
                 },
+                "speaking_exam",
+                Some(job_id),
             )
             .await
             .map_err(|error| {
@@ -1576,10 +2065,20 @@ impl SpeakingExamService {
                 return Err(error);
             }
         };
-        let artifact_dir = PathBuf::from(&project.root_path)
-            .join("artifacts")
-            .join("speaking-exams")
-            .join(attempt_id);
+
+        if let Some(ref token) = cancel_token {
+            if token.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(app, job_id);
+                return Err(app_error(
+                    AppErrorCode::JobCancelled,
+                    "Konuşma değerlendirme işlemi iptal edildi.",
+                    true,
+                    None,
+                    "",
+                ));
+            }
+        }
+        let artifact_dir = speaking_artifact_dir(&self.project_store, project_id, attempt_id)?;
         if let Err(error) = write_artifact_json(
             &artifact_dir.join("transcript-cleanup.json"),
             &json!({
@@ -1638,7 +2137,9 @@ impl SpeakingExamService {
         attempt_mut.transcript_cleanup.diagnostics = Some(cleanup_result.diagnostics.clone());
         attempt_mut.transcript_cleanup.failure_reason = None;
         attempt_mut.state = SpeakingAttemptState::Evaluating;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         self.job_manager.update_progress(
             app,
             job_id,
@@ -1647,26 +2148,6 @@ impl SpeakingExamService {
             "Düzeltilmiş transkript doğrulandı; aynı Gemma 4 12B runtime rubriğe geçiyor."
                 .to_string(),
         )?;
-        self.model_runtime_service
-            .ensure_ready(
-                Some(SPEAKING_RUBRIC_PROFILE_ID),
-                ModelRuntimeRequest {
-                    use_case: ModelUseCase::Scoring,
-                    capability: ModelCapability::Text,
-                    requires_mmproj: false,
-                    timeout_seconds: 240,
-                },
-            )
-            .await
-            .map_err(|error| {
-                app_error(
-                    AppErrorCode::SpeakingEvaluationFailed,
-                    "Gemma 4 12B rubrik değerlendirme motoru başlatılamadı.",
-                    true,
-                    Some("Model ayarlarını kontrol edip tekrar deneyin."),
-                    &error.to_string(),
-                )
-            })?;
         let rubric_profile = self
             .model_runtime_service
             .get_profile(SPEAKING_RUBRIC_PROFILE_ID)?;
@@ -1735,15 +2216,7 @@ impl SpeakingExamService {
             }
         };
 
-        let _ = self
-            .model_runtime_service
-            .stop_server(Some(SPEAKING_RUBRIC_PROFILE_ID))
-            .await;
-
-        let artifact_dir = PathBuf::from(&project.root_path)
-            .join("artifacts")
-            .join("speaking-exams")
-            .join(attempt_id);
+        let artifact_dir = speaking_artifact_dir(&self.project_store, project_id, attempt_id)?;
 
         let result = match result {
             Ok(res) => {
@@ -1842,7 +2315,9 @@ impl SpeakingExamService {
         } else {
             attempt_mut.evaluation_error = None;
         }
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         if !reconciliation.scoring_applied
             || reconciliation.matched_count < reconciliation.expected_ai_count
         {
@@ -1881,11 +2356,10 @@ impl SpeakingExamService {
             .project_store
             .get_project_snapshot(project_id.to_string())
         {
-            let artifact_dir = PathBuf::from(&project.root_path)
-                .join("artifacts")
-                .join("speaking-exams")
-                .join(attempt_id);
-            let _ = std::fs::create_dir_all(&artifact_dir);
+            let artifact_dir = speaking_artifact_dir(&self.project_store, project_id, attempt_id);
+            let Ok(artifact_dir) = artifact_dir else {
+                return;
+            };
             let _ = write_artifact_json(
                 &artifact_dir.join("transcript-cleanup-error.json"),
                 &json!({
@@ -1902,7 +2376,7 @@ impl SpeakingExamService {
                 attempt.transcript_for_scoring = None;
                 attempt.cleanup_candidate = None;
                 attempt.state = SpeakingAttemptState::TeacherReview;
-                let _ = self.project_store.save_project(&project);
+                let _ = self.project_store.commit_snapshot_cas(&project);
             }
         }
     }
@@ -2940,18 +3414,21 @@ fn permanently_delete_speaking_audio(
     project_root: &str,
     relative_audio_path: &str,
 ) -> Result<(), AppError> {
-    let relative = std::path::Path::new(relative_audio_path);
-    let safe_relative = !relative.is_absolute()
-        && relative.components().all(|component| {
-            matches!(
-                component,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
-        && relative
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"));
-    if !safe_relative {
+    let trusted_root = TrustedProjectRoot::from_canonical_root(PathBuf::from(project_root), false)?;
+    let managed = trusted_root.managed(relative_audio_path).map_err(|_| {
+        app_error(
+            AppErrorCode::PermissionDenied,
+            "Öğrenci ses kaydı güvenli biçimde silinemedi.",
+            false,
+            Some("Tanılama kaydını inceleyin."),
+            "Unsafe speaking audio path rejected.",
+        )
+    })?;
+    if !managed
+        .as_path()
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
         return Err(app_error(
             AppErrorCode::PermissionDenied,
             "Öğrenci ses kaydı güvenli biçimde silinemedi.",
@@ -2960,7 +3437,7 @@ fn permanently_delete_speaking_audio(
             "Unsafe speaking audio path rejected.",
         ));
     }
-    let target = std::path::Path::new(project_root).join(relative);
+    let target = trusted_root.root().join(managed.as_path());
     if !target.exists() {
         return Ok(());
     }
@@ -2982,15 +3459,17 @@ fn permanently_delete_speaking_audio(
             "Speaking audio target is not a regular file.",
         ));
     }
-    std::fs::remove_file(&target).map_err(|error| {
-        app_error(
-            AppErrorCode::FileWriteFailed,
-            "Puan kaydedildi ancak öğrenci ses kaydı silinemedi.",
-            true,
-            Some("Disk iznini kontrol edip öğrenci onayını yeniden açın."),
-            &error.to_string(),
-        )
-    })
+    crate::platform::file_access::remove_file_within(trusted_root.root(), &target)
+        .map(|_| ())
+        .map_err(|error| {
+            app_error(
+                AppErrorCode::FileWriteFailed,
+                "Puan kaydedildi ancak öğrenci ses kaydı silinemedi.",
+                true,
+                Some("Disk iznini kontrol edip öğrenci onayını yeniden açın."),
+                &error.to_string(),
+            )
+        })
 }
 
 fn remove_uncommitted_speaking_audio(project_root: &str, relative_audio_path: &str) {
@@ -3246,7 +3725,7 @@ fn find_exam_attempt(
     let exam = project
         .speaking_exams
         .iter()
-        .find(|exam| exam.id == exam_id)
+        .find(|exam| exam.id == exam_id || exam.assessment_activity_id.as_deref() == Some(exam_id))
         .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
     let attempt = exam
         .attempts
@@ -3264,7 +3743,7 @@ fn find_exam_attempt_mut<'a>(
     let exam = project
         .speaking_exams
         .iter_mut()
-        .find(|exam| exam.id == exam_id)
+        .find(|exam| exam.id == exam_id || exam.assessment_activity_id.as_deref() == Some(exam_id))
         .ok_or_else(|| speaking_not_found("Konuşma sınavı"))?;
     let attempt = exam
         .attempts
@@ -3299,6 +3778,18 @@ fn app_error(
         technical_details: Some(technical_details.to_string()),
         correlation_id: Uuid::new_v4().to_string(),
     }
+}
+
+fn speaking_artifact_dir(
+    project_store: &ProjectStore,
+    project_id: &str,
+    attempt_id: &str,
+) -> Result<PathBuf, AppError> {
+    let trusted_root = project_store.trusted_project_root(project_id)?;
+    let managed = trusted_root.managed(&format!("artifacts/speaking-exams/{attempt_id}"))?;
+    let directory = trusted_root.root().join(managed.as_path());
+    trusted_root.ensure_managed_directory(&directory)?;
+    Ok(directory)
 }
 
 fn write_artifact_json<T: serde::Serialize>(
@@ -3369,6 +3860,9 @@ mod tests {
         );
         let attempt = SpeakingAttempt {
             id: "attempt".to_string(),
+            assessment_activity_id: None,
+            class_application_id: None,
+            school_class_id: None,
             exam_id: exam.id.clone(),
             student_id: "student".to_string(),
             attempt_number: 1,
@@ -3406,6 +3900,7 @@ mod tests {
             model_id: String::new(),
             prompt_version: String::new(),
             rubric_version: exam.rubric_version.clone(),
+            speaking_config_snapshot: None,
         };
         let verified_segments = vec![SpeakingTranscriptSegment {
             segment_id: "segment-1".to_string(),
@@ -3637,6 +4132,7 @@ mod tests {
     fn test_exam() -> SpeakingExam {
         SpeakingExam {
             id: "e1".to_string(),
+            assessment_activity_id: None,
             title: String::new(),
             class_id: None,
             assigned_class_ids: vec![],
@@ -3658,6 +4154,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             active_student_id: None,
+            active_class_application_id: None,
             completed_at: None,
             attempts: vec![],
         }
@@ -4143,6 +4640,9 @@ mod tests {
         );
         let mut attempt = SpeakingAttempt {
             id: "attempt".to_string(),
+            assessment_activity_id: None,
+            class_application_id: None,
+            school_class_id: None,
             exam_id: exam.id.clone(),
             student_id: "anonymous".to_string(),
             attempt_number: 1,
@@ -4180,6 +4680,7 @@ mod tests {
             model_id: String::new(),
             prompt_version: String::new(),
             rubric_version: exam.rubric_version.clone(),
+            speaking_config_snapshot: None,
         };
         let policy = default_speaking_scoring_policy();
         let first = speaking_evaluation_input_hash(
@@ -4364,6 +4865,145 @@ mod tests {
         assert_eq!(
             SpeakingPerformanceLevel::Developing.score_for(15.0),
             Some(6.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn proof_8_speaking_cancel_preserves_teacher_data() {
+        use crate::domain::job::{DuplicatePolicy, JobKind, JobStatus};
+        use crate::jobs::job_manager::JobRegistrationInput;
+        use crate::services::model_config_service::ModelConfigService;
+        use crate::services::model_process_manager::ModelProcessManager;
+        use crate::services::model_runtime_service::ModelRuntimeService;
+
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-p8-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_path_buf).unwrap();
+        let store = ProjectStore::new();
+        let mut project = store
+            .create_project(
+                "proj_p8".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let mut exam = test_exam();
+        exam.id = "exam_p8".to_string();
+        exam.title = "Speaking Exam P8".to_string();
+        exam.rubric_version = "v1".to_string();
+
+        let attempt = SpeakingAttempt {
+            id: "att_p8".to_string(),
+            assessment_activity_id: None,
+            class_application_id: None,
+            school_class_id: None,
+            exam_id: "exam_p8".to_string(),
+            student_id: "s1".to_string(),
+            attempt_number: 1,
+            state: SpeakingAttemptState::TeacherReview,
+            started_at: Utc::now().to_rfc3339(),
+            ended_at: None,
+            audio_path: Some("audio.wav".to_string()),
+            engine_session_id: None,
+            source_history_id: None,
+            raw_transcript: "Original teacher raw transcript".to_string(),
+            readable_transcript: "Original teacher readable transcript".to_string(),
+            cleanup_candidate: None,
+            transcript_for_scoring: None,
+            approved_transcript: None,
+            cleanup_status: SpeakingTranscriptCleanupStatus::NotStarted,
+            cleanup_changes: vec![],
+            cleanup_diagnostics: None,
+            cleanup_model_provenance: None,
+            evaluation_model_provenance: None,
+            evaluation_input_hash: None,
+            frozen_min_duration_seconds: None,
+            frozen_max_duration_seconds: None,
+            duration_scoring_policy_version: None,
+            scoring_policy_version: SPEAKING_SCORING_POLICY_VERSION.to_string(),
+            evaluation_prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
+            transcript_cleanup: Default::default(),
+            transcript_segments: vec![],
+            metrics: SpeakingMetrics::default(),
+            criterion_scores: vec![],
+            evaluation_job_id: None,
+            evaluation_error: None,
+            teacher_note: Some("Teacher note preserved".to_string()),
+            final_score: Some(85.0),
+            teacher_approved_at: None,
+            model_id: "Gemma 4 12B".to_string(),
+            prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
+            rubric_version: "v1".to_string(),
+            speaking_config_snapshot: None,
+        };
+
+        exam.attempts.push(attempt);
+        project.speaking_exams.push(exam);
+        store.save_project(&project).unwrap();
+
+        let jm = std::sync::Arc::new(JobManager::new());
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+            .handle()
+            .clone();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::SpeakingEvaluation,
+                    display_label: Some("Speaking Evaluation".into()),
+                    total: 1,
+                    message: "Evaluating".into(),
+                    correlation_id: Some("corr-p8".into()),
+                    idempotency_key: Some("key-p8".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation
+        jm.cancel_job(&app, &reg.snapshot.id).unwrap();
+
+        let model_gateway_impl =
+            std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_config = ModelConfigService::new();
+        let model_process_manager =
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
+        let speaking_engine = std::sync::Arc::new(speakoflow_engine::SpeakoflowEngine::new());
+
+        let service = SpeakingExamService::new(
+            store.clone(),
+            model_gateway_impl,
+            model_runtime_service,
+            jm.clone(),
+            speaking_engine,
+        );
+
+        let res = service
+            .evaluate_attempt_inner(&app, &project.id, "exam_p8", "att_p8", &reg.snapshot.id)
+            .await;
+
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify teacher notes and readable transcript remain unchanged
+        let updated = store.get_project_snapshot(project.id).unwrap();
+        let att = &updated.speaking_exams[0].attempts[0];
+        assert_eq!(att.teacher_note.as_deref(), Some("Teacher note preserved"));
+        assert_eq!(att.final_score, Some(85.0));
+        assert_eq!(
+            att.readable_transcript,
+            "Original teacher readable transcript"
         );
     }
 }

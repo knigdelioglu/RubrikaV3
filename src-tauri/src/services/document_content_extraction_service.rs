@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelInputImage, ModelInputImageKind};
-use crate::platform::file_access::atomic_write;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_input_image_service::{ModelInputBatchMetadata, ModelInputImageService};
 
 const MIN_NON_WHITESPACE_LENGTH: usize = 200;
@@ -125,7 +125,11 @@ impl DocumentContentExtractionService {
         &self,
         request: DocumentContentExtractionRequest,
     ) -> Result<DocumentContentExtractionResult, AppError> {
-        let artifact_dir = document_content_dir(&request.project_root, &request.document_id);
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(request.project_root.clone(), false)?;
+        let artifact_relative =
+            trusted_root.managed(&format!("cache/document_content/{}", request.document_id))?;
+        let artifact_dir = trusted_root.root().join(artifact_relative.as_path());
         let metadata_path = artifact_dir.join("content_metadata.json");
         if !request.force_refresh {
             if let Some(cached) = self.try_load_cached(&request, &artifact_dir, &metadata_path)? {
@@ -133,14 +137,7 @@ impl DocumentContentExtractionService {
             }
         }
 
-        std::fs::create_dir_all(&artifact_dir).map_err(|error| {
-            app_error(
-                AppErrorCode::FileWriteFailed,
-                "Belge içerik klasörü oluşturulamadı.",
-                Some(error.to_string()),
-                Some("Check project cache permissions.".to_string()),
-            )
-        })?;
+        trusted_root.ensure_managed_directory(&artifact_dir)?;
 
         let source_metadata = std::fs::metadata(&request.document_path).map_err(|error| {
             app_error(
@@ -168,14 +165,14 @@ impl DocumentContentExtractionService {
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let _ = atomic_write(&stderr_path, &stderr);
+                let _ = atomic_write_managed(&trusted_root, &stderr_path, &stderr);
                 warnings.push("pdftotext_failed".to_string());
                 warnings.push("vision_fallback_recommended".to_string());
                 String::new()
             }
             Err(error) => {
                 let stderr = error.to_string();
-                let _ = atomic_write(&stderr_path, &stderr);
+                let _ = atomic_write_managed(&trusted_root, &stderr_path, &stderr);
                 warnings.push("pdftotext_unavailable".to_string());
                 warnings.push("vision_fallback_recommended".to_string());
                 String::new()
@@ -219,10 +216,8 @@ impl DocumentContentExtractionService {
             warnings.push("likely_scanned_pdf".to_string());
         }
 
-        atomic_write(&raw_text_path, &raw_text)
-            .map_err(|error| file_write_error("raw_text.txt yazılamadı.", error))?;
-        atomic_write(&normalized_text_path, &normalized_text)
-            .map_err(|error| file_write_error("normalized_text.txt yazılamadı.", error))?;
+        atomic_write_managed(&trusted_root, &raw_text_path, &raw_text)?;
+        atomic_write_managed(&trusted_root, &normalized_text_path, &normalized_text)?;
 
         let mut model_input_images = Vec::new();
         let mut model_input_manifest_path = None;
@@ -235,7 +230,7 @@ impl DocumentContentExtractionService {
                     &request.project_root,
                     &model_input_kind,
                     &request.document_id,
-                );
+                )?;
                 if !manifest_path.exists() {
                     model_input_images = self.model_input_image_service.prepare_inputs(
                         &request.project_root,
@@ -244,6 +239,7 @@ impl DocumentContentExtractionService {
                         &request.vision_sources,
                     )?;
                 } else if let Ok(manifest) = load_model_input_manifest(&manifest_path) {
+                    ModelInputImageService::validate_manifest_paths(&trusted_root, &manifest)?;
                     model_input_images = manifest.images;
                 }
                 model_input_manifest_path = Some(manifest_path);
@@ -323,7 +319,8 @@ impl DocumentContentExtractionService {
             artifact_dir: artifact_dir.to_string_lossy().to_string(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
-        atomic_write(
+        atomic_write_managed(
+            &trusted_root,
             &metadata_path,
             &serde_json::to_string_pretty(&metadata).map_err(|error| {
                 app_error(
@@ -334,7 +331,10 @@ impl DocumentContentExtractionService {
                 )
             })?,
         )
-        .map_err(|error| file_write_error("content_metadata.json yazılamadı.", error))?;
+        .map_err(|mut error| {
+            error.message = "Belge içerik metadata yazılamadı.".to_string();
+            error
+        })?;
 
         Ok(result)
     }
@@ -348,7 +348,11 @@ impl DocumentContentExtractionService {
         if !metadata_path.exists() {
             return Ok(None);
         }
-        let metadata: DocumentContentCacheMetadata = match std::fs::read_to_string(metadata_path) {
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(request.project_root.clone(), false)?;
+        let metadata_managed = trusted_root.managed_for_path(metadata_path)?;
+        let metadata_path = trusted_root.resolve_existing_file(&metadata_managed)?;
+        let metadata: DocumentContentCacheMetadata = match std::fs::read_to_string(&metadata_path) {
             Ok(content) => match serde_json::from_str(&content) {
                 Ok(metadata) => metadata,
                 Err(_) => return Ok(None),
@@ -375,15 +379,28 @@ impl DocumentContentExtractionService {
             }
         }
 
-        let raw_text = read_optional_text(&artifact_dir.join("raw_text.txt"));
-        let normalized_text = read_optional_text(&artifact_dir.join("normalized_text.txt"));
+        let raw_text =
+            read_optional_managed_text(&trusted_root, &artifact_dir.join("raw_text.txt"));
+        let normalized_text =
+            read_optional_managed_text(&trusted_root, &artifact_dir.join("normalized_text.txt"));
         let mut model_input_manifest_path = metadata
             .model_input_manifest_path
             .as_ref()
             .map(PathBuf::from);
+        if let Some(path) = &model_input_manifest_path {
+            let trusted_root =
+                TrustedProjectRoot::from_canonical_root(request.project_root.clone(), false)?;
+            let managed = trusted_root.adapt_legacy_document_path(&path.to_string_lossy())?;
+            let safe_path = trusted_root.resolve_existing_file(&managed)?;
+            model_input_manifest_path = Some(safe_path);
+        }
         let mut model_input_images = if metadata.vision_fallback_needed {
             if let Some(path) = &model_input_manifest_path {
                 load_model_input_manifest(path)
+                    .and_then(|manifest| {
+                        ModelInputImageService::validate_manifest_paths(&trusted_root, &manifest)
+                            .map(|_| manifest)
+                    })
                     .map(|manifest| manifest.images)
                     .unwrap_or_default()
             } else {
@@ -402,7 +419,7 @@ impl DocumentContentExtractionService {
                 &request.project_root,
                 &model_input_kind,
                 &metadata.document_id,
-            );
+            )?;
             model_input_images = self.model_input_image_service.prepare_inputs(
                 &request.project_root,
                 model_input_kind,
@@ -445,13 +462,6 @@ impl DocumentContentExtractionService {
             warnings,
         }))
     }
-}
-
-pub fn document_content_dir(project_root: &Path, document_id: &str) -> PathBuf {
-    project_root
-        .join("cache")
-        .join("document_content")
-        .join(document_id)
 }
 
 pub fn normalize_question_detection_text(text: &str) -> String {
@@ -552,6 +562,21 @@ fn read_optional_text(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+fn read_optional_managed_text(trusted_root: &TrustedProjectRoot, path: &Path) -> Option<String> {
+    let managed = trusted_root.managed_for_path(path).ok()?;
+    let safe_path = trusted_root.resolve_existing_file(&managed).ok()?;
+    read_optional_text(&safe_path)
+}
+
+fn atomic_write_managed(
+    trusted_root: &TrustedProjectRoot,
+    path: &Path,
+    content: &str,
+) -> Result<(), AppError> {
+    let managed = trusted_root.managed_for_path(path)?;
+    trusted_root.atomic_write(&managed, content)
+}
+
 fn load_model_input_manifest(path: &Path) -> Result<ModelInputBatchMetadata, AppError> {
     let content = std::fs::read_to_string(path).map_err(|error| {
         app_error(
@@ -595,17 +620,6 @@ fn app_error(
         recoverable: true,
         suggested_action,
         technical_details,
-        correlation_id: Uuid::new_v4().to_string(),
-    }
-}
-
-fn file_write_error(message: &str, error: std::io::Error) -> AppError {
-    AppError {
-        code: AppErrorCode::FileWriteFailed,
-        message: message.to_string(),
-        recoverable: false,
-        suggested_action: Some("Check project cache permissions.".to_string()),
-        technical_details: Some(error.to_string()),
         correlation_id: Uuid::new_v4().to_string(),
     }
 }

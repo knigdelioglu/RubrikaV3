@@ -1,6 +1,7 @@
 use crate::domain::errors::{AppError, AppErrorCode};
+use crate::platform::project_paths::TrustedProjectRoot;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -25,6 +26,14 @@ pub struct PdfPreviewState {
     pub job_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Immutable preview generation currently used by readers. Legacy
+    /// projects omit this and continue to use the compatibility cache path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_generation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -64,31 +73,62 @@ pub struct Document {
 
 impl Document {
     pub fn resolve_path(&self, project_root: &str) -> Result<PathBuf, AppError> {
-        let path = Path::new(&self.stored_path);
-        let resolved = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            let direct = Path::new(project_root).join(path);
-            if direct.exists() && direct.is_file() {
-                direct
-            } else {
-                Path::new(project_root).join("documents").join(path)
-            }
-        };
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(std::path::PathBuf::from(project_root), false)
+                .map_err(|error| AppError {
+                    code: AppErrorCode::PdfDocumentNotFound,
+                    message: format!("Belge dosyası bulunamadı: {}", self.file_name),
+                    recoverable: true,
+                    suggested_action: Some("Lütfen belgeyi yeniden yükleyin.".to_string()),
+                    technical_details: error.technical_details,
+                    correlation_id: Uuid::new_v4().to_string(),
+                })?;
+        self.resolve_path_with_root(&trusted_root)
+    }
 
-        if !resolved.exists() || !resolved.is_file() {
-            return Err(AppError {
-                code: AppErrorCode::PdfDocumentNotFound,
-                message: format!("Belge dosyası bulunamadı: {}", self.file_name),
-                recoverable: true,
-                suggested_action: Some("Lütfen belgeyi yeniden yükleyin.".to_string()),
-                technical_details: Some(format!(
-                    "stored_path={:?}, resolved={:?}, project_root={:?}",
-                    self.stored_path, resolved, project_root
-                )),
-                correlation_id: Uuid::new_v4().to_string(),
-            });
-        }
+    pub fn resolve_path_with_root(
+        &self,
+        trusted_root: &TrustedProjectRoot,
+    ) -> Result<PathBuf, AppError> {
+        let managed = trusted_root
+            .adapt_legacy_document_path(&self.stored_path)
+            .map_err(|error| {
+                let code = error.code.clone();
+                AppError {
+                    code: match code {
+                        AppErrorCode::ManagedPathOutsideProject
+                        | AppErrorCode::ManagedPathSymlinkEscape
+                        | AppErrorCode::UnsafeManagedPath
+                        | AppErrorCode::LegacyDocumentPathUnresolved => code.clone(),
+                        _ => AppErrorCode::PdfDocumentNotFound,
+                    },
+                    message: if matches!(
+                        code,
+                        AppErrorCode::ManagedPathOutsideProject
+                            | AppErrorCode::ManagedPathSymlinkEscape
+                            | AppErrorCode::UnsafeManagedPath
+                            | AppErrorCode::LegacyDocumentPathUnresolved
+                    ) {
+                        "Bu dosya proje klasörünün dışında olduğu için açılamadı.".to_string()
+                    } else {
+                        format!("Belge dosyası bulunamadı: {}", self.file_name)
+                    },
+                    recoverable: true,
+                    suggested_action: Some("Belgeyi proje içine yeniden içe aktarın.".to_string()),
+                    technical_details: error.technical_details,
+                    correlation_id: Uuid::new_v4().to_string(),
+                }
+            })?;
+
+        let resolved = if trusted_root.root().join(managed.as_path()).is_file() {
+            trusted_root.resolve_existing_file(&managed)?
+        } else if !managed.starts_with_component("documents") {
+            let documents_path =
+                trusted_root.managed(&format!("documents/{}", managed.as_str()))?;
+            trusted_root.resolve_existing_file(&documents_path)?
+        } else {
+            trusted_root.resolve_existing_file(&managed)?
+        };
 
         Ok(resolved)
     }
@@ -122,8 +162,8 @@ mod tests {
             preview: None,
         };
 
-        let resolved = doc.resolve_path("/nonexistent_root").unwrap();
-        assert_eq!(resolved, file_path);
+        let resolved = doc.resolve_path(&root.to_string_lossy()).unwrap();
+        assert_eq!(resolved, std::fs::canonicalize(file_path).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -145,7 +185,7 @@ mod tests {
         };
 
         let resolved = doc.resolve_path(&root.to_string_lossy()).unwrap();
-        assert_eq!(resolved, file_path);
+        assert_eq!(resolved, std::fs::canonicalize(file_path).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -169,7 +209,7 @@ mod tests {
         };
 
         let resolved = doc.resolve_path(&root.to_string_lossy()).unwrap();
-        assert_eq!(resolved, file_path);
+        assert_eq!(resolved, std::fs::canonicalize(file_path).unwrap());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -189,5 +229,30 @@ mod tests {
         let result = doc.resolve_path("/nonexistent_root");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, AppErrorCode::PdfDocumentNotFound);
+    }
+
+    #[test]
+    fn test_resolve_path_rejects_absolute_outside_project() {
+        let root = temp_root();
+        let outside = temp_root();
+        let file_path = outside.join("private.pdf");
+        File::create(&file_path).unwrap();
+        let doc = Document {
+            id: "d1".to_string(),
+            role: DocumentRole::ExamSource,
+            file_name: "private.pdf".to_string(),
+            stored_path: file_path.to_string_lossy().to_string(),
+            page_count: 1,
+            added_at: "now".to_string(),
+            checksum: None,
+            preview: None,
+        };
+        let result = doc.resolve_path(&root.to_string_lossy());
+        assert_eq!(
+            result.unwrap_err().code,
+            AppErrorCode::ManagedPathOutsideProject
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 }

@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::document::{DocumentRole, PdfPreviewStatus};
-use crate::domain::errors::AppError;
+use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::job::{JobSnapshot, JobStatus};
 
 use crate::domain::project::Project;
@@ -19,6 +19,7 @@ use crate::domain::school_class::{normalize_school_class_name, SchoolClassStatus
 use crate::domain::student::student_identity_is_missing;
 use crate::jobs::job_manager::load_persisted_jobs;
 use crate::platform::paths::model_server_log_path;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::document_content_extraction_service::{
     clamp_question_markers, detect_question_markers, missing_numbers,
     normalize_question_detection_text, DocumentContentExtractionRequest,
@@ -33,8 +34,8 @@ use crate::services::question_text_service::{
     apply_extraction_to_project_with_expected, extract_numbered_questions_from_text,
 };
 
-use crate::services::project_store::ProjectStore;
-use crate::services::school_class_service::build_school_class_overview;
+use crate::services::project_store::{PersistenceDiagnostics, ProjectStore};
+use crate::services::school_class_service::{build_school_class_overview, students_for_class};
 use crate::services::workflow_engine;
 
 #[derive(Clone)]
@@ -52,6 +53,8 @@ pub struct DoctorReport {
     pub project_file_exists: bool,
     pub project_readable: bool,
     pub project: Option<ProjectInspectReport>,
+    pub path_security: PathSecurityDoctorSummary,
+    pub persistence: PersistenceDiagnostics,
     pub documents_dir_exists: bool,
     pub cache_dir_exists: bool,
     pub exam_source_exists: bool,
@@ -76,11 +79,20 @@ pub struct DoctorReport {
     pub student_answer_ocr_expected_records: usize,
     pub student_answer_ocr_reviewed: usize,
     pub student_answer_ocr_needs_review: usize,
+    pub ocr_active_generation_count: usize,
+    pub ocr_pending_generation_count: usize,
+    pub ocr_interrupted_generation_count: usize,
+    pub ocr_stale_generation_count: usize,
     pub student_answer_ocr_status: String,
     pub student_answer_ocr_ready_for_scoring: bool,
     pub pages_per_student: Option<u32>,
     pub preview_metadata_exists: bool,
     pub preview_png_count: usize,
+    pub preview_active_generation_count: usize,
+    pub preview_orphan_staging_count: usize,
+    pub preview_missing_active_generation_count: usize,
+    pub submission_delete_blocked_count: usize,
+    pub orphan_artifact_count: usize,
     pub exam_package_status: String,
     pub question_text_coverage: String,
     pub rubric_coverage: String,
@@ -108,9 +120,31 @@ pub struct DoctorReport {
     pub errors: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PathSecurityDoctorSummary {
+    pub project_root_metadata_mismatch: usize,
+    pub unsafe_document_path_count: usize,
+    pub unresolved_legacy_document_path_count: usize,
+    pub external_managed_document_path_count: usize,
+    pub symlink_escape_count: usize,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakingDoctorSummary {
+    pub assessment_activity_count: usize,
+    pub speaking_activity_count: usize,
+    pub written_activity_count: usize,
+    pub listening_activity_count: usize,
+    pub assessment_class_application_count: usize,
+    pub duplicate_activity_class_application_count: usize,
+    pub class_application_without_class_count: usize,
+    pub speaking_attempt_without_activity_count: usize,
+    pub speaking_attempt_without_class_application_count: usize,
+    pub speaking_attempt_class_membership_mismatch_count: usize,
+    pub unresolved_legacy_speaking_record_count: usize,
+    pub activity_application_workflow_mismatch_count: usize,
     pub cleanup_model: String,
     pub evaluation_model: String,
     pub cleanup_prompt_version: String,
@@ -285,6 +319,10 @@ pub struct ModelInspectReport {
     pub completion_probe_ok: bool,
     pub started_by_app: bool,
     pub model_managed_process_pid: Option<u32>,
+    pub managed_process_present: bool,
+    pub process_identity_verification: String,
+    pub active_lease_count: usize,
+    pub draining_requested: bool,
     pub log_path: Option<String>,
     pub can_start_from_app: bool,
     pub can_stop_from_app: bool,
@@ -487,6 +525,18 @@ struct DocumentContentFreshAnalysis {
 
 fn speaking_doctor_summary(project: Option<&Project>) -> SpeakingDoctorSummary {
     let mut summary = SpeakingDoctorSummary {
+        assessment_activity_count: 0,
+        speaking_activity_count: 0,
+        written_activity_count: 0,
+        listening_activity_count: 0,
+        assessment_class_application_count: 0,
+        duplicate_activity_class_application_count: 0,
+        class_application_without_class_count: 0,
+        speaking_attempt_without_activity_count: 0,
+        speaking_attempt_without_class_application_count: 0,
+        speaking_attempt_class_membership_mismatch_count: 0,
+        unresolved_legacy_speaking_record_count: 0,
+        activity_application_workflow_mismatch_count: 0,
         cleanup_model: "Gemma 4 12B".to_string(),
         evaluation_model: "Gemma 4 12B".to_string(),
         cleanup_prompt_version: "speaking_asr_cleanup_tr_v3".to_string(),
@@ -504,9 +554,87 @@ fn speaking_doctor_summary(project: Option<&Project>) -> SpeakingDoctorSummary {
     let Some(project) = project else {
         return summary;
     };
+    summary.assessment_activity_count = project.assessment_activities.len();
+    summary.speaking_activity_count = project
+        .assessment_activities
+        .iter()
+        .filter(|activity| {
+            activity.assessment_type == crate::domain::assessment::AssessmentType::Speaking
+        })
+        .count();
+    summary.written_activity_count = project
+        .assessment_activities
+        .iter()
+        .filter(|activity| {
+            activity.assessment_type == crate::domain::assessment::AssessmentType::Written
+        })
+        .count();
+    summary.listening_activity_count = project
+        .assessment_activities
+        .iter()
+        .filter(|activity| {
+            activity.assessment_type == crate::domain::assessment::AssessmentType::Listening
+        })
+        .count();
+    let mut activity_keys = std::collections::HashSet::new();
+    for activity in &project.assessment_activities {
+        let key = (
+            activity.academic_year_id.clone(),
+            activity.course_id.clone(),
+            activity.grade_level,
+            activity.term,
+            format!("{:?}", activity.assessment_type),
+            activity.sequence_number,
+        );
+        if !activity_keys.insert(key) {
+            summary.duplicate_activity_class_application_count += 1;
+        }
+        if activity.workflow_family != activity.assessment_type.workflow_family() {
+            summary.activity_application_workflow_mismatch_count += 1;
+        }
+        let mut class_ids = std::collections::HashSet::new();
+        for application in &activity.class_applications {
+            summary.assessment_class_application_count += 1;
+            if !class_ids.insert(application.school_class_id.clone()) {
+                summary.duplicate_activity_class_application_count += 1;
+            }
+            let school_class = project
+                .school_classes
+                .iter()
+                .find(|school_class| school_class.id == application.school_class_id);
+            if school_class.is_none() {
+                summary.class_application_without_class_count += 1;
+            }
+            for attempt in &application.speaking_attempts {
+                if attempt.assessment_activity_id.is_none() {
+                    summary.speaking_attempt_without_activity_count += 1;
+                }
+                if attempt.class_application_id.as_deref() != Some(application.id.as_str()) {
+                    summary.speaking_attempt_without_class_application_count += 1;
+                }
+                if let Ok(students) = students_for_class(project, &application.school_class_id) {
+                    if !students
+                        .iter()
+                        .any(|student| student.id == attempt.student_id)
+                    {
+                        summary.speaking_attempt_class_membership_mismatch_count += 1;
+                    }
+                }
+            }
+        }
+    }
     for exam in &project.speaking_exams {
+        if exam.assessment_activity_id.is_none() {
+            summary.unresolved_legacy_speaking_record_count += 1;
+        }
         let mut policies = std::collections::HashSet::new();
         for attempt in &exam.attempts {
+            if attempt.assessment_activity_id.is_none() {
+                summary.speaking_attempt_without_activity_count += 1;
+            }
+            if attempt.class_application_id.is_none() {
+                summary.speaking_attempt_without_class_application_count += 1;
+            }
             policies.insert(attempt.scoring_policy_version.clone());
             if !attempt.raw_transcript.trim().is_empty()
                 && matches!(
@@ -655,6 +783,16 @@ impl DiagnosticsContext {
             completion_probe_ok: status.completion_probe_ok,
             started_by_app: status.started_by_app,
             model_managed_process_pid: status.managed_process_pid,
+            managed_process_present: status.managed_process_pid.is_some(),
+            process_identity_verification: if status.started_by_app {
+                "verified".to_string()
+            } else if status.managed_process_pid.is_some() {
+                "unverified_or_external".to_string()
+            } else {
+                "not_present".to_string()
+            },
+            active_lease_count: status.active_lease_count,
+            draining_requested: status.draining,
             log_path: Some(log_path.to_string_lossy().to_string()),
             can_start_from_app: status.can_start_from_app,
             can_stop_from_app: status.can_stop_from_app,
@@ -748,6 +886,15 @@ impl DiagnosticsContext {
                 project_file_exists: false,
                 project_readable: false,
                 project: None,
+                path_security: PathSecurityDoctorSummary::default(),
+                persistence: PersistenceDiagnostics {
+                    storage_revision: 0,
+                    project_fingerprint_status: "unknown".to_string(),
+                    stale_job_result_count: 0,
+                    mutation_conflict_count: 0,
+                    external_modification_detected: false,
+                    legacy_project_without_revision: false,
+                },
                 documents_dir_exists: project_path.join("documents").exists(),
                 cache_dir_exists: project_path.join("cache").exists(),
                 exam_source_exists: false,
@@ -772,11 +919,20 @@ impl DiagnosticsContext {
                 student_answer_ocr_expected_records: 0,
                 student_answer_ocr_reviewed: 0,
                 student_answer_ocr_needs_review: 0,
+                ocr_active_generation_count: 0,
+                ocr_pending_generation_count: 0,
+                ocr_interrupted_generation_count: 0,
+                ocr_stale_generation_count: 0,
                 student_answer_ocr_status: "not_started".to_string(),
                 student_answer_ocr_ready_for_scoring: false,
                 pages_per_student: None,
                 preview_metadata_exists: false,
                 preview_png_count: 0,
+                preview_active_generation_count: 0,
+                preview_orphan_staging_count: 0,
+                preview_missing_active_generation_count: 0,
+                submission_delete_blocked_count: 0,
+                orphan_artifact_count: 0,
                 exam_package_status: "missing".to_string(),
                 question_text_coverage: "0/0".to_string(),
                 rubric_coverage: "0/0".to_string(),
@@ -841,15 +997,93 @@ impl DiagnosticsContext {
             .project_store
             .open_project_with_warnings(project_path.to_string_lossy().to_string())?;
         let workflow_snapshot = workflow_engine::evaluate_workflow(&project);
-        let preview_metadata_exists = project
-            .documents
-            .iter()
-            .any(|document| preview_metadata_path(&project, &document.id).exists());
+        let preview_metadata_exists = project.documents.iter().any(|document| {
+            preview_metadata_path(&project, &document.id).is_some_and(|path| path.exists())
+        });
         let preview_png_count = project
             .documents
             .iter()
             .map(|document| page_preview_png_count(&project, &document.id))
             .sum();
+        let ocr_active_generation_count = project
+            .student_answer_ocr_generations
+            .iter()
+            .filter(|generation| {
+                generation.status == crate::domain::student::OcrGenerationStatus::Active
+            })
+            .count();
+        let ocr_pending_generation_count = project
+            .student_answer_ocr_generations
+            .iter()
+            .filter(|generation| {
+                matches!(
+                    generation.status,
+                    crate::domain::student::OcrGenerationStatus::Candidate
+                        | crate::domain::student::OcrGenerationStatus::ReadyForReview
+                )
+            })
+            .count();
+        let ocr_interrupted_generation_count = project
+            .student_answer_ocr_generations
+            .iter()
+            .filter(|generation| {
+                generation.status == crate::domain::student::OcrGenerationStatus::Interrupted
+            })
+            .count();
+        let ocr_stale_generation_count = project
+            .student_answer_ocr_generations
+            .iter()
+            .filter(|generation| {
+                generation.status == crate::domain::student::OcrGenerationStatus::Stale
+            })
+            .count();
+        let preview_active_generation_count = project
+            .documents
+            .iter()
+            .filter(|document| {
+                document
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.active_generation_id.as_ref())
+                    .is_some()
+            })
+            .count();
+        let preview_missing_active_generation_count = project
+            .documents
+            .iter()
+            .filter(|document| {
+                document
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.active_generation_id.as_ref())
+                    .is_some()
+                    && !preview_metadata_path(&project, &document.id)
+                        .is_some_and(|path| path.exists())
+            })
+            .count();
+        let preview_orphan_staging_count = count_preview_staging_dirs(&project);
+        let submission_delete_blocked_count = project
+            .student_submissions
+            .iter()
+            .filter(|submission| {
+                crate::services::student_scan_service::scan_submission_dependencies(
+                    &project,
+                    std::slice::from_ref(&submission.id),
+                )
+                .is_blocked()
+            })
+            .count();
+        let orphan_artifact_count = project
+            .student_answer_ocr_records
+            .iter()
+            .filter(|record| {
+                record
+                    .source_image_refs
+                    .iter()
+                    .chain(record.crop_refs.iter())
+                    .any(|reference| reference.trim().is_empty())
+            })
+            .count();
         let exam_source_exists = project
             .documents
             .iter()
@@ -1000,6 +1234,8 @@ impl DiagnosticsContext {
         let scoring_ready = scoring_state.ready && scoring_blockers.is_empty();
 
         let model_status = self.inspect_model(40).await.ok();
+        let path_security = path_security_doctor_summary(project_path, &project);
+        let persistence = self.project_store.persistence_diagnostics();
 
         Ok(DoctorReport {
             project_path: project_path.to_string_lossy().to_string(),
@@ -1010,6 +1246,8 @@ impl DiagnosticsContext {
                 computed_project.workflow = workflow_snapshot.clone();
                 project_report(computed_project)
             }),
+            path_security,
+            persistence,
             documents_dir_exists: project_path.join("documents").exists(),
             cache_dir_exists: project_path.join("cache").exists(),
             exam_source_exists,
@@ -1035,11 +1273,20 @@ impl DiagnosticsContext {
             student_answer_ocr_expected_records,
             student_answer_ocr_reviewed,
             student_answer_ocr_needs_review,
+            ocr_active_generation_count,
+            ocr_pending_generation_count,
+            ocr_interrupted_generation_count,
+            ocr_stale_generation_count,
             student_answer_ocr_status,
             student_answer_ocr_ready_for_scoring,
             pages_per_student: project.student_pages_per_student,
             preview_metadata_exists,
             preview_png_count,
+            preview_active_generation_count,
+            preview_orphan_staging_count,
+            preview_missing_active_generation_count,
+            submission_delete_blocked_count,
+            orphan_artifact_count,
             exam_package_status: to_snake_case(&format!("{:?}", workflow_snapshot.current_stage)),
             question_text_coverage,
             rubric_coverage,
@@ -1340,7 +1587,9 @@ impl DiagnosticsContext {
             &fresh_raw_text,
             expected_question_count,
         )?;
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(report)
     }
 
@@ -1464,19 +1713,11 @@ impl DiagnosticsContext {
                 });
                 job.updated_at = now.clone();
 
-                let path = crate::jobs::job_manager::job_snapshot_path(project_path, &job.id);
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| AppError {
-                        code: crate::domain::errors::AppErrorCode::ProjectSaveFailed,
-                        message: "Job snapshot dizini oluşturulamadı.".to_string(),
-                        recoverable: false,
-                        suggested_action: Some("Check project log permissions.".to_string()),
-                        technical_details: Some(error.to_string()),
-                        correlation_id: uuid::Uuid::new_v4().to_string(),
-                    })?;
-                }
-                crate::platform::file_access::atomic_write(
-                    &path,
+                let trusted_root =
+                    TrustedProjectRoot::from_canonical_root(project_path.to_path_buf(), false)?;
+                let managed = trusted_root.managed(&format!("logs/jobs/{}.json", job.id))?;
+                trusted_root.atomic_write(
+                    &managed,
                     &serde_json::to_string_pretty(&job).map_err(|error| AppError {
                         code: crate::domain::errors::AppErrorCode::ProjectSaveFailed,
                         message: "Job snapshot serialize edilemedi.".to_string(),
@@ -1485,15 +1726,7 @@ impl DiagnosticsContext {
                         technical_details: Some(error.to_string()),
                         correlation_id: uuid::Uuid::new_v4().to_string(),
                     })?,
-                )
-                .map_err(|error| AppError {
-                    code: crate::domain::errors::AppErrorCode::ProjectSaveFailed,
-                    message: "Job snapshot yazılamadı.".to_string(),
-                    recoverable: false,
-                    suggested_action: Some("Check project log permissions.".to_string()),
-                    technical_details: Some(error.to_string()),
-                    correlation_id: uuid::Uuid::new_v4().to_string(),
-                })?;
+                )?;
 
                 items.push(StaleJobsRepairItem {
                     job_id: job.id.clone(),
@@ -1526,7 +1759,9 @@ impl DiagnosticsContext {
                 DocumentRole::ExamSource | DocumentRole::Rubric | DocumentRole::AnswerKey
             )
         }) {
-            let artifact_dir = document_content_dir(project_path, &document.id);
+            let Some(artifact_dir) = document_content_dir(project_path, &document.id) else {
+                continue;
+            };
             let metadata_path = artifact_dir.join("content_metadata.json");
             let raw_text_path = artifact_dir.join("raw_text.txt");
             let normalized_text_path = artifact_dir.join("normalized_text.txt");
@@ -1933,11 +2168,16 @@ fn student_intake_readiness(project: &Project) -> (bool, Vec<String>) {
 }
 
 fn document_reports(project: &Project, project_path: &Path) -> Vec<DocumentInspectRecord> {
+    let trusted_root = TrustedProjectRoot::open_selected(project_path).ok();
     project
         .documents
         .iter()
         .map(|document| {
-            let stored = project_path.join("documents").join(&document.stored_path);
+            let stored = trusted_root.as_ref().and_then(|root| {
+                root.adapt_legacy_document_path(&document.stored_path)
+                    .and_then(|managed| root.resolve_existing_file(&managed))
+                    .ok()
+            });
             let preview_status = document.preview.as_ref().map(|preview| {
                 match preview.status {
                     PdfPreviewStatus::Missing => "missing",
@@ -1949,7 +2189,7 @@ fn document_reports(project: &Project, project_path: &Path) -> Vec<DocumentInspe
                 .to_string()
             });
             let mut warnings = Vec::new();
-            if matches!(document.role, DocumentRole::Rubric) && !stored.exists() {
+            if matches!(document.role, DocumentRole::Rubric) && stored.is_none() {
                 warnings.push("rubric PDF stored path missing".to_string());
             }
             DocumentInspectRecord {
@@ -1957,7 +2197,7 @@ fn document_reports(project: &Project, project_path: &Path) -> Vec<DocumentInspe
                 role: document_role_label(&document.role),
                 file_name: document.file_name.clone(),
                 stored_path: document.stored_path.clone(),
-                exists: stored.exists(),
+                exists: stored.is_some(),
                 checksum: document.checksum.clone(),
                 page_count: document.page_count,
                 preview_status,
@@ -1969,6 +2209,105 @@ fn document_reports(project: &Project, project_path: &Path) -> Vec<DocumentInspe
             }
         })
         .collect()
+}
+
+fn path_security_doctor_summary(
+    project_path: &Path,
+    project: &Project,
+) -> PathSecurityDoctorSummary {
+    let mut summary = PathSecurityDoctorSummary::default();
+    let Ok(trusted_root) = TrustedProjectRoot::open_selected(project_path) else {
+        return summary;
+    };
+
+    let raw_value = std::fs::read_to_string(trusted_root.project_file())
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+    let stored_root = raw_value
+        .as_ref()
+        .and_then(|value| value.get("rootPath").or_else(|| value.get("root_path")))
+        .and_then(serde_json::Value::as_str);
+    if stored_root
+        .map(|value| {
+            std::fs::canonicalize(value)
+                .map(|path| path != trusted_root.root())
+                .unwrap_or(true)
+        })
+        .unwrap_or(true)
+    {
+        summary.project_root_metadata_mismatch = 1;
+    }
+
+    let raw_documents = raw_value
+        .as_ref()
+        .and_then(|value| value.get("documents"))
+        .and_then(serde_json::Value::as_array);
+    if let Some(raw_documents) = raw_documents {
+        for raw_document in raw_documents {
+            let Some(raw_path) = raw_document
+                .get("storedPath")
+                .or_else(|| raw_document.get("stored_path"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            if crate::platform::project_paths::is_absolute_like_path(raw_path) {
+                let absolute = Path::new(raw_path);
+                if path_has_symlink_component(absolute) {
+                    summary.symlink_escape_count += 1;
+                }
+                match std::fs::canonicalize(absolute) {
+                    Ok(canonical)
+                        if canonical.is_file()
+                            && canonical.strip_prefix(trusted_root.root()).is_ok() => {}
+                    _ => {
+                        summary.external_managed_document_path_count += 1;
+                        summary.unresolved_legacy_document_path_count += 1;
+                    }
+                }
+                continue;
+            }
+
+            match trusted_root.adapt_legacy_document_path(raw_path) {
+                Ok(managed) => match trusted_root.resolve_existing_file(&managed) {
+                    Ok(_) => {}
+                    Err(error) if error.code == AppErrorCode::ManagedPathSymlinkEscape => {
+                        summary.symlink_escape_count += 1;
+                    }
+                    Err(_) => {}
+                },
+                Err(error) if error.code == AppErrorCode::ManagedPathSymlinkEscape => {
+                    summary.symlink_escape_count += 1;
+                }
+                Err(error) if error.code == AppErrorCode::UnsafeManagedPath => {
+                    summary.unsafe_document_path_count += 1;
+                }
+                Err(_) => {
+                    summary.unresolved_legacy_document_path_count += 1;
+                }
+            }
+        }
+    } else {
+        // A successfully deserialized project with no documents has no risky
+        // document paths. Keep the project argument explicit for future doctor
+        // checks without writing student content into diagnostics.
+        let _ = project.documents.len();
+    }
+    summary
+}
+
+fn path_has_symlink_component(path: &Path) -> bool {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn question_text_summary(project: &Project) -> QuestionTextSummary {
@@ -2750,11 +3089,18 @@ fn read_log_tail(path: &Path, line_count: usize) -> Vec<String> {
     }
 }
 
-fn document_content_dir(project_root: &Path, document_id: &str) -> PathBuf {
-    project_root
-        .join("cache")
-        .join("document_content")
-        .join(document_id)
+fn document_content_dir(project_root: &Path, document_id: &str) -> Option<PathBuf> {
+    let trusted_root =
+        TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false).ok()?;
+    let managed = trusted_root
+        .managed(&format!("cache/document_content/{document_id}"))
+        .ok()?;
+    let candidate = trusted_root.root().join(managed.as_path());
+    if candidate.exists() {
+        trusted_root.resolve_existing_directory(&managed).ok()
+    } else {
+        Some(candidate)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2777,27 +3123,63 @@ fn read_document_content_metadata(
     project_root: &Path,
     document_id: &str,
 ) -> Option<DocumentContentMetadataSnapshot> {
-    let path = document_content_dir(project_root, document_id).join("content_metadata.json");
+    let trusted_root =
+        TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false).ok()?;
+    let managed = trusted_root
+        .managed(&format!(
+            "cache/document_content/{document_id}/content_metadata.json"
+        ))
+        .ok()?;
+    let path = trusted_root.resolve_existing_file(&managed).ok()?;
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
-fn preview_metadata_path(project: &Project, document_id: &str) -> PathBuf {
-    Path::new(&project.root_path)
-        .join("cache")
-        .join("page_previews")
-        .join(document_id)
-        .join("page_previews.json")
+fn preview_metadata_path(project: &Project, document_id: &str) -> Option<PathBuf> {
+    let trusted_root =
+        TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false).ok()?;
+    let document = project
+        .documents
+        .iter()
+        .find(|document| document.id == document_id);
+    let relative = document
+        .and_then(|document| document.preview.as_ref())
+        .and_then(|preview| preview.active_generation_id.as_ref())
+        .map(|generation_id| {
+            format!("outputs/previews/{document_id}/generations/{generation_id}/manifest.json")
+        })
+        .unwrap_or_else(|| format!("cache/page_previews/{document_id}/page_previews.json"));
+    let managed = trusted_root.managed(&relative).ok()?;
+    let candidate = trusted_root.root().join(managed.as_path());
+    if candidate.exists() {
+        trusted_root.resolve_existing_file(&managed).ok()
+    } else {
+        Some(candidate)
+    }
 }
 
 fn page_preview_png_count(project: &Project, document_id: &str) -> usize {
-    let dir = Path::new(&project.root_path)
-        .join("cache")
-        .join("page_previews")
-        .join(document_id);
-    if !dir.exists() {
-        return 0;
-    }
+    let trusted_root =
+        match TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false) {
+            Ok(root) => root,
+            Err(_) => return 0,
+        };
+    let relative = project
+        .documents
+        .iter()
+        .find(|document| document.id == document_id)
+        .and_then(|document| document.preview.as_ref())
+        .and_then(|preview| preview.active_generation_id.as_ref())
+        .map(|generation_id| format!("outputs/previews/{document_id}/generations/{generation_id}"))
+        .unwrap_or_else(|| format!("cache/page_previews/{document_id}"));
+    let managed = match trusted_root.managed(&relative) {
+        Ok(managed) => managed,
+        Err(_) => return 0,
+    };
+    let dir = match trusted_root.resolve_existing_directory(&managed) {
+        Ok(dir) => dir,
+        Err(_) => return 0,
+    };
     std::fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -2810,11 +3192,26 @@ fn page_preview_png_count(project: &Project, document_id: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn count_preview_staging_dirs(project: &Project) -> usize {
+    let root = PathBuf::from(&project.root_path)
+        .join("outputs")
+        .join("previews");
+    std::fs::read_dir(root)
+        .map(|documents| {
+            documents
+                .flatten()
+                .map(|entry| entry.path().join(".staging"))
+                .filter_map(|path| std::fs::read_dir(path).ok())
+                .map(|entries| entries.flatten().count())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 fn project_path(project: &Project) -> String {
-    Path::new(&project.root_path)
-        .join("project.json")
-        .to_string_lossy()
-        .to_string()
+    TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false)
+        .map(|root| root.project_file().to_string_lossy().to_string())
+        .unwrap_or_default()
 }
 
 fn document_role_label(role: &DocumentRole) -> String {
@@ -3021,12 +3418,19 @@ BAŞARILAR...";
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root().to_string_lossy().to_string(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -3087,12 +3491,19 @@ BAŞARILAR...";
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
             root_path: temp_project_root().to_string_lossy().to_string(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -3276,10 +3687,14 @@ BAŞARILAR...";
         let root = temp_project_root();
         let job = JobSnapshot {
             id: "job-1".to_string(),
+            schema_version: 1,
             project_id: "project-1".to_string(),
             project_root_path: Some(root.to_string_lossy().to_string()),
             kind: JobKind::QuestionTextExtraction,
+            display_label: None,
             status: JobStatus::Running,
+            cancellation_requested: false,
+            cancellation_requested_at: None,
             progress: JobProgress {
                 current: 2,
                 total: 6,
@@ -3288,12 +3703,16 @@ BAŞARILAR...";
             started_at: Some("2020-01-01T00:00:00Z".to_string()),
             finished_at: None,
             last_message: Some("Soru 23/6 Gemma vision ile tamamlanıyor...".to_string()),
+            correlation_id: "corr-diag".to_string(),
+            idempotency_key: None,
+            cancellable: true,
+            retry_of_job_id: None,
             result: None,
             error: None,
             created_at: "2020-01-01T00:00:00Z".to_string(),
             updated_at: "2020-01-01T00:00:00Z".to_string(),
         };
-        let path = job_snapshot_path(&root, &job.id);
+        let path = job_snapshot_path(&root, &job.id).expect("safe job path");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("jobs dir");
         }
@@ -3464,6 +3883,9 @@ BAŞARILAR...";
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -3571,6 +3993,62 @@ BAŞARILAR...";
         assert!(report.errors.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_path_security_counters_without_rewriting_project() {
+        let root = temp_project_root();
+        let outside_root = temp_project_root();
+        let outside_document = outside_root.join("private.pdf");
+        std::fs::write(&outside_document, "outside").expect("write outside document");
+        let original_project = root.join("project.json");
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Path Doctor".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        let mut raw_project = serde_json::to_value(project).expect("serialize project");
+        let object = raw_project.as_object_mut().expect("project object");
+        object.insert(
+            "rootPath".to_string(),
+            serde_json::Value::String(outside_root.to_string_lossy().to_string()),
+        );
+        object.insert(
+            "documents".to_string(),
+            serde_json::json!([
+                {"id":"outside","role":"exam_source","fileName":"private.pdf","storedPath":outside_document.to_string_lossy(),"pageCount":1,"addedAt":"now","checksum":null,"preview":null},
+                {"id":"unsafe","role":"exam_source","fileName":"unsafe.pdf","storedPath":"../private.pdf","pageCount":1,"addedAt":"now","checksum":null,"preview":null}
+            ]),
+        );
+        std::fs::write(
+            &original_project,
+            serde_json::to_string_pretty(&raw_project).expect("serialize tampered project"),
+        )
+        .expect("write project");
+        let before = std::fs::read(&original_project).expect("read project before doctor");
+
+        let report = DiagnosticsContext::new()
+            .doctor(&root)
+            .await
+            .expect("doctor");
+
+        assert!(report.project_readable);
+        assert_eq!(report.path_security.project_root_metadata_mismatch, 1);
+        assert_eq!(report.path_security.external_managed_document_path_count, 1);
+        assert_eq!(
+            report.path_security.unresolved_legacy_document_path_count,
+            1
+        );
+        assert_eq!(report.path_security.unsafe_document_path_count, 1);
+        assert_eq!(
+            std::fs::read(&original_project).expect("read project after doctor"),
+            before
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside_root);
     }
 
     #[test]

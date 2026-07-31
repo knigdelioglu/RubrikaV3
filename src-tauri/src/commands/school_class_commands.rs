@@ -3,11 +3,11 @@ use tauri::State;
 use crate::domain::errors::AppError;
 use crate::domain::school_class::{SchoolClass, StudentScanBatch};
 use crate::services::school_class_service::{
-    CreateSchoolClassInput, CreateStudentScanBatchInput, GetSchoolClassOverviewInput,
-    ImportStudentScanBatchInput, ImportStudentScanBatchOutput, ListClassStudentsInput,
-    ListSchoolClassesInput, ListStudentScanBatchesInput, MoveStudentScanBatchInput,
-    RemoveStudentScanBatchInput, SchoolClassIdInput, SchoolClassOverviewSnapshot,
-    UpdateSchoolClassInput,
+    CreateClassStudentInput, CreateSchoolClassInput, CreateStudentScanBatchInput,
+    GetSchoolClassOverviewInput, ImportStudentScanBatchInput, ImportStudentScanBatchOutput,
+    ListClassStudentsInput, ListSchoolClassesInput, ListStudentScanBatchesInput,
+    MoveStudentScanBatchInput, RemoveStudentScanBatchInput, SchoolClassIdInput,
+    SchoolClassOverviewSnapshot, UpdateClassStudentInput, UpdateSchoolClassInput,
 };
 use crate::AppState;
 
@@ -33,6 +33,22 @@ pub async fn list_class_students(
     input: ListClassStudentsInput,
 ) -> Result<Vec<crate::domain::student::Student>, AppError> {
     state.school_class_service.list_class_students(input)
+}
+
+#[tauri::command]
+pub async fn create_class_student(
+    state: State<'_, AppState>,
+    input: CreateClassStudentInput,
+) -> Result<crate::domain::student::Student, AppError> {
+    state.school_class_service.create_class_student(input)
+}
+
+#[tauri::command]
+pub async fn update_class_student(
+    state: State<'_, AppState>,
+    input: UpdateClassStudentInput,
+) -> Result<crate::domain::student::Student, AppError> {
+    state.school_class_service.update_class_student(input)
 }
 
 #[tauri::command]

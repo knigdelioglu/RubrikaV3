@@ -146,7 +146,9 @@ impl ScoringService {
             crate::domain::workflow::WorkflowStage::ScoringRunning;
         running_project.workflow.current_stage_label = "Notlandırma Çalışıyor".to_string();
         running_project.workflow.summary.text = Some("Notlandırma çalışıyor.".to_string());
-        self.project_store.save_project(&running_project)?;
+        self.project_store
+            .commit_snapshot_cas(&running_project)
+            .map(|_| ())?;
 
         let service = self.clone();
         let app_handle = app.clone();
@@ -162,7 +164,6 @@ impl ScoringService {
                     run_id.clone(),
                 )
                 .await;
-            let _ = service.model_runtime_service.stop_server(None).await;
             if let Err(error) = run_result {
                 let _ = service.job_manager.fail(&app_handle, &job_id, error);
             }
@@ -251,7 +252,9 @@ impl ScoringService {
         };
 
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -299,8 +302,9 @@ impl ScoringService {
             requires_mmproj: false,
             timeout_seconds: 180,
         };
-        self.model_runtime_service
-            .ensure_ready(None, runtime_request)
+        let _runtime_lease = self
+            .model_runtime_service
+            .acquire_runtime(None, &runtime_request, "scoring", Some(&job_id))
             .await?;
 
         let source_hash = scoring_source_hash(&project);
@@ -313,12 +317,19 @@ impl ScoringService {
         let mut needs_review = 0u32;
         let mut new_records = Vec::new();
 
+        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
         for submission in &project.student_submissions {
             let student = project
                 .students
                 .iter()
                 .find(|student| student.id == submission.student_id);
             for question in &project.questions {
+                if let Some(ref t) = cancel_token {
+                    if t.is_cancelled() {
+                        let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                        return Ok(());
+                    }
+                }
                 current += 1;
                 self.job_manager
                     .update_progress(
@@ -550,6 +561,13 @@ impl ScoringService {
             }
         }
 
+        if let Some(ref t) = cancel_token {
+            if t.is_cancelled() {
+                let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                return Ok(());
+            }
+        }
+
         let scoring_hash = scoring_package_hash(&project);
         project.latest_scoring_run_id = Some(run_id.clone());
         project.scoring_records.extend(new_records);
@@ -566,7 +584,9 @@ impl ScoringService {
             }
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         let result = ScoringJobResult {
             total,

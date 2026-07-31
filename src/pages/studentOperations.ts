@@ -15,6 +15,8 @@ export type StudentOperationsSelection = {
 
 export function normalizeStudentOperationsTab(rawTab: string | null): StudentOperationsTab {
   switch (rawTab) {
+    case 'roster':
+      return 'roster';
     case 'identity':
     case 'crops':
     case 'ocr':

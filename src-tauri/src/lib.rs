@@ -7,6 +7,7 @@ pub mod services;
 
 use jobs::job_manager::JobManager;
 use services::analysis_service::AnalysisService;
+use services::assessment_organization_service::AssessmentOrganizationService;
 use services::document_content_extraction_service::DocumentContentExtractionService;
 use services::exam_package_build_service::ExamPackageBuildService;
 use services::graded_exam_review_service::GradedExamReviewService;
@@ -31,6 +32,7 @@ use services::student_answer_ocr_service::StudentAnswerOcrService;
 use services::student_scan_service::StudentScanService;
 use speakoflow_engine::SpeakoflowEngine;
 use std::sync::Arc;
+use tauri::Manager;
 
 pub struct AppState {
     pub project_store: ProjectStore,
@@ -53,6 +55,7 @@ pub struct AppState {
     pub rubric_extraction_service: Arc<RubricExtractionService>,
     pub scoring_service: Arc<ScoringService>,
     pub school_class_service: Arc<SchoolClassService>,
+    pub assessment_organization_service: Arc<AssessmentOrganizationService>,
     pub student_answer_crop_service: Arc<StudentAnswerCropService>,
     pub student_answer_ocr_service: Arc<StudentAnswerOcrService>,
     pub speaking_exam_service: SpeakingExamService,
@@ -130,6 +133,10 @@ pub fn run() {
                 pdf_preview_service.clone(),
             ));
             let school_class_service = Arc::new(SchoolClassService::new(project_store.clone()));
+            let assessment_organization_service = Arc::new(AssessmentOrganizationService::new(
+                project_store.clone(),
+                school_class_service.clone(),
+            ));
             let rubric_service = Arc::new(RubricService::new(project_store.clone()));
             let scoring_service = Arc::new(ScoringService::new(
                 project_store.clone(),
@@ -175,6 +182,7 @@ pub fn run() {
                 rubric_extraction_service,
                 scoring_service,
                 school_class_service,
+                assessment_organization_service,
                 student_answer_crop_service,
                 student_answer_ocr_service,
                 speaking_exam_service: SpeakingExamService::new(
@@ -201,6 +209,7 @@ pub fn run() {
             commands::analysis_commands::list_assessment_analyses,
             commands::project_commands::list_projects,
             commands::project_commands::create_project,
+            commands::project_commands::update_course_info,
             commands::project_commands::open_project,
             commands::project_commands::get_project_snapshot,
             commands::project_commands::get_default_project_path,
@@ -229,6 +238,8 @@ pub fn run() {
             commands::school_class_commands::list_school_classes,
             commands::school_class_commands::get_school_class_overview,
             commands::school_class_commands::list_class_students,
+            commands::school_class_commands::create_class_student,
+            commands::school_class_commands::update_class_student,
             commands::school_class_commands::create_school_class,
             commands::school_class_commands::update_school_class,
             commands::school_class_commands::archive_school_class,
@@ -238,11 +249,24 @@ pub fn run() {
             commands::school_class_commands::list_student_scan_batches,
             commands::school_class_commands::move_student_scan_batch,
             commands::school_class_commands::remove_student_scan_batch,
+            commands::assessment_organization_commands::list_assessment_activities,
+            commands::assessment_organization_commands::get_assessment_sequence_options,
+            commands::assessment_organization_commands::list_assessment_classes,
+            commands::assessment_organization_commands::create_assessment_activity,
+            commands::assessment_organization_commands::add_assessment_class_application,
+            commands::assessment_organization_commands::archive_assessment_class_application,
+            commands::assessment_organization_commands::attach_assessment_document,
+            commands::assessment_organization_commands::list_teaching_assignments,
+            commands::assessment_organization_commands::create_teaching_assignment,
+            commands::assessment_organization_commands::batch_create_teaching_assignments,
+            commands::assessment_organization_commands::archive_teaching_assignment,
             commands::student_answer_ocr_commands::start_student_answer_ocr,
             commands::student_answer_ocr_commands::start_student_identity_ocr,
             commands::student_answer_ocr_commands::update_student_answer_ocr_text,
             commands::student_answer_ocr_commands::mark_student_answer_ocr_reviewed,
             commands::student_answer_ocr_commands::mark_all_student_answer_ocr_reviewed,
+            commands::student_answer_ocr_commands::accept_student_answer_ocr_generation,
+            commands::student_answer_ocr_commands::reject_student_answer_ocr_generation,
             commands::student_answer_ocr_commands::save_student_answer_crop_template,
             commands::student_answer_ocr_commands::save_student_identity_crop_template,
             commands::student_answer_ocr_commands::preprocess_ocr_image,
@@ -250,6 +274,9 @@ pub fn run() {
             commands::student_answer_ocr_commands::suggest_ocr_issue_correction_with_model,
             commands::job_commands::get_job_snapshot,
             commands::job_commands::list_jobs,
+            commands::job_commands::cancel_job,
+            commands::job_commands::retry_job,
+            commands::job_commands::cleanup_job_history,
             commands::model_commands::get_model_status,
             commands::model_commands::probe_model_server,
             commands::model_commands::get_model_runtime_status,
@@ -295,7 +322,19 @@ pub fn run() {
             commands::speaking_exam_commands::update_speaking_criterion_level,
             commands::speaking_exam_commands::update_speaking_attempt_note,
             commands::speaking_exam_commands::approve_speaking_attempt,
+            commands::assessment_organization_commands::get_assessment_activity,
+            commands::assessment_organization_commands::get_assessment_class_applications,
+            commands::assessment_organization_commands::get_class_application_students,
+            commands::assessment_organization_commands::update_assessment_activity,
+            commands::assessment_organization_commands::remove_assessment_class_application,
         ])
-        .run(tauri::generate_context!())
-        .unwrap_or_else(|error| eprintln!("error while running tauri application: {error}"));
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|error| panic!("error while building tauri application: {error}"))
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    state.job_manager.shutdown_all_jobs(app_handle);
+                }
+            }
+        });
 }

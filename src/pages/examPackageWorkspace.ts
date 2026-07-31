@@ -36,7 +36,8 @@ const QUESTION_READY = new Set<Question['questionText']['status']>(['confirmed',
 const RUBRIC_INVALID = new Set<Question['rubric']['status']>(['missing', 'invalid', 'legacy']);
 
 export function normalizeExamPackageTab(rawTab: string | null): ExamPackageTab {
-  return rawTab === 'rubric' || rawTab === 'freeze' ? rawTab : 'question';
+  if (rawTab === 'documents' || rawTab === 'rubric' || rawTab === 'freeze') return rawTab;
+  return 'question';
 }
 
 export function resolveSelectedQuestionId(

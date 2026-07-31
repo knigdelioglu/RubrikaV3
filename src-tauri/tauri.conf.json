@@ -30,8 +30,7 @@
       "assetProtocol": {
         "enable": true,
         "scope": [
-          "$HOME/Documents/RubrikaV3/**/*",
-          "$HOME/Desktop/RubriKa/**/*"
+          "$HOME/Documents/RubrikaV3/Projects/**/*"
         ]
       }
     }

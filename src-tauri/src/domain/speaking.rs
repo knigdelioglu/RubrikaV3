@@ -520,6 +520,13 @@ pub struct SpeakingTranscriptCleanup {
 #[serde(rename_all = "camelCase")]
 pub struct SpeakingAttempt {
     pub id: String,
+    /// Canonical organization reference. Legacy attempts may omit these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_application_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub school_class_id: Option<String>,
     pub exam_id: String,
     pub student_id: String,
     pub attempt_number: u32,
@@ -589,12 +596,16 @@ pub struct SpeakingAttempt {
     pub prompt_version: String,
     #[serde(default)]
     pub rubric_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaking_config_snapshot: Option<crate::domain::assessment::SpeakingConfigurationSnapshot>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakingExam {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_id: Option<String>,
@@ -626,6 +637,8 @@ pub struct SpeakingExam {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_student_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_class_application_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
     #[serde(default)]
@@ -871,6 +884,7 @@ pub fn new_exam(
     let class_id = clean_assigned_ids.first().cloned();
     SpeakingExam {
         id: uuid::Uuid::new_v4().to_string(),
+        assessment_activity_id: None,
         title,
         class_id,
         assigned_class_ids: clean_assigned_ids,
@@ -892,6 +906,7 @@ pub fn new_exam(
         created_at: Utc::now().to_rfc3339(),
         updated_at: Utc::now().to_rfc3339(),
         active_student_id: None,
+        active_class_application_id: None,
         completed_at: None,
         attempts: vec![],
     }

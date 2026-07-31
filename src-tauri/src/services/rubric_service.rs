@@ -187,7 +187,9 @@ impl RubricService {
         }
 
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
 
         Ok(ImportRubricJsonOutput {
             imported_count,
@@ -273,7 +275,9 @@ impl RubricService {
         let updated = question.clone();
         project.invalidate_exam_package_if_frozen("package_changed_after_freeze");
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -324,7 +328,9 @@ impl RubricService {
 
         let updated = question.clone();
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(updated)
     }
 
@@ -426,7 +432,9 @@ impl RubricService {
             now,
         ));
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -618,7 +626,7 @@ impl RubricService {
                     technical_details: Some(format!("document_id={document_id}")),
                     correlation_id: Uuid::new_v4().to_string(),
                 })?;
-            Path::new(&document.stored_path).to_path_buf()
+            document.resolve_path(&project.root_path)?
         } else {
             return Err(AppError {
                 code: AppErrorCode::RubricJsonInvalid,
@@ -1012,6 +1020,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.questions = vec![confirmed_question(1), confirmed_question(2)];

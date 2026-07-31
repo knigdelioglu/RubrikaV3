@@ -70,6 +70,16 @@ import type {
   AssessmentKind,
   AssessmentAnalysis,
   FinishAssessmentOutput,
+  AssessmentActivity,
+  AssessmentSequenceOptions,
+  AssessmentClassApplication,
+  AssessmentType,
+  AssessmentStatus,
+  ListeningDetails,
+  SpeakingConfigurationSnapshot,
+  TeachingAssignment,
+  UpdateCourseInfoInput,
+  BatchCreateTeachingAssignmentsInput,
 } from './types';
 import type { AppError } from './errors';
 
@@ -99,6 +109,20 @@ function handleInvokeError(e: unknown): never {
 }
 
 export const commands = {
+  updateCourseInfo: async (input: UpdateCourseInfoInput): Promise<ProjectSnapshot> => {
+    try {
+      return await invoke<ProjectSnapshot>('update_course_info', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  batchCreateTeachingAssignments: async (input: BatchCreateTeachingAssignmentsInput): Promise<TeachingAssignment[]> => {
+    try {
+      return await invoke<TeachingAssignment[]>('batch_create_teaching_assignments', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
   getAppStatus: async (): Promise<AppStatus> => {
     try {
       return await invoke<AppStatus>('get_app_status');
@@ -169,51 +193,51 @@ export const commands = {
       handleInvokeError(e);
     }
   },
-  toggleSpeakingCapture: async (input: { projectId: string; examId: string; studentId: string; action: 'start' | 'pause' | 'resume' | 'stop' | 'cancel' }): Promise<ToggleSpeakingCaptureOutput> => {
+  toggleSpeakingCapture: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string; action: 'start' | 'pause' | 'resume' | 'stop' | 'cancel' }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('toggle_speaking_capture', { input });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  startSpeakingExamAttempt: async (input: { projectId: string; examId: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
+  startSpeakingExamAttempt: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('start_speaking_exam_attempt', { input: { ...input, action: 'start' } });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  stopSpeakingExamAttempt: async (input: { projectId: string; examId: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
+  stopSpeakingExamAttempt: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('stop_speaking_exam_attempt', { input: { ...input, action: 'stop' } });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  pauseSpeakingExamAttempt: async (input: { projectId: string; examId: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
+  pauseSpeakingExamAttempt: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('pause_speaking_exam_attempt', { input: { ...input, action: 'pause' } });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  resumeSpeakingExamAttempt: async (input: { projectId: string; examId: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
+  resumeSpeakingExamAttempt: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('resume_speaking_exam_attempt', { input: { ...input, action: 'resume' } });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  cancelSpeakingExamAttempt: async (input: { projectId: string; examId: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
+  cancelSpeakingExamAttempt: async (input: { projectId: string; examId: string; assessmentActivityId?: string; classApplicationId?: string; studentId: string }): Promise<ToggleSpeakingCaptureOutput> => {
     try {
       return await invoke<ToggleSpeakingCaptureOutput>('cancel_speaking_exam_attempt', { input: { ...input, action: 'cancel' } });
     } catch (e) {
       handleInvokeError(e);
     }
   },
-  getSpeakingExam: async (projectId: string, examId: string): Promise<SpeakingExam> => {
+  getSpeakingExam: async (projectId: string, examId: string, assessmentActivityId?: string, classApplicationId?: string): Promise<SpeakingExam> => {
     try {
-      return await invoke<SpeakingExam>('get_speaking_exam', { input: { projectId, examId } });
+      return await invoke<SpeakingExam>('get_speaking_exam', { input: { projectId, examId, assessmentActivityId, classApplicationId } });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -249,7 +273,9 @@ export const commands = {
   selectSpeakingExamClass: async (input: {
     projectId: string;
     examId: string;
-    classId: string;
+    classId?: string;
+    assessmentActivityId?: string;
+    classApplicationId?: string;
   }): Promise<SpeakingExam> => {
     try {
       return await invoke<SpeakingExam>('select_speaking_exam_class', { input });
@@ -260,6 +286,8 @@ export const commands = {
   selectSpeakingExamStudent: async (input: {
     projectId: string;
     examId: string;
+    assessmentActivityId?: string;
+    classApplicationId?: string;
     studentId: string;
   }): Promise<SpeakingExam> => {
     try {
@@ -343,6 +371,20 @@ export const commands = {
       handleInvokeError(e);
     }
   },
+  createClassStudent: async (input: { projectId: string; classId: string; displayName?: string; number?: string }): Promise<Student> => {
+    try {
+      return await invoke<Student>('create_class_student', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  updateClassStudent: async (input: { projectId: string; classId: string; studentId: string; displayName?: string; number?: string }): Promise<Student> => {
+    try {
+      return await invoke<Student>('update_class_student', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
   finishAssessment: async (input: {
     projectId: string;
     kind: AssessmentKind;
@@ -421,6 +463,170 @@ export const commands = {
   getSchoolClassOverview: async (projectId: string): Promise<SchoolClassOverviewSnapshot> => {
     try {
       return await invoke<SchoolClassOverviewSnapshot>('get_school_class_overview', { input: { projectId } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  listAssessmentActivities: async (input: {
+    projectId: string;
+    academicYearId?: string;
+    courseId?: string;
+    gradeLevel?: number;
+    term?: number;
+    assessmentType?: AssessmentType;
+    status?: AssessmentStatus;
+  }): Promise<AssessmentActivity[]> => {
+    try {
+      return await invoke<AssessmentActivity[]>('list_assessment_activities', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getAssessmentSequenceOptions: async (input: {
+    projectId: string;
+    academicYearId: string;
+    courseId: string;
+    term: number;
+    assessmentType: AssessmentType;
+  }): Promise<AssessmentSequenceOptions> => {
+    try {
+      return await invoke<AssessmentSequenceOptions>('get_assessment_sequence_options', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getAssessmentActivity: async (input: { projectId: string; activityId: string }): Promise<AssessmentActivity> => {
+    try {
+      return await invoke<AssessmentActivity>('get_assessment_activity', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  updateAssessmentActivity: async (input: { projectId: string; activityId: string; title?: string; speakingConfiguration?: SpeakingConfigurationSnapshot; status?: AssessmentStatus }): Promise<AssessmentActivity> => {
+    try {
+      return await invoke<AssessmentActivity>('update_assessment_activity', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getAssessmentClassApplications: async (input: { projectId: string; activityId: string }): Promise<AssessmentClassApplication[]> => {
+    try {
+      return await invoke<AssessmentClassApplication[]>('get_assessment_class_applications', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getClassApplicationStudents: async (input: { projectId: string; activityId: string; applicationId: string }): Promise<Student[]> => {
+    try {
+      return await invoke<Student[]>('get_class_application_students', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  listAssessmentClasses: async (input: {
+    projectId: string;
+    academicYearId: string;
+    courseId: string;
+    gradeLevel: number;
+  }): Promise<SchoolClass[]> => {
+    try {
+      return await invoke<SchoolClass[]>('list_assessment_classes', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  createAssessmentActivity: async (input: {
+    projectId: string;
+    academicYearId: string;
+    courseId: string;
+    courseName: string;
+    gradeLevel: number;
+    term: number;
+    assessmentType: AssessmentType;
+    sequenceNumber: number;
+    schoolClassIds: string[];
+    title?: string;
+    speakingConfiguration?: SpeakingConfigurationSnapshot;
+    listeningDetails?: ListeningDetails;
+  }): Promise<AssessmentActivity> => {
+    try {
+      return await invoke<AssessmentActivity>('create_assessment_activity', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  addAssessmentClassApplication: async (input: {
+    projectId: string;
+    activityId: string;
+    schoolClassId: string;
+    scheduledAt?: string;
+    applicationDate?: string;
+    notes?: string;
+  }): Promise<AssessmentClassApplication> => {
+    try {
+      return await invoke<AssessmentClassApplication>('add_assessment_class_application', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  archiveAssessmentClassApplication: async (input: {
+    projectId: string;
+    activityId: string;
+    applicationId: string;
+  }): Promise<AssessmentClassApplication> => {
+    try {
+      return await invoke<AssessmentClassApplication>('archive_assessment_class_application', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  removeAssessmentClassApplication: async (input: { projectId: string; activityId: string; applicationId: string }): Promise<AssessmentClassApplication> => {
+    try {
+      return await invoke<AssessmentClassApplication>('remove_assessment_class_application', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  attachAssessmentDocument: async (input: {
+    projectId: string;
+    activityId: string;
+    documentId: string;
+    applicationId?: string;
+  }): Promise<AssessmentActivity> => {
+    try {
+      return await invoke<AssessmentActivity>('attach_assessment_document', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  listTeachingAssignments: async (input: {
+    projectId: string;
+    academicYearId?: string;
+    includeInactive?: boolean;
+  }): Promise<TeachingAssignment[]> => {
+    try {
+      return await invoke<TeachingAssignment[]>('list_teaching_assignments', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  createTeachingAssignment: async (input: {
+    projectId: string;
+    academicYearId: string;
+    courseId: string;
+    courseName: string;
+    classSectionId: string;
+    teacherId?: string;
+  }): Promise<TeachingAssignment> => {
+    try {
+      return await invoke<TeachingAssignment>('create_teaching_assignment', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  archiveTeachingAssignment: async (input: { projectId: string; assignmentId: string }): Promise<TeachingAssignment> => {
+    try {
+      return await invoke<TeachingAssignment>('archive_teaching_assignment', { input });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -639,6 +845,20 @@ export const commands = {
       handleInvokeError(e);
     }
   },
+  acceptStudentAnswerOcrGeneration: async (input: { projectId: string; generationId: string }): Promise<import('./types').OcrGeneration> => {
+    try {
+      return await invoke<import('./types').OcrGeneration>('accept_student_answer_ocr_generation', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  rejectStudentAnswerOcrGeneration: async (input: { projectId: string; generationId: string }): Promise<import('./types').OcrGeneration> => {
+    try {
+      return await invoke<import('./types').OcrGeneration>('reject_student_answer_ocr_generation', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
   startStudentIdentityOcr: async (input: { projectId: string }): Promise<StartStudentIdentityOcrOutput> => {
     try {
       return await invoke<StartStudentIdentityOcrOutput>('start_student_identity_ocr', { input });
@@ -801,9 +1021,30 @@ export const commands = {
       handleInvokeError(e);
     }
   },
-  listJobs: async (projectId: string): Promise<JobSnapshot[]> => {
+  listJobs: async (projectId: string, projectRootPath?: string): Promise<JobSnapshot[]> => {
     try {
-      return await invoke<JobSnapshot[]>('list_jobs', { input: { projectId } });
+      return await invoke<JobSnapshot[]>('list_jobs', { input: { projectId, projectRootPath } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  cancelJob: async (jobId: string): Promise<JobSnapshot> => {
+    try {
+      return await invoke<JobSnapshot>('cancel_job', { input: { jobId } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  retryJob: async (jobId: string): Promise<JobSnapshot> => {
+    try {
+      return await invoke<JobSnapshot>('retry_job', { input: { jobId } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  cleanupJobHistory: async (projectRootPath: string, maxTerminalJobs?: number): Promise<unknown> => {
+    try {
+      return await invoke('cleanup_job_history', { input: { projectRootPath, maxTerminalJobs } });
     } catch (e) {
       handleInvokeError(e);
     }

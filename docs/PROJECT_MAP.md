@@ -22,6 +22,21 @@ Frontend React/TypeScript (örn. `src/pages/StudentAnswerOcrPage.tsx`)
 
 Konuşma sınavı özelinde `SpeakingExamService` tek Gemma 4 12B text-only runtime ile segment cleanup ve evidence-level evaluation çağrılarını yürütür; cleanup gate, scoring policy ve provenance backend'dedir.
 
+Assessment organization için canonical zincir şöyledir:
+
+```text
+Project setup (`/project/:projectId/classes`)
+  → SchoolClass / SchoolClassService
+  → TeachingAssignment filtrelemesi
+  → AssessmentOrganizationPage list-first create mode
+  → AssessmentActivity (tek ortak sınav)
+  → Canonical Exam Workspace (`/project/:projectId/activities/:activityId/:step`)
+  → ClassApplication (activity + schoolClassId tekilliği)
+  → SpeakingAttempt / StudentSubmissions / StudentAnswerOcrRecords
+```
+
+`CanonicalExamWorkspacePage` ve `CanonicalExamWorkspaceHeader` sınav açıldığında global menüyü değiştirmeden ana içerik alanında sınav türüne (Yazılı, Dinleme, Konuşma) özel 5 adımlı canonical çalışma alanını gösterir. Adım durumları (`not_started`, `ready`, `in_progress`, `needs_review`, `completed`, `blocked`) yalnız `WorkflowSnapshot` ve backend artifact durumundan türetilir. Sınıf filtresi yalnız `activity.classApplications` kayıtlarını sunar; sınıf değişiminde geçici görünüm state'i temizlenir. `SpeechExamPage` ve diğer üretim sayfaları bu adımlar altında wrapper/adapter olarak kullanılır.
+
 ---
 
 ## B. Klasör Haritası
@@ -41,6 +56,7 @@ Konuşma sınavı özelinde `SpeakingExamService` tek Gemma 4 12B text-only runt
 * **`src-tauri/src/jobs/`**: Uzun süren (long-running) asenkron işlemlerin yönetimi (`JobManager`, `JobSnapshot`). OCR veya PDF oluşturma gibi işlemler arayüzü kilitlemesin diye buradan yönetilir.
 * **`src-tauri/src/bin/`**: Harici binary CLI dosyaları (örn: `rubrika.rs` CLI araçları veya diagnostics için).
 * **`src-tauri/src/platform/`**: Dosya yolları (`paths.rs`) ve işletim sistemine özel dosya erişim detayları.
+  `project_paths.rs`, `TrustedProjectRoot` ve `ManagedProjectPath` ile proje içi tüm read/write containment, legacy path adaptation, symlink policy ve atomic temp doğrulamasının tek sahibidir.
 * **`src-tauri/src/diagnostics.rs`**: Uygulamanın sağlık durumu ve diagnostik raporlama araçları.
 
 ---
@@ -54,6 +70,7 @@ Konuşma sınavı özelinde `SpeakingExamService` tek Gemma 4 12B text-only runt
 | `src-tauri/src/domain/errors.rs` | Domain | Hata tipleri (`AppError`, `AppErrorCode`). UI'a gösterilecek yapılandırılmış hatalar. | - | - | Tüm uygulama | - | Rust'ta Error trait'i, `Result` döndürme |
 | `src-tauri/src/services/workflow_engine.rs` | Service | Proje durumuna bakıp bir sonraki `WorkflowSnapshot`'ı hesaplar. Frontend'in "ne yapmalıyım" kararı burada alınır. | `Project` ref | `WorkflowSnapshot` | `project_store.rs` | - | Saf fonksiyon tasarımı, referans kullanımı |
 | `src-tauri/src/services/project_store.rs` | Service | Projenin diske yazılması ve okunması (JSON). `project.json` atomik olarak yazılır. | `Project` struct | Diske yazma, okuma Result | Tüm komut ve servisler | `workflow_engine.rs` | Dosya I/O, atomik fsync |
+| `src-tauri/src/platform/project_paths.rs` | Platform/security boundary | Kullanıcı tarafından seçilen canonical proje kökü, managed relative path parsing, read/write containment, symlink policy ve legacy path adaptation. | Selected project path, managed path | `TrustedProjectRoot`, `ManagedProjectPath`, safe filesystem targets | `ProjectStore`, document/PDF/OCR/cache/artifact services | `file_access.rs` | Path canonicalization, containment, atomic staging |
 | `src-tauri/src/services/llama_server_gateway.rs` | Service | `llama.cpp` sunucusuna HTTP üzerinden prompt atar ve yanıtı parse eder. | `StudentAnswerOcrRequest` vb. | `StudentAnswerOcrResult` | OCR servisleri | `reqwest::Client` | Async I/O, HTTP Client, timeout |
 | `src-tauri/src/services/model_runtime_service.rs` | Service | Model sunucusunun (llama-server) çalışıp çalışmadığını, sağlığını ve portunu kontrol eder. | `ModelRuntimeRequest` | `ModelRuntimeStatus` | OCR / Soru servisleri | `model_process_manager.rs` | Process yönetimi, async health check |
 | `src-tauri/src/services/ocr_image_preprocess_service.rs` | Service | OCR öncesi crop görüntülerini temiz gri ton / yüksek kontrast / BW opsiyonuyla preprocess eder ve ayrı cache üretir. | `project_root`, `image_path`, `mode` | Preprocessed image path + diagnostics | `student_answer_ocr_service.rs`, `student_answer_ocr_commands.rs` | `image`, project cache | Görüntü ön işleme, deterministic cache |
@@ -155,3 +172,44 @@ UI: `StudentAnswerOcrIssueReviewPage.tsx` üzerindeki "Gemma ile öneriyi kontro
 → ModelGateway (`llama_server_gateway.rs`): strict JSON dönen issue correction isteği atanır
 → geri dönen snapshot: öğretmen onayı gerektiren öneri DTO'su (OCR metni otomatik güncellenmez)
 ```
+## Faz 2 — transactional ProjectStore persistence
+
+`ProjectStore` canonical persistence writer'dır. Proje mutation'ları `mutate` ile proje kökü bazlı lock altında güncel dosyadan okunur, invariant kontrolünden sonra `storage_revision` bir kez artırılır ve Faz 1 atomic replacement yardımcısıyla yazılır.
+
+- `Project.storage_revision`: backend-authoritative monotonik revision; legacy projelerde güvenli başlangıç değeri `0`.
+- `ProjectSnapshot`: project, revision, content fingerprint ve trusted root metadata'sını birlikte taşır.
+- `commit_job`: uzun işlerin snapshot + narrow commit yoludur; yalnız işin sahip olduğu alanları merge eder ve source generation uyuşmazlığını `stale` olarak döndürür.
+- Per-project lock registry farklı trusted root'ların paralel çalışmasına izin verir; global mutex kullanılmaz.
+- Production servislerinde blind `save_project(full_project)` yoktur. Fixture/migration uyumluluğu dışındaki yazımlar `mutate` veya `commit_job` üzerinden gider.
+
+Ayrıntılı persistence akışı, ownership matrisi ve conflict sözleşmesi için [`docs/PROJECTSTORE_CONCURRENCY.md`](PROJECTSTORE_CONCURRENCY.md) okunmalıdır.
+
+## Faz 3 — generation safety
+
+- `Project.student_answer_ocr_generations`, `OcrGenerationStatus` ve `OcrTeacherReviewStatus` OCR geçmişini active flat projection'dan ayırır.
+- `StudentAnswerOcrService::start` yalnız candidate queue eder; `commit_ocr_generation` source fingerprint doğrulaması ile dar commit yapar. `accept/reject_student_answer_ocr_generation` öğretmen karşılaştırma akışını yönetir.
+- `PdfPreviewService` active preview'ı silmeden `outputs/previews/<document_id>/.staging/<generation_id>` altında render eder ve doğrulanmış immutable generation manifest'ini `active_generation_id` pointer'ı ile etkinleştirir.
+- `StudentScanService::delete_student_submission` ve `SchoolClassService::remove_student_scan_batch` dependency scan + `commit_job` ile OCR/scoring/job/artifact ilişkilerini kontrol eder.
+- `diagnostics.rs` generation, orphan staging ve blocked deletion sayaçlarını PII olmadan raporlar.
+
+Ayrıntılı yaşam döngüsü, recovery, retention/GC ve silme sırası için [`docs/GENERATION_AND_ROLLBACK_SAFETY.md`](GENERATION_AND_ROLLBACK_SAFETY.md) okunmalıdır.
+
+## Faz 4 — model runtime ownership
+
+Model process lifecycle'ının tek sahibi `src-tauri/src/services/model_process_manager.rs`'dir.
+`ProcessInspector` (`src-tauri/src/platform/process_inspector.rs`) persisted PID
+recovery ve verified stop için native process identity sağlar. `ModelRuntimeService`
+lease facade'ıdır; model tüketicileri `acquire_runtime` ile aynı runtime instance'a
+bağlanır ve global iş-sonu stop çağrısı yapmaz.
+
+Detaylı identity, Child handle, restart recovery, profile transition, idle
+shutdown ve draining sözleşmesi için [`docs/MODEL_RUNTIME_OWNERSHIP.md`](MODEL_RUNTIME_OWNERSHIP.md)
+okunmalıdır.
+
+## Faz 5 / 5B / 5C — production job lifecycle and cancellation
+
+Tüm asenkron arka plan işlerinin tek yürütücüsü `src-tauri/src/jobs/job_manager.rs`'dir.
+7 durumlu makine (`Queued`, `Running`, `Succeeded`, `Partial`, `Failed`, `Cancelled`, `Interrupted`), `CancellationToken` bazlı iptal, `JobTaskGuard` panik koruması, `retry_job` canonical yeniden deneme, `cleanup_job_history` retention ve `shutdown_all_jobs` kontrollü kapama backend tarafından garanti edilir.
+Faz 5C kapsamında 10 domain servisinin tüm uzun işlemlerine (DocumentImport, PdfPreviewRender, QuestionTextExtraction, RubricPdfImport, ExamPackageBuild, StudentAnswerOcr, StudentIdentityOcr, Scoring, SpeakingEvaluation, AssessmentAnalysis) cancellation checkpoint'leri eklenmiş ve 16 production proof testi ile doğrulanmıştır.
+
+Ayrıntılı job envanteri, iptal noktaları ve UI event sözleşmesi için [`docs/JOB_LIFECYCLE_AND_CANCELLATION.md`](JOB_LIFECYCLE_AND_CANCELLATION.md) okunmalıdır.

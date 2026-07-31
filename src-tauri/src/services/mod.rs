@@ -1,4 +1,5 @@
 pub mod analysis_service;
+pub mod assessment_organization_service;
 // Domain services
 pub mod document_content_extraction_service;
 pub mod document_service;

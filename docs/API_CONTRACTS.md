@@ -7,7 +7,29 @@ This document defines the Tauri commands that bridge the React frontend with the
 - Long-running operations must be implemented as jobs, not synchronous commands.
 - Errors must use the `AppError` structure defined in `ERROR_CODES.md`.
 
+## Project path security contract
+
+`create_project` ve `open_project` backend tarafından `TrustedProjectRoot` ile canonicalize edilir. `project.json.root_path` yalnız metadata'dır; runtime save root'u değildir. Açılan root ile stored metadata uyuşmazlığı load failure değildir, ancak warning olarak raporlanır.
+
+Managed document/artifact inputs frontend'den absolute path kabul etmez; command yalnız `project_id` + domain ID veya managed relative path kullanır. Backend trusted root üzerinden containment, regular-file ve symlink kontrollerini tekrarlar. `file_path` alanı yalnız kullanıcının açıkça seçtiği external import source veya export destination sözleşmelerinde bulunabilir.
+
 ## Commands
+
+### Assessment organization contract
+
+`list_assessment_classes` is the shared class-selection read for written, listening and speaking activities. It returns only active classes matching the academic year, course, grade and active teaching assignments. `create_assessment_activity` creates one `AssessmentActivity` and one `ClassApplication` per selected class; duplicate main keys, duplicate activity/class links, ineligible classes, and mixed-grade selections are rejected. Speaking setup writes the activity directly; it does not create a new independent speaking class list. `attach_assessment_document` uses no application ID for common documents and an application ID for class-specific documents.
+
+The canonical UI ownership is `/project/:projectId/classes` for `create_teaching_assignment` and `/project/:projectId/activities` for assessment activity commands. Assessment create mode has no free-form course, academic-year, or grade inputs.
+
+Commands: `list_assessment_activities`, `get_assessment_sequence_options`, `get_assessment_activity`, `list_assessment_classes`, `create_assessment_activity`, `update_assessment_activity`, `get_assessment_class_applications`, `get_class_application_students`, `add_assessment_class_application`, `archive_assessment_class_application`, `remove_assessment_class_application`, `attach_assessment_document`, `list_teaching_assignments`, `create_teaching_assignment`, `archive_teaching_assignment`.
+
+`assessment_type` values are `written`, `listening`, `speaking`; workflow families are derived as `written`, `written`, `speaking` respectively. All organization errors are structured `AppError` values.
+
+Canonical Assessment Workspace routes are `/project/:projectId/activities/:assessmentActivityId/:step`. Canonical steps for `written` (`prep`, `students`, `ocr`, `scoring`, `results`), `listening` (`listening_content`, `questions`, `students`, `ocr_scoring`, `results`), and `speaking` (`settings`, `students`, `transcript`, `evaluation`, `results`) present type-specific steps in the main workspace content shell without changing the global navigation. Step readiness is calculated exclusively from backend `WorkflowSnapshot` and attempt states.
+
+Canonical speaking execution commands are `start_speaking_exam_attempt`, `toggle_speaking_capture`, `select_speaking_exam_class`, `select_speaking_exam_student` and `get_speaking_exam`. Canonical input carries `assessmentActivityId` and `classApplicationId`; `classId` alone is only a legacy adapter input and is not used by the new UI. `start_speaking_exam_attempt` rejects missing activity/application, unrelated applications, archived applications and students outside the selected SchoolClass roster.
+
+`SpeakingAttempt` is persisted under `AssessmentActivity.classApplications[*].speakingAttempts` with activity, application and school-class references plus the speaking configuration snapshot. `SpeakingExam` remains an in-memory/runtime compatibility projection for the existing audio service.
 
 ### Speaking evaluation contract
 
@@ -16,6 +38,17 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 `SpeakingSubindicatorScore` exposes `selectedLevelId`, `appliedLevelId`, `points`, positive/counter evidence IDs, missing requirements and optional ceiling reason/explanation. `selectedLevelId` is immutable model provenance; UI uses `appliedLevelId` for the effective contribution.
 
 `SpeakingMetrics` exposes recording/active speech durations, words per minute, silence/long pause/filler/repetition counts, duration tier, expected minimum duration, `sampleDurationSufficient` and `measurementConfidence`. A low-confidence short sample requires teacher review and is not automatic zero.
+
+### Job commands contract
+- `list_jobs`: Inputs `{ projectId: String, projectRootPath: Option<String> }`. Rehydrates persisted jobs and returns list of jobs.
+- `get_job_snapshot`: Inputs `{ jobId: String }`. Returns `JobSnapshot`.
+- `cancel_job`: Inputs `{ jobId: String }`. Sets `cancellation_requested = true`, signals Tokio cancellation token, cleans up active lease/staging state, and returns updated `JobSnapshot`.
+- `retry_job`: Inputs `{ jobId: String }`. Validates target terminal job (`failed`, `cancelled`, `interrupted`), registers new job with fresh `job_id`/`correlation_id`, preserves `retry_of_job_id`, and returns new `JobSnapshot`.
+- `cleanup_job_history`: Inputs `{ projectRootPath: String, maxTerminalJobs: Option<usize> }`. Cleans up terminal jobs exceeding `max_terminal_jobs` while protecting active jobs and retry-chain referenced jobs; returns `RetentionStats`.
+
+### Job cancellation & correlation ID contract (Phase 5C)
+- **Cancellation Checkpoints**: Every long-running job service periodically queries `cancellation_token.is_cancelled()`. On cancellation, active staging files and uncommitted draft models are discarded without modifying teacher-confirmed or active production data.
+- **Correlation ID Chain**: `correlation_id` passed at command invocation propagates identically across `JobRegistrationInput` $\rightarrow$ `JobSnapshot` $\rightarrow$ `ModelRuntimeLease` $\rightarrow$ `ModelGateway Request` $\rightarrow$ `ProjectStore Commit Event` $\rightarrow$ `Tauri Job Event`.
 
 ### `get_app_status`
 - **Input**: None
@@ -26,14 +59,16 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 ### `create_project`
 - **Input**: `CreateProjectInput { name: String, root_path: Option<String> }`
 - **Output**: `ProjectSnapshot`
-- **Errors**: `PERMISSION_DENIED`, `PROJECT_SAVE_FAILED`
+- **Errors**: `PERMISSION_DENIED`, `PROJECT_SAVE_FAILED`, `PROJECT_ALREADY_EXISTS`, `PROJECT_DIRECTORY_NOT_EMPTY`
 - **Job-based**: No
+- **Path rule**: Hedef klasör yoksa oluşturulur; mevcut klasör boş değilse veya `project.json` içeriyorsa backend reddeder ve sessiz overwrite yapmaz.
 
 ### `open_project`
 - **Input**: `OpenProjectInput { path: String }`
 - **Output**: `ProjectSnapshot`
-- **Errors**: `PROJECT_NOT_FOUND`, `PROJECT_LOAD_FAILED`
+- **Errors**: `PROJECT_NOT_FOUND`, `PROJECT_LOAD_FAILED`, `MANAGED_PATH_SYMLINK_ESCAPE`
 - **Job-based**: No
+- **Path rule**: `path` kullanıcı tarafından seçilen proje klasörü veya o klasördeki `project.json` olabilir. Stored `root_path` runtime root'u değiştiremez; taşınmış projeler yeni canonical konumundan açılır.
 
 ### `get_project_snapshot`
 - **Input**: `GetProjectInput { project_id: String }`
@@ -50,8 +85,9 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 ### `import_exam_source_pdf`
 - **Input**: `ImportPdfInput { project_id: String, file_path: String }`
 - **Output**: `DocumentSnapshot`
-- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`
+- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`, `UNSAFE_MANAGED_PATH`, `MANAGED_PATH_SYMLINK_ESCAPE`
 - **Job-based**: Yes (triggers PDF rendering job)
+- **Path rule**: `file_path` açıkça seçilmiş external source'tur. Import sonrası `Document.storedPath` yalnız `documents/...` relative managed kopyadır.
 
 ### `get_pdf_page_count`
 - **Input**: `PdfDocumentInput { project_id: String, document_id: String }`
@@ -92,13 +128,13 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 ### `import_answer_key_pdf`
 - **Input**: `ImportPdfInput { project_id: String, file_path: String }`
 - **Output**: `DocumentSnapshot`
-- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`
+- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`, `UNSAFE_MANAGED_PATH`, `MANAGED_PATH_SYMLINK_ESCAPE`
 - **Job-based**: Yes (triggers PDF rendering job)
 
 ### `import_student_scan_pdf`
 - **Input**: `ImportPdfInput { project_id: String, file_path: String }`
 - **Output**: `DocumentSnapshot`
-- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`
+- **Errors**: `DOCUMENT_IMPORT_FAILED`, `PDF_RENDER_FAILED`, `UNSAFE_MANAGED_PATH`, `MANAGED_PATH_SYMLINK_ESCAPE`
 - **Job-based**: Yes (triggers PDF rendering job)
 
 ### `list_student_scan_documents`
@@ -146,8 +182,9 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 ### `delete_student_submission`
 - **Input**: `DeleteStudentSubmissionInput { project_id: String, submission_id: String }`
 - **Output**: `void`
-- **Errors**: `STUDENT_SUBMISSION_NOT_FOUND`
+- **Errors**: `STUDENT_SUBMISSION_NOT_FOUND`, `STUDENT_SUBMISSION_IN_USE`, `SUBMISSION_DELETE_CONFLICT`
 - **Job-based**: No
+- **Safety**: OCR generation/history, OCR review, scoring, artifact veya running job referansı varsa metadata ve dosya silinmez.
 
 ### `mark_student_grouping_complete`
 - **Input**: `MarkStudentGroupingCompleteInput { project_id: String }`
@@ -167,6 +204,24 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Errors**: `WORKFLOW_BLOCKED`, `STUDENT_SCAN_NOT_FOUND`, `STUDENT_SCAN_PREVIEW_NOT_READY`, `STUDENT_GROUPING_NOT_READY`, `QUESTION_TEXT_MISSING`, `MODEL_SERVER_START_FAILED`, `MODEL_SERVER_READY_TIMEOUT`
 - **Job-based**: Yes
 - **Notes**: If the model server is not healthy yet, the backend starts the managed model process, waits for `/health`, then queues OCR. Teacher-facing errors stay structured; technical details remain in diagnostics.
+
+### `accept_student_answer_ocr_generation`
+- **Input**: `OcrGenerationInput { project_id: String, generation_id: String }`
+- **Output**: `OcrGeneration`
+- **Errors**: `OCR_GENERATION_CONFLICT`, `PROJECT_ENTITY_NOT_FOUND`, `PROJECT_MUTATION_CONFLICT`
+- **Job-based**: No
+- **Safety**: Active pointer transaction içinde değiştirilir; eski generation history'de kalır ve bağlı scoring invalidated olur.
+
+### `reject_student_answer_ocr_generation`
+- **Input**: `OcrGenerationInput { project_id: String, generation_id: String }`
+- **Output**: `OcrGeneration`
+- **Errors**: `OCR_GENERATION_CONFLICT`, `PROJECT_ENTITY_NOT_FOUND`
+- **Job-based**: No
+- **Safety**: Candidate rejected olur; mevcut active OCR projection'ı korunur.
+
+### Preview generation safety
+
+`start_pdf_preview_render` staging generation üretir. `PdfPreviewState.activeGenerationId` yalnız tüm sayfalar regular file, page count, manifest, source fingerprint ve trusted-root kontrollerinden sonra commit edilir. `PREVIEW_GENERATION_FAILED`, `PREVIEW_GENERATION_STALE` veya `PREVIEW_ACTIVE_GENERATION_MISSING` teacher-facing güvenli preview mesajlarına map edilir; UUID/path UI'a sızdırılmaz.
 
 ### `start_question_text_extraction`
 - **Input**: `StartQuestionTextExtractionInput { project_id: String, document_id?: String, source: "exam_pdf" }`
@@ -320,7 +375,10 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Job-based**: No
 
 ### Speaking roster and review commands
-- `list_class_students` reads the canonical common class roster used by written and speaking exams.
+- `list_class_students` reads the canonical common class roster used by written, listening and speaking exams.
+- `create_class_student` registers a student before any exam; active class applications for that class receive the new student in their persisted scope.
+- `update_class_student` edits the name or school number without creating a second student record.
+- The class roster UI is `/project/:projectId/students?tab=roster`; PDF grouping and identity OCR remain separate operational tabs.
 - `select_speaking_exam_class` and `select_speaking_exam_student` persist the resumable session location.
 - `update_speaking_criterion_level` accepts `very_good | good | moderate | developing` for teacher-only criteria and maps the level to a bounded score in Rust.
 - `update_speaking_attempt_note` persists the teacher note without waiting for final approval.
@@ -347,9 +405,20 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 
 ### `stop_model_server`
 - **Input**: `ProfileSelectionInput { profileId?: string }`
-- **Output**: `StopModelServerOutput`
-- **Errors**: `MODEL_SERVER_STOP_FAILED`, `MODEL_SERVER_NOT_STARTED_BY_APP`
+- **Output**: `StopModelServerOutput { stopped: boolean, draining: boolean, activeLeaseCount: number, message: string }`
+- **Errors**: `MODEL_SERVER_STOP_FAILED`, `MODEL_PROCESS_UNVERIFIED`, `MODEL_PROCESS_IDENTITY_MISMATCH`, `MODEL_RUNTIME_IN_USE`
 - **Job-based**: No
+
+`stop_model_server` aktif lease varken process'i doğrudan sonlandırmaz. Coordinator
+`Draining` durumuna geçer ve mevcut lease'ler release edilene kadar bekler.
+
+### `acquire_runtime` / `release_runtime` (backend service contract)
+- **Owner**: `ModelProcessManager` üzerinden `ModelRuntimeService`
+- **Acquire**: `profile`, `ModelRuntimeRequest`, `consumerId`, `jobId`
+- **Grant**: lease ID, runtime instance ID, profile fingerprint ve verified base URL
+- **Release**: yalnız aynı lease ID + runtime instance ID; idempotent public guard
+- **Errors**: `MODEL_RUNTIME_DRAINING`, `MODEL_RUNTIME_PROFILE_BUSY`, `MODEL_RUNTIME_START_FAILED`, `MODEL_RUNTIME_READINESS_TIMEOUT`, `MODEL_RUNTIME_LEASE_INVALID`, `MODEL_RUNTIME_LEASE_ALREADY_RELEASED`
+- **Invariant**: lease release'i başka job'ın runtime'ını durdurmaz; son lease sonrası idle shutdown uygulanır.
 
 ### `set_model_mode`
 - **Input**: `SetModelModeInput { profileId?: string, mode: "external" | "managed" }`
@@ -392,3 +461,18 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - Request diagnostics should include prompt length, image count, image bytes, and base64 size estimates
 
 *Note: Some commands listed above are explicitly planned and may not be fully implemented yet.*
+## Faz 2 — ProjectStore concurrency contract
+
+`Project` JSON'unda backend-authoritative `storageRevision` alanı bulunur. Alanı olmayan legacy projeler `0` revision ile yüklenir; salt açılış rewrite yapmaz. Başarılı canonical mutation revision'ı tam bir kez artırır.
+
+`UpdateCourseInfoInput` gibi kısa mutation DTO'ları isteğe bağlı `expectedRevision` taşıyabilir. Frontend revision üretemez veya authoritative olarak overwrite edemez; backend güncel entity'yi ID ile bulur.
+
+Backend içi persistence sonuçları:
+
+- `ProjectSnapshot { project, revision, contentFingerprint, trustedRoot }`
+- `MutationOutput<T> { result, snapshot }`
+- `JobCommitResult<T>`: `Applied`, `Stale`, `Conflict`, `EntityMissing`, `Rejected`
+
+Typed conflict kodları `PROJECT_REVISION_CONFLICT`, `PROJECT_EXTERNALLY_MODIFIED`, `PROJECT_MUTATION_CONFLICT`, `PROJECT_ENTITY_STALE`, `PROJECT_ENTITY_NOT_FOUND` ve `PROJECT_MUTATION_REJECTED` olarak API error union'ına eklenmiştir. Teacher-facing mesajlar teknik revision/hash/path göstermez; conflict UI'sı yerel formu koruyarak “Son durumu yenile” eylemi sunar.
+
+Servisler uzun iş sonunda eski full snapshot'ı körlemesine yazamaz. Snapshot + source hash/generation alınır, dış iş lock'suz yapılır, sonuç `commit_job` ile güncel dosyaya narrow merge edilir. Ayrıntılı sözleşme ve production writer matrisi [`docs/PROJECTSTORE_CONCURRENCY.md`](PROJECTSTORE_CONCURRENCY.md) içindedir.

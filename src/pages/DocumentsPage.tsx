@@ -64,7 +64,7 @@ function fileNameFromPath(path: string): string {
   return path.split(/[\\/]/).pop() || 'Öğrenci cevapları.pdf';
 }
 
-export function DocumentsPage() {
+export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } = {}) {
   const { projectId, projectPath, isResolving } = useProjectContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
@@ -147,6 +147,10 @@ export function DocumentsPage() {
   const effectivePreviewState = toWorkspacePreviewState(
     previewStatusQuery.data?.status ?? selectedDocument?.preview?.status,
   );
+  const hasUsablePreview = Boolean(
+    selectedDocument?.preview?.activeGenerationId
+      || selectedDocument?.preview?.renderedAt,
+  );
 
   const pagePreviewsQuery = useQuery({
     queryKey: ['pdf-page-previews', projectId, selectedDocument?.id],
@@ -154,7 +158,7 @@ export function DocumentsPage() {
       projectId,
       documentId: selectedDocument?.id ?? '',
     }),
-    enabled: !!projectId && !!selectedDocument && effectivePreviewState === 'ready',
+    enabled: !!projectId && !!selectedDocument && (effectivePreviewState === 'ready' || hasUsablePreview),
   });
   const pagePreviews = pagePreviewsQuery.data ?? [];
   const selectedJobId = previewStatusQuery.data?.jobId ?? selectedDocument?.preview?.jobId;
@@ -479,22 +483,26 @@ export function DocumentsPage() {
 
   return (
     <div className="documents-workspace">
-      <div className="documents-workspace__breadcrumb">
-        <Link to={`/project/${encodeURIComponent(projectId)}/overview`}>← İş akışına dön</Link>
-      </div>
+      {!hideHeader && (
+        <>
+          <div className="documents-workspace__breadcrumb">
+            <Link to={`/project/${encodeURIComponent(projectId)}/overview`}>← İş akışına dön</Link>
+          </div>
 
-      <header className="documents-workspace__header">
-        <div>
-          <h2>Belgeler</h2>
-          <p>Sınav belgelerini yükleyin ve sayfaların doğru göründüğünü kontrol edin.</p>
-        </div>
-        <dl className="documents-summary" aria-label="Belge özeti">
-          <div><dt>Yüklü belge</dt><dd>{summary.uploadedCount} / 3</dd></div>
-          <div><dt>Önizleme hazır</dt><dd>{summary.readyPreviewCount} / 3</dd></div>
-          <div><dt>Devam eden iş</dt><dd>{summary.activePreviewCount}</dd></div>
-          <div className={summary.failedPreviewCount ? 'has-error' : ''}><dt>Müdahale gerekli</dt><dd>{summary.failedPreviewCount}</dd></div>
-        </dl>
-      </header>
+          <header className="documents-workspace__header">
+            <div>
+              <h2>Belgeler</h2>
+              <p>Sınav belgelerini yükleyin ve sayfaların doğru göründüğünü kontrol edin.</p>
+            </div>
+            <dl className="documents-summary" aria-label="Belge özeti">
+              <div><dt>Yüklü belge</dt><dd>{summary.uploadedCount} / 3</dd></div>
+              <div><dt>Önizleme hazır</dt><dd>{summary.readyPreviewCount} / 3</dd></div>
+              <div><dt>Devam eden iş</dt><dd>{summary.activePreviewCount}</dd></div>
+              <div className={summary.failedPreviewCount ? 'has-error' : ''}><dt>Müdahale gerekli</dt><dd>{summary.failedPreviewCount}</dd></div>
+            </dl>
+          </header>
+        </>
+      )}
 
       {error && <ErrorBanner error={error} />}
       {queryError && <ErrorBanner error={operationError(
@@ -704,6 +712,16 @@ export function DocumentsPage() {
               </div>
             )}
 
+            {previewRunning && hasUsablePreview && (
+              <div className="document-preview-callout">
+                <FileText size={22} aria-hidden="true" />
+                <div>
+                  <strong>Önizleme yenileniyor</strong>
+                  <p>Mevcut önizleme, yeni sürüm hazır olana kadar kullanılabilir.</p>
+                </div>
+              </div>
+            )}
+
             {(effectivePreviewState === 'not_started' || effectivePreviewState === 'failed') && (
               <div className={`document-preview-callout ${effectivePreviewState === 'failed' ? 'is-error' : ''}`}>
                 {effectivePreviewState === 'failed' ? <AlertTriangle size={22} aria-hidden="true" /> : <FileText size={22} aria-hidden="true" />}
@@ -723,17 +741,17 @@ export function DocumentsPage() {
               </div>
             )}
 
-            {effectivePreviewState === 'ready' && pagePreviewsQuery.isLoading && (
+            {hasUsablePreview && pagePreviewsQuery.isLoading && (
               <div className="document-viewer-state" role="status"><Loader2 className="animate-spin" aria-hidden="true" /> Sayfa görüntüleri yükleniyor…</div>
             )}
-            {effectivePreviewState === 'ready' && !pagePreviewsQuery.isLoading && pagePreviews.length === 0 && (
+            {hasUsablePreview && !pagePreviewsQuery.isLoading && pagePreviews.length === 0 && (
               <div className="document-preview-callout is-error">
                 <AlertTriangle size={22} aria-hidden="true" />
                 <div><strong>Sayfa görüntüsü bulunamadı</strong><p>Belge korunuyor. Önizlemeyi yeniden hazırlayın.</p></div>
                 <LoadingButton type="button" className="button button--primary" onClick={() => void handlePreview()} loading={previewMutation.isPending}>Yeniden Dene</LoadingButton>
               </div>
             )}
-            {effectivePreviewState === 'ready' && pagePreviews.length > 0 && (
+            {hasUsablePreview && pagePreviews.length > 0 && (
               <DocumentPreviewViewer
                 key={selectedDocument.id}
                 documentName={selectedDocument.fileName}

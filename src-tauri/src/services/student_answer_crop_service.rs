@@ -11,6 +11,7 @@ use crate::domain::student::{
     StudentAnswerCropTemplateItem, StudentAnswerOcrCropBBox, StudentAnswerOcrRenderDiagnostics,
     StudentIdentityCropTemplate, StudentSubmission,
 };
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
 use crate::services::workflow_engine;
@@ -99,7 +100,9 @@ impl StudentAnswerCropService {
             project.student_answer_ocr_records.clear();
         }
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -119,7 +122,9 @@ impl StudentAnswerCropService {
         template.updated_at = Some(chrono::Utc::now().to_rfc3339());
         project.student_identity_crop_template = Some(template);
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.project_store.save_project(&project)?;
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
         Ok(project)
     }
 
@@ -425,19 +430,13 @@ impl StudentAnswerCropService {
         let (x, y, crop_width, crop_height, crop_was_clamped, crop_margin_applied) =
             crop_rect(crop_template, width, height);
         let cropped = image.crop_imm(x, y, crop_width, crop_height);
-        let crop_dir = Path::new(project_root)
-            .join("crops")
-            .join("student_answer_ocr")
-            .join(document_id)
-            .join(submission_id);
-        std::fs::create_dir_all(&crop_dir).map_err(|error| AppError {
-            code: AppErrorCode::FileWriteFailed,
-            message: "Crop dizini oluşturulamadı.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Disk izinlerini kontrol edin.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(PathBuf::from(project_root), false)?;
+        let crop_relative = trusted_root.managed(&format!(
+            "crops/student_answer_ocr/{document_id}/{submission_id}"
+        ))?;
+        let crop_dir = trusted_root.root().join(crop_relative.as_path());
+        trusted_root.ensure_managed_directory(&crop_dir)?;
         let crop_path = crop_dir.join(format!("q{question_number}_p{page_number}.png"));
         cropped.save(&crop_path).map_err(|error| AppError {
             code: AppErrorCode::PdfRenderFailed,
@@ -493,19 +492,13 @@ impl StudentAnswerCropService {
         let (x, y, crop_width, crop_height, crop_was_clamped, crop_margin_applied) =
             crop_rect(&item, width, height);
         let cropped = image.crop_imm(x, y, crop_width, crop_height);
-        let crop_dir = Path::new(project_root)
-            .join("crops")
-            .join("student_identity_ocr")
-            .join(document_id)
-            .join(submission_id);
-        std::fs::create_dir_all(&crop_dir).map_err(|error| AppError {
-            code: AppErrorCode::FileWriteFailed,
-            message: "Kimlik crop dizini oluşturulamadı.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Disk izinlerini kontrol edin.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(PathBuf::from(project_root), false)?;
+        let crop_relative = trusted_root.managed(&format!(
+            "crops/student_identity_ocr/{document_id}/{submission_id}"
+        ))?;
+        let crop_dir = trusted_root.root().join(crop_relative.as_path());
+        trusted_root.ensure_managed_directory(&crop_dir)?;
         let crop_path = crop_dir.join(format!("identity_p{page_number}.png"));
         cropped.save(&crop_path).map_err(|error| AppError {
             code: AppErrorCode::PdfRenderFailed,

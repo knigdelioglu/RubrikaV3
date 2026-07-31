@@ -51,6 +51,32 @@ pub struct ManagedModelProcess {
     pub base_url: String,
     pub log_path: PathBuf,
     pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub identity: Option<ManagedProcessIdentity>,
+    #[serde(default)]
+    pub runtime_instance_id: Option<String>,
+    #[serde(default)]
+    pub runtime_profile_fingerprint: Option<String>,
+    #[serde(default)]
+    pub unverified: bool,
+}
+
+/// The persisted identity is deliberately stronger than a PID. It is only
+/// valid for lifecycle decisions when all available signals match the live
+/// process inspection result.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedProcessIdentity {
+    pub pid: u32,
+    pub owner_uid: u32,
+    pub process_start_time_unix_ms: u128,
+    pub canonical_executable_path: PathBuf,
+    pub executable_fingerprint: String,
+    pub argv_fingerprint: String,
+    pub expected_port: u16,
+    pub runtime_profile_fingerprint: String,
+    pub launch_instance_id: String,
+    pub launched_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -68,6 +94,10 @@ pub struct ModelStatus {
     pub completion_probe_ok: bool,
     pub managed_process_pid: Option<u32>,
     pub started_by_app: bool,
+    #[serde(default)]
+    pub active_lease_count: usize,
+    #[serde(default)]
+    pub draining: bool,
     pub log_path: Option<PathBuf>,
     pub last_error: Option<AppError>,
     pub warnings: Vec<String>,
@@ -100,6 +130,8 @@ impl Default for ModelStatus {
             completion_probe_ok: false,
             managed_process_pid: None,
             started_by_app: false,
+            active_lease_count: 0,
+            draining: false,
             log_path: None,
             last_error: None,
             warnings: vec![],

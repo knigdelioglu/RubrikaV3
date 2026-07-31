@@ -120,6 +120,28 @@ pub enum StudentAnswerOcrStatus {
     TeacherApproved,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrGenerationStatus {
+    Candidate,
+    ReadyForReview,
+    Active,
+    Rejected,
+    Failed,
+    Stale,
+    Interrupted,
+    Superseded,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrTeacherReviewStatus {
+    NotRequired,
+    Pending,
+    Approved,
+    Rejected,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PageGroupingMode {
@@ -187,6 +209,32 @@ pub struct StudentSubmission {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+}
+
+/// A versioned OCR result set. Each submission gets its own generation so a
+/// partial or stale rerun can never replace another submission's active data.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrGeneration {
+    pub generation_id: String,
+    pub submission_id: String,
+    pub source_fingerprint: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    pub prompt_version: String,
+    pub status: OcrGenerationStatus,
+    #[serde(default)]
+    pub result: Vec<StudentAnswerOcrRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<serde_json::Value>,
+    pub teacher_review_status: OcrTeacherReviewStatus,
+    pub created_by_job_id: String,
+    pub source_document_id: String,
+    #[serde(default)]
+    pub source_storage_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

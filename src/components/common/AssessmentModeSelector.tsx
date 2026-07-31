@@ -1,4 +1,4 @@
-import { FileText, Mic2 } from 'lucide-react';
+import { FileText, Headphones, Mic2 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { getAssessmentMode, getAssessmentModePath, type AssessmentMode } from '../../app/assessmentMode';
 import { useProjectContext } from '../../state/useProjectContext';
@@ -7,7 +7,7 @@ export function AssessmentModeSelector() {
   const navigate = useNavigate();
   const location = useLocation();
   const { projectId } = useProjectContext();
-  const activeMode = getAssessmentMode(location.pathname);
+  const activeMode = getAssessmentMode(location.pathname, location.search);
 
   const selectMode = (mode: AssessmentMode) => {
     if (mode !== activeMode) navigate(getAssessmentModePath(mode, projectId));
@@ -24,6 +24,16 @@ export function AssessmentModeSelector() {
       >
         <FileText size={15} aria-hidden="true" />
         Yazılı Sınav
+      </button>
+      <button
+        type="button"
+        className={activeMode === 'listening' ? 'is-active' : ''}
+        role="radio"
+        aria-checked={activeMode === 'listening'}
+        onClick={() => selectMode('listening')}
+      >
+        <Headphones size={15} aria-hidden="true" />
+        Dinleme Sınavı
       </button>
       <button
         type="button"

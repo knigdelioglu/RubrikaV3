@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use crate::domain::document::DocumentRole;
 use crate::domain::document::PdfPreviewStatus;
 use crate::domain::job::{JobSnapshot, JobStatus};
@@ -9,6 +11,7 @@ use crate::domain::student::student_identity_is_missing;
 use crate::domain::workflow::{BlockingReason, WorkflowAction, WorkflowSnapshot, WorkflowStage};
 
 use crate::domain::workflow::{WorkflowReadiness, WorkflowStep, WorkflowSummary};
+use crate::platform::project_paths::{is_absolute_like_path, TrustedProjectRoot};
 
 pub fn evaluate_workflow(project: &Project) -> WorkflowSnapshot {
     evaluate_workflow_with_context(
@@ -1158,15 +1161,18 @@ fn student_grouping_is_complete(project: &Project) -> bool {
 }
 
 fn check_preview_cache_valid(root_path: &str, document_id: &str) -> bool {
-    let path = std::path::Path::new(root_path)
-        .join("cache")
-        .join("page_previews")
-        .join(document_id)
-        .join("page_previews.json");
-
-    if !path.exists() || !path.is_file() {
+    let Ok(trusted_root) = TrustedProjectRoot::from_canonical_root(PathBuf::from(root_path), false)
+    else {
         return false;
-    }
+    };
+    let Ok(managed_index) = trusted_root.managed(&format!(
+        "cache/page_previews/{document_id}/page_previews.json"
+    )) else {
+        return false;
+    };
+    let Ok(path) = trusted_root.resolve_existing_file(&managed_index) else {
+        return false;
+    };
 
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -1192,8 +1198,13 @@ fn check_preview_cache_valid(root_path: &str, document_id: &str) -> bool {
             Some(s) => s,
             None => return false,
         };
-        let img_path = std::path::Path::new(image_path_str);
-        if !img_path.exists() || !img_path.is_file() {
+        let resolved = if is_absolute_like_path(image_path_str) {
+            trusted_root.relative_for_existing(Path::new(image_path_str))
+        } else {
+            trusted_root.managed(image_path_str)
+        }
+        .and_then(|managed| trusted_root.resolve_existing_file(&managed));
+        if resolved.is_err() {
             return false;
         }
     }
@@ -1210,13 +1221,21 @@ fn student_scan_preview_progress(
     }
     let mut current = 0;
     let mut total = 0;
+    let Ok(trusted_root) = TrustedProjectRoot::from_canonical_root(PathBuf::from(root_path), false)
+    else {
+        return None;
+    };
     for document in student_scan_docs {
         total += document.page_count;
-        let metadata_path = std::path::Path::new(root_path)
-            .join("cache")
-            .join("page_previews")
-            .join(&document.id)
-            .join("page_previews.json");
+        let Ok(metadata) = trusted_root.managed(&format!(
+            "cache/page_previews/{}/page_previews.json",
+            document.id
+        )) else {
+            continue;
+        };
+        let Ok(metadata_path) = trusted_root.resolve_existing_file(&metadata) else {
+            continue;
+        };
         let Some(index) = std::fs::read_to_string(&metadata_path)
             .ok()
             .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
@@ -1272,12 +1291,19 @@ mod tests {
             created_at: "".into(),
             updated_at: "".into(),
             root_path: "".into(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             student_scan_document_id: None,
@@ -1341,6 +1367,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -1393,6 +1422,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -1423,6 +1455,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.questions.push(Question {
@@ -1505,6 +1540,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.student_scan_document_id = Some("student_scan".into());
@@ -1623,6 +1661,9 @@ mod tests {
                 page_count: None,
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         with_preview_missing.student_scan_document_id = Some("scan".into());
@@ -1646,6 +1687,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         with_grouping_missing.student_scan_document_id = Some("scan".into());
@@ -1669,6 +1713,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         ready_for_ocr.student_scan_document_id = Some("scan".into());
@@ -1724,6 +1771,9 @@ mod tests {
                 page_count: None,
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.student_scan_document_id = Some("scan".into());
@@ -1752,6 +1802,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.student_scan_document_id = Some("scan".into());
@@ -1776,6 +1829,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.student_scan_document_id = Some("scan".into());
@@ -1834,6 +1890,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.documents.push(Document {
@@ -1850,6 +1909,9 @@ mod tests {
                 page_count: Some(2),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.student_scan_document_id = Some("scan".into());
@@ -1935,6 +1997,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -1998,6 +2063,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.questions.push(Question {
@@ -2047,6 +2115,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -2098,10 +2169,14 @@ mod tests {
         let jobs = vec![
             crate::domain::job::JobSnapshot {
                 id: "failed".into(),
+                schema_version: 1,
                 project_id: "p".into(),
                 project_root_path: None,
                 kind: crate::domain::job::JobKind::QuestionTextExtraction,
+                display_label: None,
                 status: crate::domain::job::JobStatus::Failed,
+                cancellation_requested: false,
+                cancellation_requested_at: None,
                 progress: crate::domain::job::JobProgress {
                     current: 1,
                     total: 1,
@@ -2110,6 +2185,10 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 last_message: None,
+                correlation_id: "corr".into(),
+                idempotency_key: None,
+                cancellable: true,
+                retry_of_job_id: None,
                 result: None,
                 error: None,
                 created_at: "1".into(),
@@ -2117,10 +2196,14 @@ mod tests {
             },
             crate::domain::job::JobSnapshot {
                 id: "other".into(),
+                schema_version: 1,
                 project_id: "p".into(),
                 project_root_path: None,
                 kind: crate::domain::job::JobKind::PdfPreviewRender,
+                display_label: None,
                 status: crate::domain::job::JobStatus::Running,
+                cancellation_requested: false,
+                cancellation_requested_at: None,
                 progress: crate::domain::job::JobProgress {
                     current: 1,
                     total: 2,
@@ -2129,6 +2212,10 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 last_message: None,
+                correlation_id: "corr-2".into(),
+                idempotency_key: None,
+                cancellable: true,
+                retry_of_job_id: None,
                 result: None,
                 error: None,
                 created_at: "2".into(),
@@ -2156,6 +2243,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
 
@@ -2189,6 +2279,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         p.questions.push(Question {
@@ -2252,6 +2345,9 @@ mod tests {
                 page_count: Some(1),
                 job_id: None,
                 error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
             }),
         });
         project.documents.push(Document {

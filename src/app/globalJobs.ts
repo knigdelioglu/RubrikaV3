@@ -1,6 +1,7 @@
 import type { JobKind, JobSnapshot } from '../api/types';
 
 const jobLabels: Record<JobKind, string> = {
+  document_import: 'Belge yükleniyor',
   question_text_extraction: 'Soru metinleri hazırlanıyor',
   pdf_preview_render: 'PDF önizlemesi hazırlanıyor',
   rubric_pdf_import: 'Rubrikler hazırlanıyor',
@@ -13,7 +14,7 @@ const jobLabels: Record<JobKind, string> = {
 };
 
 export function getJobLabel(kind: JobKind): string {
-  return jobLabels[kind];
+  return jobLabels[kind] || 'İşlem yürütülüyor';
 }
 
 export function getActiveJobs(jobs: JobSnapshot[]): JobSnapshot[] {
@@ -21,7 +22,11 @@ export function getActiveJobs(jobs: JobSnapshot[]): JobSnapshot[] {
 }
 
 export function getFailedJobs(jobs: JobSnapshot[]): JobSnapshot[] {
-  return jobs.filter((job) => job.status === 'failed');
+  return jobs.filter((job) => job.status === 'failed' || job.status === 'interrupted');
+}
+
+export function getPartialJobs(jobs: JobSnapshot[]): JobSnapshot[] {
+  return jobs.filter((job) => job.status === 'partial');
 }
 
 export function getJobProgressPercent(job: JobSnapshot): number {
@@ -32,9 +37,16 @@ export function getJobProgressPercent(job: JobSnapshot): number {
 export function getJobCenterButtonLabel(jobs: JobSnapshot[]): string {
   const activeJobs = getActiveJobs(jobs);
   const failedJobs = getFailedJobs(jobs);
+  const partialJobs = getPartialJobs(jobs);
   const [activeJob] = activeJobs;
-  if (activeJob && activeJobs.length === 1) return getJobLabel(activeJob.kind);
+  if (activeJob && activeJobs.length === 1) {
+    if (activeJob.cancellationRequested) {
+      return `${getJobLabel(activeJob.kind)} (İptal ediliyor...)`;
+    }
+    return getJobLabel(activeJob.kind);
+  }
   if (activeJobs.length > 1) return `${activeJobs.length} işlem devam ediyor`;
   if (failedJobs.length > 0) return `${failedJobs.length} işlem kontrol bekliyor`;
+  if (partialJobs.length > 0) return `${partialJobs.length} işlem kısmen tamamlandı`;
   return 'Aktif işlem yok';
 }

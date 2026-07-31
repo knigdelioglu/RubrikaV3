@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::domain::project::Project;
 use crate::domain::scoring::{scoring_active_records, ScoringReviewStatus};
 use crate::domain::speaking::SpeakingAttemptState;
 use crate::jobs::job_manager::JobManager;
-use crate::platform::file_access::atomic_write;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_gateway::ModelGateway;
 use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
@@ -82,12 +82,15 @@ impl AnalysisService {
                     exam.updated_at = now;
                     exam.active_student_id = None;
                 }
-                self.project_store.save_project(&project)?;
+                self.project_store
+                    .commit_snapshot_cas(&project)
+                    .map(|_| ())?;
                 analysis
             }
             AssessmentKind::Written => build_written_analysis(&project)?,
         };
-        self.save_analysis(&project.root_path, &analysis)?;
+        let trusted_root = self.project_store.trusted_project_root(&project_id)?;
+        self.save_analysis(&trusted_root, &analysis)?;
 
         let job = self.job_manager.start_job(
             &app,
@@ -102,10 +105,10 @@ impl AnalysisService {
         let app_for_job = app.clone();
         let job_id = job.id.clone();
         let analysis_id = analysis.id.clone();
-        let project_root = project.root_path.clone();
+        let trusted_root_for_job = trusted_root.clone();
         tokio::spawn(async move {
             service
-                .generate_report(app_for_job, job_id, project_root, analysis)
+                .generate_report(app_for_job, job_id, trusted_root_for_job, analysis)
                 .await;
         });
 
@@ -117,26 +120,28 @@ impl AnalysisService {
     }
 
     pub fn get(&self, project_id: &str, analysis_id: &str) -> Result<AssessmentAnalysis, AppError> {
-        let project = self
-            .project_store
-            .get_project_snapshot(project_id.to_string())?;
-        let path = analysis_path(&project.root_path, analysis_id)?;
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        let managed = analysis_managed_path(&trusted_root, analysis_id)?;
+        let path = trusted_root.resolve_existing_file(&managed)?;
         read_analysis(&path)
     }
 
     pub fn list(&self, project_id: &str) -> Result<Vec<AssessmentAnalysis>, AppError> {
-        let project = self
-            .project_store
-            .get_project_snapshot(project_id.to_string())?;
-        let dir = analysis_dir(&project.root_path);
-        if !dir.exists() {
-            return Ok(vec![]);
-        }
+        let trusted_root = self.project_store.trusted_project_root(project_id)?;
+        let analysis_dir = trusted_root.managed("outputs/analysis")?;
+        let dir = match trusted_root.resolve_existing_directory(&analysis_dir) {
+            Ok(path) => path,
+            Err(_) => return Ok(vec![]),
+        };
         let mut analyses = std::fs::read_dir(&dir)
             .map_err(|error| analysis_io_error("Analiz klasörü okunamadı.", &dir, error))?
             .filter_map(Result::ok)
             .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
-            .filter_map(|entry| read_analysis(&entry.path()).ok())
+            .filter_map(|entry| {
+                let managed = trusted_root.managed_for_path(&entry.path()).ok()?;
+                let path = trusted_root.resolve_existing_file(&managed).ok()?;
+                read_analysis(&path).ok()
+            })
             .collect::<Vec<_>>();
         analyses.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         Ok(analyses)
@@ -146,10 +151,25 @@ impl AnalysisService {
         &self,
         app: tauri::AppHandle<R>,
         job_id: String,
-        project_root: String,
+        trusted_root: TrustedProjectRoot,
         mut analysis: AssessmentAnalysis,
     ) {
         let run = async {
+            let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                    return Err(AppError {
+                        code: AppErrorCode::JobCancelled,
+                        message: "Analiz işlemi iptal edildi.".to_string(),
+                        recoverable: true,
+                        suggested_action: None,
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    });
+                }
+            }
+
             self.job_manager.set_running(&app, &job_id)?;
             self.job_manager.update_progress(
                 &app,
@@ -164,10 +184,29 @@ impl AnalysisService {
                 requires_mmproj: false,
                 timeout_seconds: 90,
             };
-            let _ = self.model_runtime_service.stop_server(None).await;
-            self.model_runtime_service
-                .ensure_ready(Some(SPEAKING_RUBRIC_PROFILE_ID), runtime_request)
+            let _runtime_lease = self
+                .model_runtime_service
+                .acquire_runtime(
+                    Some(SPEAKING_RUBRIC_PROFILE_ID),
+                    &runtime_request,
+                    "analysis",
+                    Some(&job_id),
+                )
                 .await?;
+
+            if let Some(ref token) = cancel_token {
+                if token.is_cancelled() {
+                    let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                    return Err(AppError {
+                        code: AppErrorCode::JobCancelled,
+                        message: "Analiz işlemi iptal edildi.".to_string(),
+                        recoverable: true,
+                        suggested_action: None,
+                        technical_details: None,
+                        correlation_id: Uuid::new_v4().to_string(),
+                    });
+                }
+            }
             self.job_manager.update_progress(
                 &app,
                 &job_id,
@@ -182,21 +221,24 @@ impl AnalysisService {
                     prompt: build_analysis_prompt(&analysis),
                 })
                 .await;
-            let _ = self
-                .model_runtime_service
-                .stop_server(Some(SPEAKING_RUBRIC_PROFILE_ID))
-                .await;
             report_result
         }
         .await;
 
         match run {
             Ok(result) => {
+                let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+                if let Some(ref token) = cancel_token {
+                    if token.is_cancelled() {
+                        let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                        return;
+                    }
+                }
                 analysis.status = AnalysisStatus::Ready;
                 analysis.model_report = Some(result.report);
                 analysis.model_report_error = None;
                 analysis.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                if let Err(error) = self.save_analysis(&project_root, &analysis) {
+                if let Err(error) = self.save_analysis(&trusted_root, &analysis) {
                     let _ = self.job_manager.fail(&app, &job_id, error);
                     return;
                 }
@@ -214,14 +256,14 @@ impl AnalysisService {
                 );
             }
             Err(error) => {
-                let _ = self
-                    .model_runtime_service
-                    .stop_server(Some(SPEAKING_RUBRIC_PROFILE_ID))
-                    .await;
+                if error.code == AppErrorCode::JobCancelled {
+                    let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                    return;
+                }
                 analysis.status = AnalysisStatus::Partial;
                 analysis.model_report_error = Some(error.message.clone());
                 analysis.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                if let Err(save_error) = self.save_analysis(&project_root, &analysis) {
+                if let Err(save_error) = self.save_analysis(&trusted_root, &analysis) {
                     let _ = self.job_manager.fail(&app, &job_id, save_error);
                     return;
                 }
@@ -239,10 +281,10 @@ impl AnalysisService {
 
     fn save_analysis(
         &self,
-        project_root: &str,
+        trusted_root: &TrustedProjectRoot,
         analysis: &AssessmentAnalysis,
     ) -> Result<(), AppError> {
-        let path = analysis_path(project_root, &analysis.id)?;
+        let managed = analysis_managed_path(trusted_root, &analysis.id)?;
         let content = serde_json::to_string_pretty(analysis).map_err(|error| AppError {
             code: AppErrorCode::AnalysisFailed,
             message: "Analiz verisi hazırlanamadı.".to_string(),
@@ -251,8 +293,18 @@ impl AnalysisService {
             technical_details: Some(error.to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
-        atomic_write(&path, &content)
-            .map_err(|error| analysis_io_error("Analiz kaydedilemedi.", &path, error))
+        trusted_root
+            .atomic_write(&managed, &content)
+            .map_err(|error| AppError {
+                code: AppErrorCode::AnalysisFailed,
+                message: "Analiz kaydedilemedi.".to_string(),
+                recoverable: true,
+                suggested_action: Some(
+                    "Disk alanı ve proje klasörü izinlerini kontrol edin.".to_string(),
+                ),
+                technical_details: error.technical_details,
+                correlation_id: error.correlation_id,
+            })
     }
 }
 
@@ -541,11 +593,10 @@ fn build_analysis_prompt(analysis: &AssessmentAnalysis) -> String {
     )
 }
 
-fn analysis_dir(project_root: &str) -> PathBuf {
-    Path::new(project_root).join("outputs").join("analysis")
-}
-
-fn analysis_path(project_root: &str, analysis_id: &str) -> Result<PathBuf, AppError> {
+fn analysis_managed_path(
+    trusted_root: &TrustedProjectRoot,
+    analysis_id: &str,
+) -> Result<crate::platform::project_paths::ManagedProjectPath, AppError> {
     if analysis_id.is_empty()
         || analysis_id.contains('/')
         || analysis_id.contains('\\')
@@ -560,7 +611,7 @@ fn analysis_path(project_root: &str, analysis_id: &str) -> Result<PathBuf, AppEr
             correlation_id: Uuid::new_v4().to_string(),
         });
     }
-    Ok(analysis_dir(project_root).join(format!("{analysis_id}.json")))
+    trusted_root.managed(&format!("outputs/analysis/{analysis_id}.json"))
 }
 
 fn read_analysis(path: &Path) -> Result<AssessmentAnalysis, AppError> {
@@ -624,5 +675,102 @@ mod tests {
         assert_eq!(bands[0].count, 1);
         assert_eq!(bands[1].count, 1);
         assert_eq!(bands[3].count, 1);
+    }
+
+    #[tokio::test]
+    async fn proof_9_analysis_cancel_does_not_finalize_report() {
+        use crate::domain::job::{DuplicatePolicy, JobKind, JobStatus};
+        use crate::jobs::job_manager::{JobManager, JobRegistrationInput};
+        use crate::services::analysis_service::AnalysisService;
+        use crate::services::llama_server_gateway::LlamaServerGateway;
+        use crate::services::model_config_service::ModelConfigService;
+        use crate::services::model_process_manager::ModelProcessManager;
+        use crate::services::model_runtime_service::ModelRuntimeService;
+        use crate::services::project_store::ProjectStore;
+        use std::sync::Arc;
+
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-p9-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_path_buf).unwrap();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "proj_p9".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let jm = Arc::new(JobManager::new());
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+            .handle()
+            .clone();
+
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::AssessmentAnalysis,
+                    display_label: Some("Assessment Analysis".into()),
+                    total: 3,
+                    message: "Analyzing".into(),
+                    correlation_id: Some("corr-p9".into()),
+                    idempotency_key: Some("key-p9".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+
+        // Request cancellation
+        jm.cancel_job(&app, &reg.snapshot.id).unwrap();
+
+        let model_gateway_impl =
+            Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_config = ModelConfigService::new();
+        let model_process_manager =
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
+
+        let service = AnalysisService::new(
+            store.clone(),
+            model_gateway_impl,
+            model_runtime_service,
+            jm.clone(),
+        );
+
+        let trusted_root = store.trusted_project_root(&project.id).unwrap();
+        let analysis = crate::domain::analysis::AssessmentAnalysis {
+            id: "analysis_p9".to_string(),
+            project_id: project.id.clone(),
+            kind: crate::domain::analysis::AssessmentKind::Written,
+            source_id: None,
+            title: "Analysis P9".to_string(),
+            class_id: None,
+            status: crate::domain::analysis::AnalysisStatus::Generating,
+            student_count: 0,
+            criteria: vec![],
+            students: vec![],
+            score_bands: vec![],
+            model_report: None,
+            model_report_error: None,
+            created_at: "now".to_string(),
+            completed_at: None,
+        };
+
+        service
+            .generate_report(app, reg.snapshot.id.clone(), trusted_root, analysis)
+            .await;
+
+        let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
+        assert_eq!(snap.status, JobStatus::Cancelled);
+
+        // Verify analysis output file was NOT saved as Ready
+        let analysis_file = root_path_buf.join("outputs/analysis/analysis_p9.json");
+        assert!(!analysis_file.exists());
     }
 }

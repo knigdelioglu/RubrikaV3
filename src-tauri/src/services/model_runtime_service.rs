@@ -1,9 +1,12 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelMode, ModelProfile, ModelStatus};
 use crate::services::model_config_service::ModelConfigService;
-use crate::services::model_process_manager::ModelProcessManager;
+use crate::services::model_process_manager::{ModelProcessManager, RuntimeLeaseGrant};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +64,10 @@ pub struct ModelRuntimeStatus {
     pub config_complete: bool,
     pub autostart_available: bool,
     pub message: String,
+    pub active_lease_count: usize,
+    pub draining: bool,
+    pub oldest_lease_age_seconds: Option<i64>,
+    pub lease_operation_kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,6 +81,62 @@ pub enum ModelRuntimeState {
     Failed,
     ConfigMissing,
     PortBlocked,
+    Draining,
+    Stopping,
+    Unverified,
+}
+
+pub struct ModelRuntimeLease {
+    manager: ModelProcessManager,
+    grant: RuntimeLeaseGrant,
+    released: Arc<AtomicBool>,
+}
+
+impl ModelRuntimeLease {
+    pub fn lease_id(&self) -> &str {
+        &self.grant.lease_id
+    }
+
+    pub fn runtime_instance_id(&self) -> &str {
+        &self.grant.runtime_instance_id
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.grant.base_url
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.grant.profile_id
+    }
+
+    pub fn active_lease_count(&self) -> usize {
+        self.grant.active_lease_count
+    }
+
+    pub async fn release(&self) -> Result<(), AppError> {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.manager
+            .release_lease(&self.grant.lease_id, &self.grant.runtime_instance_id)
+            .await
+    }
+}
+
+impl Drop for ModelRuntimeLease {
+    fn drop(&mut self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let manager = self.manager.clone();
+        let lease_id = self.grant.lease_id.clone();
+        let runtime_instance_id = self.grant.runtime_instance_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = manager.release_lease(&lease_id, &runtime_instance_id).await;
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -95,74 +158,64 @@ impl ModelRuntimeService {
         profile_id: Option<&str>,
         request: ModelRuntimeRequest,
     ) -> Result<ModelRuntimeStatus, AppError> {
+        let lease = self
+            .acquire_runtime(profile_id, &request, "ensure_ready", None)
+            .await?;
+        let status = self.get_runtime_status(profile_id, &request).await;
+        let release_result = lease.release().await;
+        match (status, release_result) {
+            (Ok(status), Ok(())) => Ok(status),
+            (Ok(status), Err(_)) => Ok(status),
+            (Err(error), _) => Err(error),
+        }
+    }
+
+    pub async fn acquire_runtime(
+        &self,
+        profile_id: Option<&str>,
+        request: &ModelRuntimeRequest,
+        consumer_id: &str,
+        job_id: Option<&str>,
+    ) -> Result<ModelRuntimeLease, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
-        let status = self.get_runtime_status(profile_id, &request).await?;
-        if status.health_ok {
-            return Ok(status);
-        }
-
-        let mut current_status = self.get_model_status(profile_id).await?;
-        if let Some(error) = model_readiness_error(&profile, &current_status, &request) {
-            return Err(error);
-        }
-
-        if current_status.start_requires_mode_change {
-            let _ = self.set_mode(profile_id, ModelMode::Managed).await?;
-        }
-
-        let started = match self
-            .process_manager
-            .start_server_with_timeout(profile_id, Duration::from_secs(request.timeout_seconds))
-            .await
+        if profile.server_path.trim().is_empty()
+            && profile.model_path.trim().is_empty()
+            && profile.mmproj_path.trim().is_empty()
         {
-            Ok(output) => output,
-            Err(error) => return Err(normalize_model_error(error)),
-        };
-        if !started.health_ok {
-            current_status = self.get_model_status(profile_id).await?;
-            let mut error = current_status
-                .last_error
-                .clone()
-                .map(normalize_model_error)
-                .unwrap_or_else(|| AppError {
-                    code: AppErrorCode::ModelStartFailed,
-                    message: "Gemma model sunucusu başlatılamadı.".to_string(),
-                    recoverable: true,
-                    suggested_action: Some(
-                        "Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string(),
-                    ),
-                    technical_details: Some(format!(
-                        "step={}; profile_id={}",
-                        request.use_case.step_name(),
-                        current_status.profile_id
-                    )),
-                    correlation_id: uuid::Uuid::new_v4().to_string(),
-                });
-            if matches!(
-                error.code,
-                AppErrorCode::ModelServerReadyTimeout | AppErrorCode::ModelStartTimeout
-            ) {
-                error.code = AppErrorCode::ModelStartTimeout;
-            } else {
-                error.code = AppErrorCode::ModelStartFailed;
-            }
-            error.message = if matches!(error.code, AppErrorCode::ModelStartTimeout) {
-                "Gemma model sunucusu zamanında hazır olmadı.".to_string()
-            } else {
-                "Gemma model sunucusu başlatılamadı.".to_string()
-            };
-            error.suggested_action =
-                Some("Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string());
-            error.technical_details = Some(format!(
-                "step={}; profile_id={}; started={:?}",
-                request.use_case.step_name(),
-                current_status.profile_id,
-                started
-            ));
+            return Err(AppError {
+                code: AppErrorCode::ModelConfigMissing,
+                message: "Model yapılandırması eksik.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Model profilini yapılandırın.".to_string()),
+                technical_details: Some(format!(
+                    "step={}; profile_id={}; server_path_empty=true; model_path_empty=true; mmproj_path_empty=true",
+                    request.use_case.step_name(),
+                    profile.id
+                )),
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+            });
+        }
+        let status = self.process_manager.get_model_status(profile_id).await?;
+        if let Some(error) = model_readiness_error(&profile, &status, request) {
             return Err(error);
         }
-
-        self.get_runtime_status(profile_id, &request).await
+        let grant = self
+            .process_manager
+            .acquire_lease(
+                profile_id,
+                request.requires_mmproj,
+                request.timeout_seconds,
+                consumer_id,
+                job_id,
+                request.use_case.step_name(),
+            )
+            .await
+            .map_err(normalize_model_error)?;
+        Ok(ModelRuntimeLease {
+            manager: self.process_manager.clone(),
+            grant,
+            released: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub async fn get_runtime_status(
@@ -250,72 +303,17 @@ impl ModelRuntimeService {
         status: ModelStatus,
     ) -> Result<ModelRuntimeStatus, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
-        Ok(build_runtime_status(request, &profile, status))
-    }
-}
-
-fn build_runtime_status(
-    request: &ModelRuntimeRequest,
-    profile: &ModelProfile,
-    status: ModelStatus,
-) -> ModelRuntimeStatus {
-    let config_complete = status.server_path_exists
-        && status.model_path_exists
-        && (!request.requires_mmproj || status.mmproj_path_exists);
-    let host = profile.host.clone();
-    let port = profile.port;
-    let autostart_available = status.can_start_from_app && config_complete;
-    let state = if !config_complete {
-        ModelRuntimeState::ConfigMissing
-    } else if status.server_running && status.health_ok {
-        ModelRuntimeState::Healthy
-    } else if status.server_running && !status.health_ok && !status.started_by_app {
-        ModelRuntimeState::PortBlocked
-    } else if status.started_by_app && !status.health_ok {
-        ModelRuntimeState::Starting
-    } else if status.server_running && !status.health_ok {
-        ModelRuntimeState::Unhealthy
-    } else if matches!(
-        status.last_error.as_ref().map(|err| &err.code),
-        Some(AppErrorCode::ModelPortAlreadyInUse)
-    ) {
-        ModelRuntimeState::PortBlocked
-    } else if status.can_start_from_app {
-        ModelRuntimeState::Stopped
-    } else {
-        ModelRuntimeState::Failed
-    };
-
-    let mut message = if status.server_running && status.health_ok {
-        "Model hazır.".to_string()
-    } else if let Some(reason) = status.start_disabled_reason.clone() {
-        reason
-    } else if let Some(error) = status.last_error.as_ref() {
-        error.message.clone()
-    } else if !config_complete {
-        "Model yapılandırması eksik.".to_string()
-    } else {
-        "Model durumu hazır değil.".to_string()
-    };
-
-    if matches!(request.capability, ModelCapability::Vision) && !request.requires_mmproj {
-        message.push_str(" Vision için mmproj zorunlu değil olarak işaretlendi.");
-    }
-
-    ModelRuntimeStatus {
-        health_ok: status.health_ok,
-        state,
-        managed_pid: status.managed_process_pid,
-        host,
-        port,
-        port_listening: status.server_running,
-        port_health_ok: status.health_ok,
-        llama_server_binary_exists: status.server_path_exists,
-        model_file_exists: status.model_path_exists,
-        mmproj_file_exists: status.mmproj_path_exists,
-        config_complete,
-        autostart_available,
-        message,
+        let mut runtime = build_runtime_status(request, &profile, status);
+        runtime.active_lease_count = self.process_manager.active_lease_count()?;
+        runtime.draining = self.process_manager.is_draining()?;
+        let lease_diagnostics = self.process_manager.lease_diagnostics()?;
+        runtime.oldest_lease_age_seconds = lease_diagnostics.oldest_lease_age_seconds;
+        runtime.lease_operation_kinds = lease_diagnostics.operation_kinds;
+        if runtime.draining {
+            runtime.state = ModelRuntimeState::Draining;
+            runtime.message = "Model işlemlerin bitmesi bekleniyor.".to_string();
+        }
+        Ok(runtime)
     }
 }
 
@@ -399,6 +397,80 @@ fn model_readiness_error(
         });
     }
     None
+}
+
+fn build_runtime_status(
+    request: &ModelRuntimeRequest,
+    profile: &ModelProfile,
+    status: ModelStatus,
+) -> ModelRuntimeStatus {
+    let config_complete = status.server_path_exists
+        && status.model_path_exists
+        && (!request.requires_mmproj || status.mmproj_path_exists);
+    let host = profile.host.clone();
+    let port = profile.port;
+    let autostart_available = status.can_start_from_app && config_complete;
+    let state = if !config_complete {
+        ModelRuntimeState::ConfigMissing
+    } else if matches!(
+        status.last_error.as_ref().map(|error| &error.code),
+        Some(AppErrorCode::ModelProcessUnverified | AppErrorCode::ModelProcessIdentityMismatch)
+    ) {
+        ModelRuntimeState::Unverified
+    } else if status.server_running && status.health_ok {
+        ModelRuntimeState::Healthy
+    } else if status.server_running && !status.health_ok && !status.started_by_app {
+        ModelRuntimeState::PortBlocked
+    } else if status.started_by_app && !status.health_ok {
+        ModelRuntimeState::Starting
+    } else if status.server_running && !status.health_ok {
+        ModelRuntimeState::Unhealthy
+    } else if matches!(
+        status.last_error.as_ref().map(|err| &err.code),
+        Some(AppErrorCode::ModelPortAlreadyInUse)
+    ) {
+        ModelRuntimeState::PortBlocked
+    } else if status.can_start_from_app {
+        ModelRuntimeState::Stopped
+    } else {
+        ModelRuntimeState::Failed
+    };
+
+    let mut message = if status.server_running && status.health_ok {
+        "Model hazır.".to_string()
+    } else if let Some(reason) = status.start_disabled_reason.clone() {
+        reason
+    } else if let Some(error) = status.last_error.as_ref() {
+        error.message.clone()
+    } else if !config_complete {
+        "Model yapılandırması eksik.".to_string()
+    } else {
+        "Model durumu hazır değil.".to_string()
+    };
+
+    if matches!(request.capability, ModelCapability::Vision) && !request.requires_mmproj {
+        message.push_str(" Vision için mmproj zorunlu değil olarak işaretlendi.");
+    }
+
+    ModelRuntimeStatus {
+        health_ok: status.health_ok,
+        state,
+        managed_pid: status.managed_process_pid,
+        host,
+        port,
+        port_listening: status.server_running,
+        port_health_ok: status.health_ok,
+        llama_server_binary_exists: status.server_path_exists,
+        model_file_exists: status.model_path_exists,
+        mmproj_file_exists: status.mmproj_path_exists,
+        config_complete,
+        autostart_available,
+        message,
+        active_lease_count: 0,
+        draining: false,
+        oldest_lease_age_seconds: None,
+        lease_operation_kinds: Vec::new(),
+    }
 }
 
 fn normalize_model_error(mut error: AppError) -> AppError {
@@ -623,7 +695,11 @@ PY
             let err = runtime.ensure_ready(None, request).await.unwrap_err();
             assert!(matches!(
                 err.code,
-                AppErrorCode::ModelStartTimeout | AppErrorCode::ModelPortBlocked
+                AppErrorCode::ModelStartTimeout
+                    | AppErrorCode::ModelServerReadyTimeout
+                    | AppErrorCode::ModelRuntimeReadinessTimeout
+                    | AppErrorCode::ModelServerStartFailed
+                    | AppErrorCode::ModelPortBlocked
             ));
         });
     }

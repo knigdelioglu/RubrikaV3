@@ -8,6 +8,7 @@ export type AppStatus = {
 };
 
 export type JobKind =
+  | 'document_import'
   | 'question_text_extraction'
   | 'pdf_preview_render'
   | 'rubric_pdf_import'
@@ -18,7 +19,14 @@ export type JobKind =
   | 'speaking_evaluation'
   | 'assessment_analysis';
 
-export type JobStatus = 'queued' | 'running' | 'succeeded' | 'partial' | 'failed' | 'cancelled';
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'partial'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
 
 export type JobProgress = {
   current: number;
@@ -28,10 +36,21 @@ export type JobProgress = {
 
 export type JobSnapshot = {
   id: string;
+  schemaVersion?: number;
   projectId: string;
   kind: JobKind;
+  displayLabel?: string;
   status: JobStatus;
+  cancellationRequested?: boolean;
+  cancellationRequestedAt?: string;
   progress: JobProgress;
+  startedAt?: string;
+  finishedAt?: string;
+  lastMessage?: string;
+  correlationId?: string;
+  idempotencyKey?: string;
+  cancellable?: boolean;
+  retryOfJobId?: string;
   result?: unknown;
   error?: AppError;
   createdAt: string;
@@ -165,6 +184,7 @@ export type StartSpeakingExamInput = {
   maximumSeconds?: number;
   classId?: string;
   assignedClassIds?: string[];
+  assessmentActivityId?: string;
   examId?: string;
   teacherNote?: string;
   examDate?: string;
@@ -197,6 +217,8 @@ export type MicrophoneDevice = {
 export type ToggleSpeakingCaptureInput = {
   projectId: string;
   examId: string;
+  assessmentActivityId?: string;
+  classApplicationId?: string;
   studentId: string;
   action: 'start' | 'pause' | 'resume' | 'stop' | 'cancel';
 };
@@ -322,6 +344,9 @@ export type SpeakingTranscriptSegment = {
 
 export type SpeakingAttempt = {
   id: string;
+  assessmentActivityId?: string | null;
+  classApplicationId?: string | null;
+  schoolClassId?: string | null;
   examId: string;
   studentId: string;
   attemptNumber: number;
@@ -362,10 +387,12 @@ export type SpeakingAttempt = {
   modelId: string;
   promptVersion: string;
   rubricVersion: string;
+  speakingConfigSnapshot?: SpeakingConfigurationSnapshot | null;
 };
 
 export type SpeakingExam = {
   id: string;
+  assessmentActivityId?: string | null;
   title: string;
   classId?: string | null;
   assignedClassIds?: string[];
@@ -387,6 +414,7 @@ export type SpeakingExam = {
   createdAt: string;
   updatedAt: string;
   activeStudentId?: string | null;
+  activeClassApplicationId?: string | null;
   completedAt?: string | null;
   attempts: SpeakingAttempt[];
 };
@@ -468,6 +496,9 @@ export type PdfPreviewState = {
   pageCount?: number | null;
   jobId?: string | null;
   errorMessage?: string | null;
+  activeGenerationId?: string | null;
+  pendingGenerationId?: string | null;
+  sourceFingerprint?: string | null;
 };
 
 export type PdfPagePreview = {
@@ -789,6 +820,35 @@ export type StartStudentAnswerOcrOutput = {
   rerun: boolean;
 };
 
+export type OcrGenerationStatus =
+  | 'candidate'
+  | 'ready_for_review'
+  | 'active'
+  | 'rejected'
+  | 'failed'
+  | 'stale'
+  | 'interrupted'
+  | 'superseded';
+
+export type OcrTeacherReviewStatus = 'not_required' | 'pending' | 'approved' | 'rejected';
+
+export type OcrGeneration = {
+  generationId: string;
+  submissionId: string;
+  sourceFingerprint: string;
+  createdAt: string;
+  modelName?: string | null;
+  promptVersion: string;
+  status: OcrGenerationStatus;
+  result: StudentAnswerOcrRecord[];
+  diagnostics?: unknown | null;
+  teacherReviewStatus: OcrTeacherReviewStatus;
+  createdByJobId: string;
+  sourceDocumentId: string;
+  sourceStorageRevision: number;
+  failureReason?: string | null;
+};
+
 export type StudentAnswerOcrIssueCorrectionDecision =
   | 'suggest_correction'
   | 'no_change'
@@ -923,12 +983,95 @@ export type SchoolClassStatus = 'active' | 'archived';
 export type SchoolClass = {
   id: string;
   name: string;
+  displayName?: string;
   normalizedName: string;
   academicYear?: string | null;
+  academicYearId?: string | null;
   gradeLevel?: number | null;
   section?: string | null;
   displayOrder: number;
   status: SchoolClassStatus;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AssessmentType = 'written' | 'listening' | 'speaking';
+export type WorkflowFamily = 'written' | 'speaking';
+export type AssessmentStatus = 'draft' | 'scheduled' | 'active' | 'completed' | 'archived';
+export type ClassApplicationStatus = 'scheduled' | 'active' | 'completed' | 'archived';
+
+export type ListeningDetails = {
+  audioDocumentId?: string | null;
+  transcriptDocumentId?: string | null;
+  playCount?: number | null;
+  durationSeconds?: number | null;
+  instruction?: string | null;
+};
+
+export type SpeakingConfigurationSnapshot = {
+  speakingType: string;
+  taskText: string;
+  targetDurationSeconds: number;
+  minDurationSeconds: number;
+  maxDurationSeconds: number;
+  rubricVersion: string;
+  scoringPolicyVersion: string;
+  cleanupPromptVersion: string;
+  evaluationPromptVersion: string;
+  frozenModelFileHash?: string | null;
+  rubricSnapshot: unknown;
+};
+
+export type ClassApplication = {
+  id: string;
+  activityId: string;
+  schoolClassId: string;
+  scheduledAt?: string | null;
+  applicationDate?: string | null;
+  status: ClassApplicationStatus;
+  notes?: string | null;
+  documentIds: string[];
+  studentScopeIds: string[];
+  speakingAttempts: SpeakingAttempt[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AssessmentClassApplication = ClassApplication;
+
+export type AssessmentActivity = {
+  id: string;
+  academicYearId: string;
+  courseId: string;
+  courseName: string;
+  title: string;
+  gradeLevel: number;
+  term: number;
+  assessmentType: AssessmentType;
+  workflowFamily: WorkflowFamily;
+  sequenceNumber: number;
+  status: AssessmentStatus;
+  commonDocumentIds: string[];
+  listeningDetails?: ListeningDetails | null;
+  speakingConfiguration?: SpeakingConfigurationSnapshot | null;
+  classApplications: AssessmentClassApplication[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AssessmentSequenceOptions = {
+  options: number[];
+  suggested: number;
+};
+
+export type TeachingAssignment = {
+  id: string;
+  academicYearId: string;
+  courseId: string;
+  courseName: string;
+  classSectionId: string;
+  teacherId?: string | null;
+  isActive: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -996,14 +1139,22 @@ export type ProjectSnapshot = {
   createdAt: string;
   updatedAt: string;
   rootPath: string;
+  /** Backend-owned persistence revision; callers must not manufacture it. */
+  storageRevision?: number;
+  academicYearId?: string | null;
+  courseId?: string | null;
+  courseName?: string | null;
   expectedQuestionCount?: number | null;
   examPackageFreeze?: ExamPackageFreeze | null;
   sections: Section[];
   schoolClasses: SchoolClass[];
+  teachingAssignments: TeachingAssignment[];
+  assessmentActivities: AssessmentActivity[];
   studentScanBatches: StudentScanBatch[];
   students: Student[];
   studentSubmissions: StudentSubmission[];
   studentAnswerOcrRecords: StudentAnswerOcrRecord[];
+  studentAnswerOcrGenerations?: OcrGeneration[];
   scoringRecords: ScoringRecord[];
   speakingExams: SpeakingExam[];
   studentAnswerCropTemplate: StudentAnswerCropTemplate;
@@ -1055,6 +1206,9 @@ export type RemoveDocumentInput = {
 export type CreateProjectInput = {
   name: string;
   rootPath: string;
+  academicYearId: string;
+  courseId: string;
+  courseName: string;
 };
 
 export type CreateProjectOutput = {
@@ -1092,6 +1246,8 @@ export type ModelStatus = {
   completionProbeOk: boolean;
   managedProcessPid?: number | null;
   startedByApp: boolean;
+  activeLeaseCount: number;
+  draining: boolean;
   logPath?: string | null;
   lastError?: AppError | null;
   warnings: string[];
@@ -1132,6 +1288,8 @@ export type StartModelServerOutput = {
 
 export type StopModelServerOutput = {
   stopped: boolean;
+  draining: boolean;
+  activeLeaseCount: number;
   message: string;
 };
 
@@ -1439,4 +1597,21 @@ export type StudentScanReadinessSnapshot = {
   groupingComplete: boolean;
   warnings: string[];
   message: string;
+};
+
+
+export type UpdateCourseInfoInput = {
+  projectId: string;
+  academicYearId: string;
+  courseId: string;
+  courseName: string;
+  expectedRevision?: number;
+};
+
+export type BatchCreateTeachingAssignmentsInput = {
+  projectId: string;
+  academicYearId: string;
+  courseId: string;
+  courseName: string;
+  classSectionIds: string[];
 };

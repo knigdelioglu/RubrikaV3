@@ -47,7 +47,7 @@ export const blockingReasonLabels: Record<string, string> = {
   CROP_MISSING: 'Kırpma alanı eksik',
   PLACEHOLDER_DATA_DETECTED: 'Taslak (placeholder) veri bulundu',
   REVIEW_REQUIRED: 'Öğretmen onayı bekleniyor',
-  QEP_NOT_FROZEN: 'QEP henüz dondurulmamış',
+  QEP_NOT_FROZEN: 'Sınav paketi hazırlığı henüz dondurulmadı (tamamlanmadı)',
   RUBRIC_NOT_READY: 'Rubrik hazırlığı kilitli',
   RUBRIC_JSON_INVALID: 'Rubrik JSON geçersiz',
   RUBRIC_JSON_PARSE_FAILED: 'Rubrik JSON çözülemedi',
@@ -75,7 +75,18 @@ export const blockingReasonLabels: Record<string, string> = {
   SCORING_RERUN_REQUIRED: 'Notlandırma sonuçları güncel değil',
   SCORING_NOT_READY: 'Notlandırma için gerekli kontroller tamam değil',
   SCORING_RESULT_MISSING: 'Notlandırma sonucu eksik',
-  MODEL_SERVER_NOT_RUNNING: 'Gemma model sunucusu çalışmıyor.'
+  MODEL_SERVER_NOT_RUNNING: 'Gemma model sunucusu çalışmıyor.',
+  MODEL_PROCESS_IDENTITY_MISMATCH: 'Yerel model süreci güvenli biçimde doğrulanamadı.',
+  MODEL_PROCESS_UNVERIFIED: 'Yerel model süreci güvenli biçimde doğrulanamadı.',
+  MODEL_RUNTIME_IN_USE: 'Yerel model şu anda başka işlemler tarafından kullanılıyor.',
+  MODEL_RUNTIME_DRAINING: 'Model işlemlerin bitmesi beklenirken yeni kullanım kabul etmiyor.',
+  MODEL_RUNTIME_PROFILE_BUSY: 'Yerel model başka bir runtime profili tarafından kullanılıyor.',
+  MODEL_RUNTIME_START_FAILED: 'Yerel model başlatılamadı.',
+  MODEL_RUNTIME_READINESS_TIMEOUT: 'Yerel model zamanında hazır olmadı.',
+  MODEL_RUNTIME_EXITED: 'Yerel model beklenmedik biçimde kapandı.',
+  MODEL_RUNTIME_LEASE_INVALID: 'Model kullanım oturumu geçersiz.',
+  MODEL_RUNTIME_LEASE_ALREADY_RELEASED: 'Model kullanım oturumu zaten kapatılmış.',
+  MODEL_RUNTIME_PORT_OCCUPIED: 'Model portu beklenmeyen bir süreç tarafından kullanılıyor.'
 };
 
 export const actionLabels: Record<string, string> = {

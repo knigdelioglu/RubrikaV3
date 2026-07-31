@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex, OnceLock, Weak,
+};
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -11,7 +14,7 @@ use crate::domain::question::is_question_text_ready;
 use crate::domain::rubric::RubricStatus;
 use crate::domain::school_class::normalize_school_class_name;
 use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
-use crate::platform::file_access::atomic_write;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::workflow_engine;
 use serde_json::{Map, Value};
 
@@ -54,9 +57,86 @@ pub struct ListProjectsOutput {
     pub skipped_projects: Vec<SkippedProject>,
 }
 
+/// The canonical read result used by persistence-aware services. The
+/// `trusted_root` is deliberately backend-only; commands expose the project
+/// and revision metadata without allowing callers to choose a write root.
+#[derive(Debug, Clone)]
+pub struct ProjectSnapshot {
+    pub project: Project,
+    pub revision: u64,
+    pub content_fingerprint: String,
+    pub trusted_root: TrustedProjectRoot,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationOptions {
+    pub expected_revision: Option<u64>,
+    pub expected_fingerprint: Option<String>,
+    pub operation: String,
+    pub correlation_id: String,
+}
+
+impl MutationOptions {
+    pub fn new(operation: impl Into<String>) -> Self {
+        Self {
+            expected_revision: None,
+            expected_fingerprint: None,
+            operation: operation.into(),
+            correlation_id: Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationContext {
+    pub project_id: String,
+    pub current_revision: u64,
+    pub current_fingerprint: String,
+    pub trusted_root: TrustedProjectRoot,
+    pub operation: String,
+    pub correlation_id: String,
+}
+
+#[derive(Debug)]
+pub struct MutationOutput<T> {
+    pub result: T,
+    pub snapshot: ProjectSnapshot,
+}
+
+/// A long-running job uses the same transactional primitive, but its caller
+/// can distinguish a stale candidate from a successful commit.
+#[derive(Debug)]
+pub enum JobCommitResult<T> {
+    Applied(Box<MutationOutput<T>>),
+    Stale { reason: String },
+    Conflict(AppError),
+    EntityMissing,
+    Rejected(AppError),
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistenceDiagnostics {
+    pub storage_revision: u64,
+    pub project_fingerprint_status: String,
+    pub stale_job_result_count: u64,
+    pub mutation_conflict_count: u64,
+    pub external_modification_detected: bool,
+    pub legacy_project_without_revision: bool,
+}
+
+static PROJECT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+
 #[derive(Clone)]
 pub struct ProjectStore {
     current_project: Arc<Mutex<Option<Project>>>,
+    trusted_root: Arc<Mutex<Option<TrustedProjectRoot>>>,
+    current_fingerprint: Arc<Mutex<Option<String>>>,
+    revision_history: Arc<Mutex<HashMap<(String, u64), Project>>>,
+    stale_job_result_count: Arc<AtomicU64>,
+    mutation_conflict_count: Arc<AtomicU64>,
+    external_modification_detected: Arc<AtomicBool>,
+    legacy_project_without_revision: Arc<AtomicBool>,
 }
 
 impl Default for ProjectStore {
@@ -69,33 +149,154 @@ impl ProjectStore {
     pub fn new() -> Self {
         Self {
             current_project: Arc::new(Mutex::new(None)),
+            trusted_root: Arc::new(Mutex::new(None)),
+            current_fingerprint: Arc::new(Mutex::new(None)),
+            revision_history: Arc::new(Mutex::new(HashMap::new())),
+            stale_job_result_count: Arc::new(AtomicU64::new(0)),
+            mutation_conflict_count: Arc::new(AtomicU64::new(0)),
+            external_modification_detected: Arc::new(AtomicBool::new(false)),
+            legacy_project_without_revision: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn create_project(&self, name: String, root_path: String) -> Result<Project, AppError> {
-        let root = PathBuf::from(&root_path);
+        self.create_project_with_setup(name, root_path, None, None, None)
+    }
+
+    pub fn update_course_info(
+        &self,
+        project_id: String,
+        academic_year_id: String,
+        course_id: String,
+        course_name: String,
+        expected_revision: Option<u64>,
+    ) -> Result<Project, AppError> {
+        let academic_year_id = academic_year_id.trim().to_string();
+        let course_id = course_id.trim().to_string();
+        let course_name = course_name.trim().to_string();
+
+        if academic_year_id.is_empty() || course_id.is_empty() || course_name.is_empty() {
+            return Err(AppError {
+                code: AppErrorCode::ProjectSaveFailed,
+                message: "Ders kodu, ders adı ve eğitim yılı boş olamaz.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Geçerli ders bilgileri girip tekrar deneyin.".to_string()),
+                technical_details: Some("empty course metadata fields".to_string()),
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+            });
+        }
+
+        let output = self.mutate(
+            &project_id,
+            MutationOptions {
+                expected_revision,
+                expected_fingerprint: None,
+                operation: "update_course_info".to_string(),
+                correlation_id: Uuid::new_v4().to_string(),
+            },
+            move |project, _context| {
+                project.academic_year_id = Some(academic_year_id);
+                project.course_id = Some(course_id);
+                project.course_name = Some(course_name);
+                Ok(project.clone())
+            },
+        )?;
+        Ok(output.result)
+    }
+
+    pub fn create_project_with_setup(
+        &self,
+        name: String,
+        root_path: String,
+        academic_year_id: Option<String>,
+        course_id: Option<String>,
+        course_name: Option<String>,
+    ) -> Result<Project, AppError> {
+        let trusted_root = TrustedProjectRoot::for_create(Path::new(&root_path))?;
+        let root = trusted_root.root().to_path_buf();
+        let root_was_created = if root.exists() {
+            let project_file = root.join("project.json");
+            if project_file.exists() {
+                return Err(AppError {
+                    code: AppErrorCode::ProjectAlreadyExists,
+                    message: "Bu klasörde zaten bir Rubrika projesi bulunuyor.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Yeni proje için boş bir klasör seçin.".to_string()),
+                    technical_details: Some(project_file.to_string_lossy().to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+            if std::fs::read_dir(&root)
+                .map_err(|error| AppError {
+                    code: AppErrorCode::ProjectSaveFailed,
+                    message: "Seçilen proje klasörü okunamadı.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
+                    technical_details: Some(error.to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                })?
+                .next()
+                .is_some()
+            {
+                return Err(AppError {
+                    code: AppErrorCode::ProjectDirectoryNotEmpty,
+                    message: "Seçilen klasör boş değil. Yeni proje için boş bir klasör seçin."
+                        .to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Boş bir klasör seçip tekrar deneyin.".to_string()),
+                    technical_details: Some(root.to_string_lossy().to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+            false
+        } else {
+            if let Some(parent) = root.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| AppError {
+                    code: AppErrorCode::ProjectSaveFailed,
+                    message: "Yeni proje için parent klasör oluşturulamadı.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
+                    technical_details: Some(error.to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                })?;
+            }
+            std::fs::create_dir(&root).map_err(|error| AppError {
+                code: AppErrorCode::ProjectSaveFailed,
+                message: "Yeni proje klasörü oluşturulamadı.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
+                technical_details: Some(error.to_string()),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+            true
+        };
         let project_id = Uuid::new_v4().to_string();
 
         let dirs = [
-            root.join("documents"),
-            root.join("cache").join("page_previews"),
-            root.join("cache").join("model_raw"),
-            root.join("cache").join("model_inputs"),
-            root.join("crops"),
-            root.join("outputs"),
-            root.join("logs"),
-            root.join("logs").join("jobs"),
+            "documents",
+            "cache/page_previews",
+            "cache/model_raw",
+            "cache/model_inputs",
+            "crops",
+            "outputs",
+            "outputs/previews",
+            "outputs/ocr_generations",
+            "logs",
+            "logs/jobs",
         ];
 
-        for dir in &dirs {
-            std::fs::create_dir_all(dir).map_err(|e| AppError {
-                code: AppErrorCode::ProjectSaveFailed,
-                message: format!("Failed to create project directory: {}", e),
-                recoverable: false,
-                suggested_action: Some("Check permissions for the project location.".to_string()),
-                technical_details: Some(e.to_string()),
-                correlation_id: Uuid::new_v4().to_string(),
-            })?;
+        let setup_result = (|| -> Result<(), AppError> {
+            for dir in &dirs {
+                let managed = trusted_root.managed(dir)?;
+                trusted_root.ensure_managed_directory(&root.join(managed.as_path()))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = setup_result {
+            if root_was_created {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            return Err(error);
         }
 
         let now = chrono::Utc::now().to_rfc3339();
@@ -105,10 +306,16 @@ impl ProjectStore {
             name,
             created_at: now.clone(),
             updated_at: now,
-            root_path: root_path.clone(),
+            root_path: trusted_root.root_string(),
+            storage_revision: 0,
+            academic_year_id,
+            course_id,
+            course_name,
             sections: vec![],
             students: vec![],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![],
             student_scan_document_id: None,
@@ -123,6 +330,7 @@ impl ProjectStore {
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             workflow: WorkflowSnapshot {
@@ -136,17 +344,24 @@ impl ProjectStore {
 
         let mut project = project;
         project.workflow = workflow_engine::evaluate_workflow(&project);
-        self.save_project(&project)?;
-
-        let mut lock = self.current_project.lock().map_err(|e| AppError {
-            code: AppErrorCode::UnknownError,
-            message: "Project store lock failed.".to_string(),
+        let content = serde_json::to_string_pretty(&project).map_err(|error| AppError {
+            code: AppErrorCode::ProjectSaveFailed,
+            message: "Yeni proje verisi hazırlanamadı.".to_string(),
             recoverable: false,
             suggested_action: None,
-            technical_details: Some(e.to_string()),
+            technical_details: Some(error.to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
-        *lock = Some(project.clone());
+        let project_path = trusted_root.managed("project.json")?;
+        if let Err(error) = trusted_root.create_new_file(&project_path, &content) {
+            if root_was_created {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            return Err(error);
+        }
+
+        self.set_trusted_root(trusted_root.clone())?;
+        self.set_session_project(project.clone(), fingerprint(&content))?;
 
         Ok(project)
     }
@@ -160,63 +375,249 @@ impl ProjectStore {
         &self,
         root_path: String,
     ) -> Result<(Project, Vec<String>), AppError> {
-        let project_file = Path::new(&root_path).join("project.json");
-        let mut loaded = Self::load_project_file(&project_file, true)?;
+        let trusted_root = TrustedProjectRoot::open_selected(Path::new(&root_path))?;
+        let mut loaded = Self::load_project_file_with_root(&trusted_root, true)?;
+        let interrupted_generations = loaded
+            .project
+            .student_answer_ocr_generations
+            .iter()
+            .filter(|generation| {
+                generation.status == crate::domain::student::OcrGenerationStatus::Candidate
+            })
+            .count();
+        self.set_trusted_root(trusted_root.clone())?;
+        if interrupted_generations > 0 {
+            match self.mutate(
+                &loaded.project.id,
+                MutationOptions::new("recover_orphaned_ocr_generations"),
+                |project, _context| {
+                    project.recover_orphaned_ocr_generations();
+                    Ok(())
+                },
+            ) {
+                Ok(recovery) => {
+                    loaded.project = recovery.snapshot.project;
+                    loaded.warnings.push(format!(
+                        "{} OCR candidate uygulama yeniden açılırken interrupted olarak işaretlendi; aktif sonuç korundu.",
+                        interrupted_generations
+                    ));
+                }
+                Err(error) => loaded.warnings.push(format!(
+                    "OCR recovery tamamlanamadı; aktif sonuç korundu ve yeniden deneme önerildi: {}",
+                    error.message
+                )),
+            }
+        }
+        self.legacy_project_without_revision
+            .store(loaded.legacy_revision_missing, Ordering::Relaxed);
         if loaded.migration_changed {
-            let backup_path = Self::persist_migrated_project(&project_file, &loaded.project)?;
+            canonicalize_speaking_attempts(&mut loaded.project);
+            let backup_path = Self::persist_migrated_project(&trusted_root, &loaded.project)?;
             loaded.warnings.push(format!(
                 "Legacy class/batch migration was persisted atomically after creating backup {}.",
                 backup_path.display()
             ));
         }
 
-        let mut lock = self.current_project.lock().map_err(|e| AppError {
-            code: AppErrorCode::UnknownError,
-            message: "Project store lock failed.".to_string(),
-            recoverable: false,
-            suggested_action: None,
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
+        let project_path =
+            trusted_root.resolve_existing_file(&trusted_root.managed("project.json")?)?;
+        let content = std::fs::read_to_string(&project_path).map_err(|error| {
+            project_error(
+                AppErrorCode::ProjectLoadFailed,
+                "Proje dosyası okunamadı.",
+                Some(error.to_string()),
+            )
         })?;
-        *lock = Some(loaded.project.clone());
+        self.set_session_project(loaded.project.clone(), fingerprint(&content))?;
 
         Ok((loaded.project, loaded.warnings))
     }
 
-    fn persist_migrated_project(
-        project_file: &Path,
-        project: &Project,
-    ) -> Result<PathBuf, AppError> {
-        let original_content = std::fs::read_to_string(project_file).map_err(|error| AppError {
-            code: AppErrorCode::ProjectLoadFailed,
-            message: "Migration öncesi proje dosyası okunamadı.".to_string(),
+    fn set_trusted_root(&self, root: TrustedProjectRoot) -> Result<(), AppError> {
+        let mut lock = self.trusted_root.lock().map_err(|error| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Project store lock failed.".to_string(),
             recoverable: false,
-            suggested_action: Some("Proje klasörü izinlerini kontrol edin.".to_string()),
-            technical_details: Some(format!(
-                "project_file={}; read_error={error}",
-                project_file.display()
-            )),
+            suggested_action: None,
+            technical_details: Some(error.to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
+        *lock = Some(root);
+        Ok(())
+    }
+
+    fn set_session_project(
+        &self,
+        project: Project,
+        content_fingerprint: String,
+    ) -> Result<(), AppError> {
+        let mut project_lock = self.current_project.lock().map_err(lock_error)?;
+        if let Some(previous) = project_lock.as_ref() {
+            let mut history = self.revision_history.lock().map_err(lock_error)?;
+            history.insert(
+                (previous.id.clone(), previous.storage_revision),
+                previous.clone(),
+            );
+            if history.len() > 64 {
+                if let Some(key) = history.keys().next().cloned() {
+                    history.remove(&key);
+                }
+            }
+        }
+        *project_lock = Some(project);
+        drop(project_lock);
+        let mut fingerprint_lock = self.current_fingerprint.lock().map_err(lock_error)?;
+        *fingerprint_lock = Some(content_fingerprint);
+        Ok(())
+    }
+
+    pub fn trusted_project_root(&self, project_id: &str) -> Result<TrustedProjectRoot, AppError> {
+        let project_lock = self.current_project.lock().map_err(|error| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Project store lock failed.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(error.to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        if project_lock
+            .as_ref()
+            .map(|project| project.id != project_id)
+            .unwrap_or(true)
+        {
+            return Err(AppError {
+                code: AppErrorCode::ProjectNotFound,
+                message: "İstenen proje açık değil.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Projeyi yeniden açıp tekrar deneyin.".to_string()),
+                technical_details: Some(format!("project_id={project_id}")),
+                correlation_id: Uuid::new_v4().to_string(),
+            });
+        }
+        drop(project_lock);
+        let root_lock = self.trusted_root.lock().map_err(|error| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Project store lock failed.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(error.to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        root_lock.clone().ok_or_else(|| AppError {
+            code: AppErrorCode::ProjectNotFound,
+            message: "Güvenilir proje kökü bulunamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Projeyi yeniden açıp tekrar deneyin.".to_string()),
+            technical_details: None,
+            correlation_id: Uuid::new_v4().to_string(),
+        })
+    }
+
+    pub fn persistence_diagnostics(&self) -> PersistenceDiagnostics {
+        let storage_revision = self
+            .current_project
+            .lock()
+            .ok()
+            .and_then(|project| project.as_ref().map(|project| project.storage_revision))
+            .unwrap_or(0);
+        let fingerprint_known = self
+            .current_fingerprint
+            .lock()
+            .ok()
+            .and_then(|value| value.clone())
+            .is_some_and(|value| !value.is_empty());
+        PersistenceDiagnostics {
+            storage_revision,
+            project_fingerprint_status: if fingerprint_known {
+                "known".to_string()
+            } else {
+                "unknown".to_string()
+            },
+            stale_job_result_count: self.stale_job_result_count.load(Ordering::Relaxed),
+            mutation_conflict_count: self.mutation_conflict_count.load(Ordering::Relaxed),
+            external_modification_detected: self
+                .external_modification_detected
+                .load(Ordering::Relaxed),
+            legacy_project_without_revision: self
+                .legacy_project_without_revision
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    fn session_fingerprint(&self) -> Result<Option<String>, AppError> {
+        self.current_fingerprint
+            .lock()
+            .map(|value| value.clone())
+            .map_err(lock_error)
+    }
+
+    fn read_disk_snapshot(
+        &self,
+        trusted_root: &TrustedProjectRoot,
+    ) -> Result<ProjectSnapshot, AppError> {
+        let project_path =
+            trusted_root.resolve_existing_file(&trusted_root.managed("project.json")?)?;
+        let content = std::fs::read_to_string(&project_path).map_err(|error| {
+            project_error(
+                AppErrorCode::ProjectLoadFailed,
+                "Proje dosyası okunamadı; değişiklik uygulanmadı.",
+                Some(error.to_string()),
+            )
+        })?;
+        let loaded = Self::load_project_file_with_root(trusted_root, true)?;
+        let revision = loaded.project.storage_revision;
+        Ok(ProjectSnapshot {
+            project: loaded.project,
+            revision,
+            content_fingerprint: fingerprint(&content),
+            trusted_root: trusted_root.clone(),
+        })
+    }
+
+    fn persist_migrated_project(
+        trusted_root: &TrustedProjectRoot,
+        project: &Project,
+    ) -> Result<PathBuf, AppError> {
+        let project_file =
+            trusted_root.resolve_existing_file(&trusted_root.managed("project.json")?)?;
+        let original_content =
+            std::fs::read_to_string(&project_file).map_err(|error| AppError {
+                code: AppErrorCode::ProjectLoadFailed,
+                message: "Migration öncesi proje dosyası okunamadı.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Proje klasörü izinlerini kontrol edin.".to_string()),
+                technical_details: Some(format!(
+                    "project_file={}; read_error={error}",
+                    project_file.display()
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
         let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.9fZ");
         let backup_name = format!("project.json.migration.{timestamp}.bak");
         let backup_path = project_file
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(backup_name);
-        atomic_write(&backup_path, &original_content).map_err(|error| AppError {
-            code: AppErrorCode::ProjectSaveFailed,
-            message: "Migration yedeği oluşturulamadığı için proje değiştirilmedi.".to_string(),
-            recoverable: true,
-            suggested_action: Some(
-                "Proje klasöründe yazma izni ve disk alanını kontrol edin.".to_string(),
-            ),
-            technical_details: Some(format!(
-                "backup_path={}; write_error={error}",
-                backup_path.display()
-            )),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        let backup_name = backup_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("project.json.bak");
+        let backup_relative = trusted_root.managed(backup_name)?;
+        trusted_root
+            .atomic_write(&backup_relative, &original_content)
+            .map_err(|error| AppError {
+                code: AppErrorCode::ProjectSaveFailed,
+                message: "Migration yedeği oluşturulamadığı için proje değiştirilmedi.".to_string(),
+                recoverable: true,
+                suggested_action: Some(
+                    "Proje klasöründe yazma izni ve disk alanını kontrol edin.".to_string(),
+                ),
+                technical_details: Some(format!(
+                    "backup_path={}; write_error={error}",
+                    backup_path.display()
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
 
         let migrated_content = serde_json::to_string_pretty(project).map_err(|error| AppError {
             code: AppErrorCode::ProjectSaveFailed,
@@ -226,20 +627,22 @@ impl ProjectStore {
             technical_details: Some(error.to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
-        atomic_write(project_file, &migrated_content).map_err(|error| AppError {
-            code: AppErrorCode::ProjectSaveFailed,
-            message: "Göç edilen proje atomik olarak kaydedilemedi; yedek korundu.".to_string(),
-            recoverable: true,
-            suggested_action: Some(
-                "Yedek dosyayı koruyup klasör izinlerini kontrol edin.".to_string(),
-            ),
-            technical_details: Some(format!(
-                "project_file={}; backup_path={}; write_error={error}",
-                project_file.display(),
-                backup_path.display()
-            )),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        trusted_root
+            .atomic_write(&trusted_root.managed("project.json")?, &migrated_content)
+            .map_err(|error| AppError {
+                code: AppErrorCode::ProjectSaveFailed,
+                message: "Göç edilen proje atomik olarak kaydedilemedi; yedek korundu.".to_string(),
+                recoverable: true,
+                suggested_action: Some(
+                    "Yedek dosyayı koruyup klasör izinlerini kontrol edin.".to_string(),
+                ),
+                technical_details: Some(format!(
+                    "project_file={}; backup_path={}; write_error={error}",
+                    project_file.display(),
+                    backup_path.display()
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
         Ok(backup_path)
     }
 
@@ -247,50 +650,203 @@ impl ProjectStore {
         Self::list_projects_in_dir(&default_projects_root_dir())
     }
 
-    pub fn save_project(&self, project: &Project) -> Result<(), AppError> {
-        let mut project = project.clone();
-        project.updated_at = chrono::Utc::now().to_rfc3339();
-        let project_file = PathBuf::from(&project.root_path).join("project.json");
-        // The in-memory project lock also serializes project.json writes. Without
-        // this guard, concurrent jobs could race on the same temporary file and
-        // leave a valid user action unpersisted.
-        let mut lock = self.current_project.lock().map_err(|e| AppError {
-            code: AppErrorCode::UnknownError,
-            message: "Project store lock failed.".to_string(),
-            recoverable: false,
-            suggested_action: None,
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+    /// Transactional canonical mutation. The project lock is acquired before
+    /// the disk read, so a read-modify-write is one indivisible operation for
+    /// this project while unrelated project roots remain independent.
+    pub fn mutate<T, F>(
+        &self,
+        project_id: &str,
+        options: MutationOptions,
+        mutation: F,
+    ) -> Result<MutationOutput<T>, AppError>
+    where
+        F: FnOnce(&mut Project, &MutationContext) -> Result<T, AppError>,
+    {
+        let trusted_root = self.trusted_project_root(project_id)?;
+        let project_lock = project_lock_for(trusted_root.root())?;
+        let _guard = project_lock.lock().map_err(lock_error)?;
+        let current = self.read_disk_snapshot(&trusted_root)?;
 
-        let content = serde_json::to_string_pretty(&project).map_err(|e| AppError {
-            code: AppErrorCode::ProjectSaveFailed,
-            message: "Could not serialize project data.".to_string(),
-            recoverable: false,
-            suggested_action: None,
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
-
-        atomic_write(&project_file, &content).map_err(|e| AppError {
-            code: AppErrorCode::ProjectSaveFailed,
-            message: "Failed to write project file.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Check disk space and permissions.".to_string()),
-            technical_details: Some(e.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
-
-        if let Some(p) = lock.as_mut() {
-            if p.id == project.id {
-                *p = project.clone();
+        if let Some(expected_fingerprint) = options.expected_fingerprint.as_deref() {
+            if expected_fingerprint != current.content_fingerprint {
+                self.external_modification_detected
+                    .store(true, Ordering::Relaxed);
+                self.mutation_conflict_count.fetch_add(1, Ordering::Relaxed);
+                return Err(external_modification_error(&options.correlation_id));
+            }
+        } else if self.session_fingerprint()?.as_deref()
+            != Some(current.content_fingerprint.as_str())
+        {
+            self.external_modification_detected
+                .store(true, Ordering::Relaxed);
+            self.mutation_conflict_count.fetch_add(1, Ordering::Relaxed);
+            return Err(external_modification_error(&options.correlation_id));
+        }
+        if let Some(expected_revision) = options.expected_revision {
+            if expected_revision != current.revision {
+                self.mutation_conflict_count.fetch_add(1, Ordering::Relaxed);
+                return Err(revision_conflict_error(
+                    expected_revision,
+                    current.revision,
+                    &options.correlation_id,
+                ));
             }
         }
 
+        let mut project = current.project;
+        let context = MutationContext {
+            project_id: project_id.to_string(),
+            current_revision: project.storage_revision,
+            current_fingerprint: current.content_fingerprint.clone(),
+            trusted_root: trusted_root.clone(),
+            operation: options.operation,
+            correlation_id: options.correlation_id.clone(),
+        };
+        let result = mutation(&mut project, &context)?;
+        canonicalize_speaking_attempts(&mut project);
+        normalize_document_paths_for_save(&trusted_root, &mut project);
+        project.root_path = trusted_root.root_string();
+        project.updated_at = chrono::Utc::now().to_rfc3339();
+        project.storage_revision = current.revision.checked_add(1).ok_or_else(|| {
+            project_error(
+                AppErrorCode::ProjectMutationRejected,
+                "Proje revision sınırına ulaştı; değişiklik kaydedilmedi.",
+                None,
+            )
+        })?;
+        project.workflow = workflow_engine::evaluate_workflow(&project);
+        let content = serde_json::to_string_pretty(&project).map_err(|error| {
+            project_error(
+                AppErrorCode::ProjectSaveFailed,
+                "Proje verisi hazırlanamadı; mevcut dosya korunuyor.",
+                Some(error.to_string()),
+            )
+        })?;
+        trusted_root.atomic_write(&trusted_root.managed("project.json")?, &content)?;
+        let new_fingerprint = fingerprint(&content);
+        self.set_session_project(project.clone(), new_fingerprint.clone())?;
+        Ok(MutationOutput {
+            result,
+            snapshot: ProjectSnapshot {
+                revision: project.storage_revision,
+                project,
+                content_fingerprint: new_fingerprint,
+                trusted_root,
+            },
+        })
+    }
+
+    /// Long jobs should call this at commit time and perform source/entity
+    /// validation inside the closure. A stale source returns a typed stale
+    /// outcome and never writes the candidate.
+    pub fn commit_job<T, F>(
+        &self,
+        project_id: &str,
+        options: MutationOptions,
+        mutation: F,
+    ) -> JobCommitResult<T>
+    where
+        F: FnOnce(&mut Project, &MutationContext) -> Result<T, AppError>,
+    {
+        match self.mutate(project_id, options, mutation) {
+            Ok(output) => JobCommitResult::Applied(Box::new(output)),
+            Err(error) if error.code == AppErrorCode::ProjectEntityStale => {
+                self.stale_job_result_count.fetch_add(1, Ordering::Relaxed);
+                JobCommitResult::Stale {
+                    reason: error.message,
+                }
+            }
+            Err(error) if error.code == AppErrorCode::ProjectEntityNotFound => {
+                JobCommitResult::EntityMissing
+            }
+            Err(error)
+                if matches!(
+                    error.code,
+                    AppErrorCode::ProjectRevisionConflict
+                        | AppErrorCode::ProjectExternallyModified
+                        | AppErrorCode::ProjectMutationConflict
+                ) =>
+            {
+                self.mutation_conflict_count.fetch_add(1, Ordering::Relaxed);
+                JobCommitResult::Conflict(error)
+            }
+            Err(error) => JobCommitResult::Rejected(error),
+        }
+    }
+
+    /// Transitional CAS adapter for callers that already produce a candidate
+    /// snapshot. It is conflict-safe, but new code should prefer a closure
+    /// that edits the latest entity inside `mutate`; this adapter is retained
+    /// only while legacy services are moved incrementally.
+    pub(crate) fn commit_snapshot_cas(&self, project: &Project) -> Result<Project, AppError> {
+        let candidate = project.clone();
+        let project_id = candidate.id.clone();
+        let base = self
+            .revision_history
+            .lock()
+            .map_err(lock_error)?
+            .get(&(project_id.clone(), candidate.storage_revision))
+            .cloned()
+            .or_else(|| {
+                self.current_project
+                    .lock()
+                    .ok()
+                    .and_then(|value| value.clone())
+                    .filter(|value| value.storage_revision == candidate.storage_revision)
+            })
+            .unwrap_or_else(|| candidate.clone());
+        let output = self.mutate(
+            &project_id,
+            MutationOptions::new("legacy_snapshot_merge"),
+            move |current, _context| {
+                merge_candidate_project(&base, &candidate, current)?;
+                Ok(())
+            },
+        )?;
+        Ok(output.snapshot.project)
+    }
+
+    /// Fixture-only whole-project replacement. Production modules cannot use
+    /// this API; canonical mutations must use `mutate` or `commit_job`.
+    #[cfg(test)]
+    pub(crate) fn save_project(&self, project: &Project) -> Result<(), AppError> {
+        if self.trusted_project_root(&project.id).is_err() {
+            let root =
+                TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false)?;
+            self.set_trusted_root(root.clone())?;
+            self.set_session_project(project.clone(), String::new())?;
+        }
+        let expected_revision = project.storage_revision;
+        let expected_fingerprint = self.session_fingerprint()?;
+        let candidate = project.clone();
+        let _ = self.mutate(
+            &project.id,
+            MutationOptions {
+                expected_revision: Some(expected_revision),
+                expected_fingerprint: expected_fingerprint.filter(|value| !value.is_empty()),
+                operation: "test_fixture_replace".to_string(),
+                correlation_id: Uuid::new_v4().to_string(),
+            },
+            move |current, _| {
+                *current = candidate;
+                Ok(())
+            },
+        )?;
         Ok(())
     }
 
     pub fn get_project_snapshot(&self, project_id: String) -> Result<Project, AppError> {
+        Ok(self
+            .get_project_snapshot_with_metadata(&project_id)?
+            .project)
+    }
+
+    pub fn get_project_snapshot_with_metadata(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectSnapshot, AppError> {
+        let trusted_root = self.trusted_project_root(project_id)?;
+        let content_fingerprint = self.session_fingerprint()?.unwrap_or_default();
         let lock = self.current_project.lock().map_err(|e| AppError {
             code: AppErrorCode::UnknownError,
             message: "Project store lock failed.".to_string(),
@@ -301,7 +857,15 @@ impl ProjectStore {
         })?;
         if let Some(project) = lock.as_ref() {
             if project.id == project_id {
-                Ok(project.clone())
+                let mut snapshot = project.clone();
+                hydrate_speaking_attempts(&mut snapshot);
+                let revision = snapshot.storage_revision;
+                Ok(ProjectSnapshot {
+                    project: snapshot,
+                    revision,
+                    content_fingerprint,
+                    trusted_root,
+                })
             } else {
                 Err(AppError {
                     code: AppErrorCode::ProjectNotFound,
@@ -401,6 +965,249 @@ impl ProjectStore {
     }
 }
 
+fn lock_error<T>(error: std::sync::PoisonError<T>) -> AppError {
+    project_error(
+        AppErrorCode::UnknownError,
+        "Proje store kilidi kullanılamadı.",
+        Some(error.to_string()),
+    )
+}
+
+fn project_error(code: AppErrorCode, message: &str, technical_details: Option<String>) -> AppError {
+    AppError {
+        code,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: None,
+        technical_details,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn external_modification_error(correlation_id: &str) -> AppError {
+    AppError {
+        code: AppErrorCode::ProjectExternallyModified,
+        message: "Proje siz çalışırken dışarıdan güncellendi. Son durumu yenileyip işlemi yeniden deneyin.".to_string(),
+        recoverable: true,
+        suggested_action: Some("Son durumu yenileyip işlemi yeniden deneyin.".to_string()),
+        technical_details: Some("project.json content fingerprint changed".to_string()),
+        correlation_id: correlation_id.to_string(),
+    }
+}
+
+fn revision_conflict_error(expected: u64, current: u64, correlation_id: &str) -> AppError {
+    AppError {
+        code: AppErrorCode::ProjectRevisionConflict,
+        message: "Proje siz çalışırken başka bir işlem tarafından güncellendi. Son durumu yenileyip işlemi yeniden deneyin.".to_string(),
+        recoverable: true,
+        suggested_action: Some("Son durumu yenileyip işlemi yeniden deneyin.".to_string()),
+        technical_details: Some(format!("expected_revision={expected}; current_revision={current}")),
+        correlation_id: correlation_id.to_string(),
+    }
+}
+
+fn fingerprint(content: &str) -> String {
+    // FNV-1a is deterministic, dependency-free, and sufficient for detecting
+    // accidental/external project.json replacement. It is not a security hash.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn project_lock_for(root: &Path) -> Result<Arc<Mutex<()>>, AppError> {
+    let registry = PROJECT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().map_err(lock_error)?;
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(root).and_then(Weak::upgrade) {
+        return Ok(lock);
+    }
+    let lock = Arc::new(Mutex::new(()));
+    registry.insert(root.to_path_buf(), Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn merge_candidate_project(
+    base: &Project,
+    candidate: &Project,
+    current: &mut Project,
+) -> Result<(), AppError> {
+    let base_value = serde_json::to_value(base).map_err(|error| {
+        project_error(
+            AppErrorCode::ProjectMutationRejected,
+            "Proje değişikliği doğrulanamadı.",
+            Some(error.to_string()),
+        )
+    })?;
+    let candidate_value = serde_json::to_value(candidate).map_err(|error| {
+        project_error(
+            AppErrorCode::ProjectMutationRejected,
+            "Proje değişikliği doğrulanamadı.",
+            Some(error.to_string()),
+        )
+    })?;
+    let mut current_value = serde_json::to_value(&*current).map_err(|error| {
+        project_error(
+            AppErrorCode::ProjectMutationRejected,
+            "Güncel proje değişikliği doğrulanamadı.",
+            Some(error.to_string()),
+        )
+    })?;
+    merge_json_values(&base_value, &candidate_value, &mut current_value, "project")?;
+    *current = serde_json::from_value(current_value).map_err(|error| {
+        project_error(
+            AppErrorCode::ProjectMutationRejected,
+            "Proje değişikliği geçerli bir proje oluşturmadı.",
+            Some(error.to_string()),
+        )
+    })?;
+    Ok(())
+}
+
+fn merge_json_values(
+    base: &Value,
+    candidate: &Value,
+    current: &mut Value,
+    path: &str,
+) -> Result<(), AppError> {
+    if candidate == base || candidate == current {
+        return Ok(());
+    }
+    if current == base {
+        *current = candidate.clone();
+        return Ok(());
+    }
+
+    match (base, candidate, current) {
+        (Value::Object(base), Value::Object(candidate), Value::Object(current)) => {
+            let keys = base
+                .keys()
+                .chain(candidate.keys())
+                .cloned()
+                .collect::<HashSet<_>>();
+            for key in keys {
+                if matches!(
+                    key.as_str(),
+                    "storageRevision" | "updatedAt" | "workflow" | "rootPath"
+                ) {
+                    continue;
+                }
+                let base_value = base.get(&key).unwrap_or(&Value::Null);
+                let candidate_value = candidate.get(&key).unwrap_or(&Value::Null);
+                let current_value = current.get_mut(&key);
+                match (candidate.contains_key(&key), current_value) {
+                    (false, Some(current_value)) => {
+                        if current_value == base_value {
+                            current.remove(&key);
+                        } else if candidate_value != current_value {
+                            return Err(merge_conflict(&format!("{path}.{key}")));
+                        }
+                    }
+                    (true, Some(current_value)) => merge_json_values(
+                        base_value,
+                        candidate_value,
+                        current_value,
+                        &format!("{path}.{key}"),
+                    )?,
+                    (true, None) => {
+                        if base_value == &Value::Null {
+                            current.insert(key, candidate_value.clone());
+                        } else {
+                            return Err(merge_conflict(&format!("{path}.{key}")));
+                        }
+                    }
+                    (false, None) => {}
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(base), Value::Array(candidate), Value::Array(current))
+            if arrays_have_stable_ids(base, candidate, current) =>
+        {
+            merge_id_arrays(base, candidate, current, path)
+        }
+        _ => Err(merge_conflict(path)),
+    }
+}
+
+fn arrays_have_stable_ids(values: &[Value], candidate: &[Value], current: &[Value]) -> bool {
+    values
+        .iter()
+        .chain(candidate)
+        .chain(current)
+        .all(|value| value.get("id").and_then(Value::as_str).is_some())
+}
+
+fn merge_id_arrays(
+    base: &[Value],
+    candidate: &[Value],
+    current: &mut Vec<Value>,
+    path: &str,
+) -> Result<(), AppError> {
+    for base_value in base {
+        let Some(id) = base_value.get("id").and_then(Value::as_str) else {
+            return Err(merge_conflict(path));
+        };
+        let candidate_value = candidate
+            .iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some(id));
+        let current_index = current
+            .iter()
+            .position(|value| value.get("id").and_then(Value::as_str) == Some(id));
+        match (candidate_value, current_index) {
+            (None, Some(index)) => {
+                if current[index] == *base_value {
+                    current.remove(index);
+                } else {
+                    return Err(merge_conflict(&format!("{path}[{id}]")));
+                }
+            }
+            (Some(candidate_value), Some(index)) => merge_json_values(
+                base_value,
+                candidate_value,
+                &mut current[index],
+                &format!("{path}[{id}]"),
+            )?,
+            (Some(_), None) => return Err(merge_conflict(&format!("{path}[{id}]"))),
+            (None, None) => {}
+        }
+    }
+
+    for candidate_value in candidate {
+        let Some(id) = candidate_value.get("id").and_then(Value::as_str) else {
+            return Err(merge_conflict(path));
+        };
+        let in_base = base
+            .iter()
+            .any(|value| value.get("id").and_then(Value::as_str) == Some(id));
+        let current_value = current
+            .iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some(id));
+        if !in_base && current_value.is_none() {
+            current.push(candidate_value.clone());
+        } else if !in_base {
+            let current_value = current
+                .iter()
+                .find(|value| value.get("id").and_then(Value::as_str) == Some(id))
+                .ok_or_else(|| merge_conflict(&format!("{path}[{id}]")))?;
+            if current_value != candidate_value {
+                return Err(merge_conflict(&format!("{path}[{id}]")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_conflict(path: &str) -> AppError {
+    project_error(
+        AppErrorCode::ProjectMutationConflict,
+        "Aynı proje kaydında çakışan değişiklik bulundu. Son durumu yenileyip işlemi yeniden deneyin.",
+        Some(format!("conflicting_path={path}")),
+    )
+}
+
 struct ProjectListEntry {
     sort_key: u128,
     item: ProjectListItem,
@@ -425,7 +1232,25 @@ impl ProjectStore {
         project_file: &Path,
         refresh_workflow: bool,
     ) -> Result<LoadedProject, AppError> {
-        let content = std::fs::read_to_string(project_file).map_err(|error| AppError {
+        let selected_root = project_file.parent().ok_or_else(|| AppError {
+            code: AppErrorCode::ProjectLoadFailed,
+            message: "Proje klasörü belirlenemedi.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(project_file.display().to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        let trusted_root = TrustedProjectRoot::open_selected(selected_root)?;
+        Self::load_project_file_with_root(&trusted_root, refresh_workflow)
+    }
+
+    fn load_project_file_with_root(
+        trusted_root: &TrustedProjectRoot,
+        refresh_workflow: bool,
+    ) -> Result<LoadedProject, AppError> {
+        let project_file =
+            trusted_root.resolve_existing_file(&trusted_root.managed("project.json")?)?;
+        let content = std::fs::read_to_string(&project_file).map_err(|error| AppError {
             code: AppErrorCode::ProjectLoadFailed,
             message: "Could not read project file.".to_string(),
             recoverable: false,
@@ -438,8 +1263,19 @@ impl ProjectStore {
             correlation_id: Uuid::new_v4().to_string(),
         })?;
 
-        let (mut project, warnings, migration_changed) =
-            Self::deserialize_project(project_file, &content)?;
+        let (mut project, mut warnings, migration_changed, legacy_revision_missing) =
+            Self::deserialize_project(&project_file, &content)?;
+        if project.root_path.trim() != trusted_root.root_string() {
+            warnings.push(format!(
+                "Project root metadata mismatch: stored root_path was not used; runtime root is {}.",
+                trusted_root.root_string()
+            ));
+        }
+        adapt_loaded_document_paths(trusted_root, &mut project, &mut warnings);
+        // Keep all existing services on the session-bound canonical root. The
+        // serialized root_path remains legacy/display metadata and can never
+        // select a write target.
+        project.root_path = trusted_root.root_string();
         if refresh_workflow {
             project.workflow = workflow_engine::evaluate_workflow(&project);
         }
@@ -447,13 +1283,14 @@ impl ProjectStore {
             project,
             warnings,
             migration_changed,
+            legacy_revision_missing,
         })
     }
 
     fn deserialize_project(
         project_file: &Path,
         content: &str,
-    ) -> Result<(Project, Vec<String>, bool), AppError> {
+    ) -> Result<(Project, Vec<String>, bool, bool), AppError> {
         let mut value: Value = serde_json::from_str(content).map_err(|error| AppError {
             code: AppErrorCode::ProjectLoadFailed,
             message: "Project JSON syntax error.".to_string(),
@@ -469,6 +1306,7 @@ impl ProjectStore {
             correlation_id: Uuid::new_v4().to_string(),
         })?;
 
+        let legacy_revision_missing = value.get("storageRevision").is_none();
         let (mut warnings, migration_changed) = normalize_project_json(project_file, &mut value);
 
         let project_json = serde_json::to_string(&value).map_err(|error| AppError {
@@ -508,7 +1346,46 @@ impl ProjectStore {
         })?;
 
         warnings.extend(school_class_reference_warnings(project_file, &project));
-        Ok((project, warnings, migration_changed))
+        Ok((
+            project,
+            warnings,
+            migration_changed,
+            legacy_revision_missing,
+        ))
+    }
+}
+
+fn adapt_loaded_document_paths(
+    trusted_root: &TrustedProjectRoot,
+    project: &mut Project,
+    warnings: &mut Vec<String>,
+) {
+    for document in &mut project.documents {
+        match trusted_root.adapt_legacy_document_path(&document.stored_path) {
+            Ok(managed) => {
+                if managed.as_str() != document.stored_path {
+                    warnings.push(format!(
+                        "Legacy document path normalized in memory: document_id={}",
+                        document.id
+                    ));
+                    document.stored_path = managed.as_str().to_string();
+                }
+            }
+            Err(error) => {
+                warnings.push(format!(
+                    "Legacy document path unresolved: document_id={}; code={:?}",
+                    document.id, error.code
+                ));
+            }
+        }
+    }
+}
+
+fn normalize_document_paths_for_save(trusted_root: &TrustedProjectRoot, project: &mut Project) {
+    for document in &mut project.documents {
+        if let Ok(managed) = trusted_root.adapt_legacy_document_path(&document.stored_path) {
+            document.stored_path = managed.as_str().to_string();
+        }
     }
 }
 
@@ -516,6 +1393,7 @@ struct LoadedProject {
     project: Project,
     warnings: Vec<String>,
     migration_changed: bool,
+    legacy_revision_missing: bool,
 }
 
 fn normalize_project_json(project_file: &Path, value: &mut Value) -> (Vec<String>, bool) {
@@ -524,48 +1402,379 @@ fn normalize_project_json(project_file: &Path, value: &mut Value) -> (Vec<String
         return (warnings, false);
     };
 
-    let migration_changed = normalize_school_class_storage(project_file, project, &mut warnings);
-    normalize_speaking_exams(project_file, project, &mut warnings);
+    let class_changed = normalize_school_class_storage(project_file, project, &mut warnings);
+    let assessment_changed =
+        normalize_assessment_organization(project_file, project, &mut warnings);
     normalize_student_answer_ocr_records(project_file, project, &mut warnings);
     normalize_student_identity_records(project_file, project, &mut warnings);
     normalize_scoring_records(project_file, project, &mut warnings);
 
-    (warnings, migration_changed)
+    (warnings, class_changed || assessment_changed)
 }
 
-fn normalize_speaking_exams(
-    _project_file: &Path,
+fn normalize_assessment_organization(
+    project_file: &Path,
     project: &mut Map<String, Value>,
-    _warnings: &mut Vec<String>,
-) {
-    let Some(exams) = project
-        .get_mut("speakingExams")
+    warnings: &mut Vec<String>,
+) -> bool {
+    let mut changed = false;
+    let activity_snapshot = project
+        .get("assessmentActivities")
+        .cloned()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let class_snapshot = project
+        .get("schoolClasses")
+        .cloned()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+
+    if let Some(activities) = project
+        .get_mut("assessmentActivities")
         .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-
-    for exam in exams {
-        let Some(exam) = exam.as_object_mut() else {
-            continue;
-        };
-
-        let has_assigned = exam
-            .get("assignedClassIds")
-            .and_then(Value::as_array)
-            .is_some_and(|arr| !arr.is_empty());
-
-        if !has_assigned {
-            if let Some(class_id) = exam.get("classId").and_then(Value::as_str) {
-                if !class_id.trim().is_empty() {
-                    exam.insert(
-                        "assignedClassIds".to_string(),
-                        Value::Array(vec![Value::String(class_id.to_string())]),
-                    );
+    {
+        for activity in activities {
+            let Some(activity) = activity.as_object_mut() else {
+                continue;
+            };
+            let assessment_type = activity
+                .get("assessmentType")
+                .and_then(Value::as_str)
+                .unwrap_or("written");
+            let workflow_family = if assessment_type == "speaking" {
+                "speaking"
+            } else {
+                "written"
+            };
+            if activity.get("workflowFamily").and_then(Value::as_str) != Some(workflow_family) {
+                activity.insert(
+                    "workflowFamily".to_string(),
+                    Value::String(workflow_family.to_string()),
+                );
+                changed = true;
+            }
+            if activity.get("title").is_none() {
+                activity.insert("title".to_string(), Value::String(String::new()));
+                changed = true;
+            }
+            if let Some(applications) = activity
+                .get_mut("classApplications")
+                .and_then(Value::as_array_mut)
+            {
+                for application in applications {
+                    let Some(application) = application.as_object_mut() else {
+                        continue;
+                    };
+                    if application.get("schoolClassId").is_none() {
+                        if let Some(legacy) = application.get("classSectionId").cloned() {
+                            application.insert("schoolClassId".to_string(), legacy);
+                            changed = true;
+                        }
+                    }
+                    if application.get("studentScopeIds").is_none() {
+                        application.insert("studentScopeIds".to_string(), Value::Array(vec![]));
+                        changed = true;
+                    }
+                    if application.get("speakingAttempts").is_none() {
+                        application.insert("speakingAttempts".to_string(), Value::Array(vec![]));
+                        changed = true;
+                    }
                 }
             }
         }
     }
+
+    let mut legacy_links: Vec<(String, String, Vec<String>)> = Vec::new();
+    if let Some(exams) = project
+        .get_mut("speakingExams")
+        .and_then(Value::as_array_mut)
+    {
+        for exam in exams {
+            let Some(exam) = exam.as_object_mut() else {
+                continue;
+            };
+            let exam_id = exam
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("legacy-speaking-exam")
+                .to_string();
+            let activity_id = exam
+                .get("assessmentActivityId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    let candidates = activity_snapshot
+                        .iter()
+                        .filter(|activity| {
+                            activity
+                                .get("assessmentType")
+                                .and_then(Value::as_str)
+                                == Some("speaking")
+                        })
+                        .filter(|activity| {
+                            let exam_title = exam.get("title").and_then(Value::as_str).unwrap_or("");
+                            let activity_title = activity
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            exam_title.is_empty()
+                                || activity_title.is_empty()
+                                || exam_title == activity_title
+                        })
+                        .filter(|activity| {
+                            let exam_task = exam.get("taskText").and_then(Value::as_str).unwrap_or("");
+                            let activity_task = activity
+                                .get("speakingConfiguration")
+                                .and_then(Value::as_object)
+                                .and_then(|config| config.get("taskText"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("");
+                            exam_task.is_empty()
+                                || activity_task.is_empty()
+                                || exam_task == activity_task
+                        })
+                        .filter_map(|activity| activity.get("id").and_then(Value::as_str));
+                    let candidates = candidates.collect::<Vec<_>>();
+                    match candidates.as_slice() {
+                        [only] => Some((*only).to_string()),
+                        [] => {
+                            warnings.push(format!(
+                                "{}.speakingExams[{exam_id}] legacy ilişki için uygun AssessmentActivity bulunamadı; unresolved bırakıldı.",
+                                project_file.display()
+                            ));
+                            None
+                        }
+                        _ => {
+                            warnings.push(format!(
+                                "{}.speakingExams[{exam_id}] birden fazla AssessmentActivity ile eşleşiyor; yanlış bağlama yapılmadı.",
+                                project_file.display()
+                            ));
+                            None
+                        }
+                    }
+                });
+
+            let Some(activity_id) = activity_id else {
+                continue;
+            };
+            if exam.get("assessmentActivityId").and_then(Value::as_str)
+                != Some(activity_id.as_str())
+            {
+                exam.insert(
+                    "assessmentActivityId".to_string(),
+                    Value::String(activity_id.clone()),
+                );
+                changed = true;
+            }
+            let mut class_ids = exam
+                .get("assignedClassIds")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if class_ids.is_empty() {
+                if let Some(class_id) = exam.get("classId").and_then(Value::as_str) {
+                    if !class_id.trim().is_empty() {
+                        class_ids.push(class_id.to_string());
+                    }
+                }
+            }
+            class_ids.sort();
+            class_ids.dedup();
+            legacy_links.push((exam_id.clone(), activity_id.clone(), class_ids.clone()));
+
+            if let Some(attempts) = exam.get_mut("attempts").and_then(Value::as_array_mut) {
+                for attempt in attempts {
+                    let Some(attempt) = attempt.as_object_mut() else {
+                        continue;
+                    };
+                    if attempt.get("assessmentActivityId").is_none() {
+                        attempt.insert(
+                            "assessmentActivityId".to_string(),
+                            Value::String(activity_id.clone()),
+                        );
+                        changed = true;
+                    }
+                    if attempt.get("schoolClassId").is_none() && class_ids.len() == 1 {
+                        attempt.insert(
+                            "schoolClassId".to_string(),
+                            Value::String(class_ids[0].clone()),
+                        );
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    for (exam_id, activity_id, class_ids) in legacy_links {
+        let Some(activities) = project
+            .get_mut("assessmentActivities")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        let Some(activity) = activities.iter_mut().find(|activity| {
+            activity.get("id").and_then(Value::as_str) == Some(activity_id.as_str())
+        }) else {
+            warnings.push(format!(
+                "{}.speakingExams[{exam_id}] AssessmentActivity referansı bulunamadı; unresolved bırakıldı.",
+                project_file.display()
+            ));
+            continue;
+        };
+        let Some(activity_object) = activity.as_object_mut() else {
+            continue;
+        };
+        let created_at = activity_object
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let applications = activity_object
+            .entry("classApplications".to_string())
+            .or_insert_with(|| Value::Array(vec![]));
+        let Some(applications) = applications.as_array_mut() else {
+            continue;
+        };
+        let mut all_classes_resolved = true;
+        for class_id in class_ids {
+            let class_exists = class_snapshot.iter().any(|school_class| {
+                school_class.get("id").and_then(Value::as_str) == Some(class_id.as_str())
+            });
+            if !class_exists {
+                all_classes_resolved = false;
+                warnings.push(format!(
+                    "{}.speakingExams[{exam_id}] sınıfı {class_id} bulunamadı; ClassApplication oluşturulmadı.",
+                    project_file.display()
+                ));
+                continue;
+            }
+            if applications.iter().any(|application| {
+                application.get("schoolClassId").and_then(Value::as_str) == Some(class_id.as_str())
+            }) {
+                continue;
+            }
+            let application_id = legacy_storage_id(
+                "legacy-speaking-application",
+                &format!("{activity_id}:{class_id}"),
+            );
+            applications.push(serde_json::json!({
+                "id": application_id,
+                "activityId": activity_id,
+                "schoolClassId": class_id,
+                "status": "scheduled",
+                "documentIds": [],
+                "studentScopeIds": [],
+                "speakingAttempts": [],
+                "createdAt": created_at,
+                "updatedAt": created_at,
+            }));
+            changed = true;
+        }
+        if all_classes_resolved {
+            if let Some(exams) = project
+                .get_mut("speakingExams")
+                .and_then(Value::as_array_mut)
+            {
+                if let Some(exam) = exams
+                    .iter_mut()
+                    .find(|exam| exam.get("id").and_then(Value::as_str) == Some(exam_id.as_str()))
+                {
+                    if let Some(exam) = exam.as_object_mut() {
+                        exam.insert("assignedClassIds".to_string(), Value::Array(vec![]));
+                        exam.insert("classId".to_string(), Value::Null);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let application_snapshot = project
+        .get("assessmentActivities")
+        .cloned()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    if let Some(exams) = project
+        .get_mut("speakingExams")
+        .and_then(Value::as_array_mut)
+    {
+        for exam in exams {
+            let Some(exam) = exam.as_object_mut() else {
+                continue;
+            };
+            let Some(activity_id) = exam
+                .get("assessmentActivityId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let applications = application_snapshot
+                .iter()
+                .find(|activity| {
+                    activity.get("id").and_then(Value::as_str) == Some(activity_id.as_str())
+                })
+                .and_then(|activity| activity.get("classApplications"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let legacy_exam_id = exam
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("legacy")
+                .to_string();
+            let Some(attempts) = exam.get_mut("attempts").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for attempt in attempts {
+                let Some(attempt) = attempt.as_object_mut() else {
+                    continue;
+                };
+                if attempt
+                    .get("classApplicationId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    continue;
+                }
+                let school_class_id = attempt
+                    .get("schoolClassId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let candidates = applications
+                    .iter()
+                    .filter(|application| {
+                        application.get("schoolClassId").and_then(Value::as_str)
+                            == Some(school_class_id)
+                    })
+                    .filter_map(|application| application.get("id").and_then(Value::as_str))
+                    .collect::<Vec<_>>();
+                if let [application_id] = candidates.as_slice() {
+                    attempt.insert(
+                        "classApplicationId".to_string(),
+                        Value::String((*application_id).to_string()),
+                    );
+                    changed = true;
+                } else if !applications.is_empty() {
+                    warnings.push(format!(
+                        "{}.speakingExams[{}] attempt için ClassApplication eşleşmesi bulunamadı; unresolved bırakıldı.",
+                        project_file.display(),
+                        legacy_exam_id
+                    ));
+                }
+            }
+        }
+    }
+
+    changed
 }
 
 fn normalize_school_class_storage(
@@ -623,6 +1832,18 @@ fn normalize_school_class_storage(
                 Value::String(normalized_name.clone()),
             );
         }
+        let display_name = class
+            .get("displayName")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&normalized_name)
+            .to_string();
+        class.insert("displayName".to_string(), Value::String(display_name));
+        if class.get("academicYearId").is_none() {
+            if let Some(academic_year) = class.get("academicYear").cloned() {
+                class.insert("academicYearId".to_string(), academic_year);
+            }
+        }
         if class
             .get("id")
             .and_then(Value::as_str)
@@ -662,6 +1883,10 @@ fn normalize_school_class_storage(
                 )),
             );
             class.insert("name".to_string(), Value::String(normalized_name.clone()));
+            class.insert(
+                "displayName".to_string(),
+                Value::String(normalized_name.clone()),
+            );
             class.insert(
                 "normalizedName".to_string(),
                 Value::String(normalized_name.clone()),
@@ -939,6 +2164,64 @@ fn legacy_storage_id(prefix: &str, seed: &str) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{prefix}-{hash:016x}")
+}
+
+/// The speaking engine still uses a runtime aggregate while it processes audio,
+/// but persisted ownership belongs to the activity's ClassApplication. These
+/// two helpers keep that compatibility projection out of project.json and make
+/// the canonical direction explicit.
+fn canonicalize_speaking_attempts(project: &mut Project) {
+    for activity in &mut project.assessment_activities {
+        if activity.assessment_type != crate::domain::assessment::AssessmentType::Speaking {
+            continue;
+        }
+        let activity_id = activity.id.clone();
+        for application in &mut activity.class_applications {
+            let application_id = application.id.clone();
+            let runtime_attempts = project
+                .speaking_exams
+                .iter()
+                .filter(|exam| {
+                    exam.assessment_activity_id.as_deref() == Some(activity_id.as_str())
+                        || exam.id == activity_id
+                })
+                .flat_map(|exam| exam.attempts.iter())
+                .filter(|attempt| {
+                    attempt.class_application_id.as_deref() == Some(application_id.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !runtime_attempts.is_empty() {
+                application.speaking_attempts = runtime_attempts;
+            }
+        }
+        for exam in &mut project.speaking_exams {
+            if exam.assessment_activity_id.as_deref() == Some(activity_id.as_str())
+                || exam.id == activity_id
+            {
+                exam.attempts.clear();
+            }
+        }
+    }
+}
+
+fn hydrate_speaking_attempts(project: &mut Project) {
+    for activity in &project.assessment_activities {
+        if activity.assessment_type != crate::domain::assessment::AssessmentType::Speaking {
+            continue;
+        }
+        let Some(exam) = project.speaking_exams.iter_mut().find(|exam| {
+            exam.assessment_activity_id.as_deref() == Some(activity.id.as_str())
+                || exam.id == activity.id
+        }) else {
+            continue;
+        };
+        exam.attempts = activity
+            .class_applications
+            .iter()
+            .flat_map(|application| application.speaking_attempts.iter().cloned())
+            .collect();
+    }
 }
 
 fn school_class_reference_warnings(project_file: &Path, project: &Project) -> Vec<String> {
@@ -1229,13 +2512,19 @@ fn document_role_key(role: &DocumentRole) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::assessment::{
+        AssessmentActivity, AssessmentStatus, AssessmentType, ClassApplication,
+        ClassApplicationStatus, SpeakingConfigurationSnapshot, WorkflowFamily,
+    };
     use crate::domain::document::Document;
     use crate::domain::project::Project;
     use crate::domain::question::{
         AnswerType, CropTemplate, Question, TextFieldSource, TextFieldState, TextFieldStatus,
     };
     use crate::domain::rubric::{RubricCriterion, RubricState};
+    use crate::domain::school_class::{SchoolClass, SchoolClassStatus};
     use crate::domain::scoring::scoring_active_run_id;
+    use crate::domain::speaking::{new_exam, SpeakingExamType};
     use crate::domain::student::{
         OcrImagePreprocessDiagnostics, OcrImagePreprocessMode, PageGroupingMode, Student,
         StudentAnswerOcrRecord, StudentAnswerOcrStatus, StudentSubmission,
@@ -1256,6 +2545,10 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: updated_at.to_string(),
             root_path: root_path.to_string_lossy().to_string(),
+            storage_revision: 0,
+            academic_year_id: None,
+            course_id: None,
+            course_name: None,
             sections: vec![],
             students: vec![Student {
                 id: Uuid::new_v4().to_string(),
@@ -1266,6 +2559,8 @@ mod tests {
                 identity_ocr: None,
             }],
             school_classes: vec![],
+            teaching_assignments: vec![],
+            assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![StudentSubmission {
                 id: Uuid::new_v4().to_string(),
@@ -1290,6 +2585,7 @@ mod tests {
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             student_answer_ocr_records: vec![],
+            student_answer_ocr_generations: vec![],
             student_answer_crop_template: Default::default(),
             student_identity_crop_template: None,
             documents: vec![
@@ -1419,6 +2715,70 @@ mod tests {
         .unwrap();
     }
 
+    fn speaking_configuration(task_text: &str) -> SpeakingConfigurationSnapshot {
+        SpeakingConfigurationSnapshot {
+            speaking_type: "prepared".to_string(),
+            task_text: task_text.to_string(),
+            target_duration_seconds: 180,
+            min_duration_seconds: 120,
+            max_duration_seconds: 240,
+            rubric_version: "rubric-v1".to_string(),
+            scoring_policy_version: "policy-v1".to_string(),
+            cleanup_prompt_version: "cleanup-v1".to_string(),
+            evaluation_prompt_version: "evaluation-v1".to_string(),
+            frozen_model_file_hash: None,
+            rubric_snapshot: serde_json::json!({"version": "rubric-v1"}),
+        }
+    }
+
+    fn speaking_activity(
+        id: &str,
+        title: &str,
+        task_text: &str,
+        class_applications: Vec<ClassApplication>,
+    ) -> AssessmentActivity {
+        AssessmentActivity {
+            id: id.to_string(),
+            academic_year_id: "2026-2027".to_string(),
+            course_id: "turkish".to_string(),
+            course_name: "Türk Dili ve Edebiyatı".to_string(),
+            title: title.to_string(),
+            grade_level: 11,
+            term: 1,
+            assessment_type: AssessmentType::Speaking,
+            workflow_family: WorkflowFamily::Speaking,
+            sequence_number: 1,
+            status: AssessmentStatus::Draft,
+            common_document_ids: vec![],
+            listening_details: None,
+            speaking_configuration: Some(speaking_configuration(task_text)),
+            class_applications,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn class_application(
+        activity_id: &str,
+        application_id: &str,
+        school_class_id: &str,
+    ) -> ClassApplication {
+        ClassApplication {
+            id: application_id.to_string(),
+            activity_id: activity_id.to_string(),
+            school_class_id: school_class_id.to_string(),
+            scheduled_at: None,
+            application_date: None,
+            status: ClassApplicationStatus::Scheduled,
+            notes: None,
+            document_ids: vec![],
+            student_scope_ids: vec![],
+            speaking_attempts: vec![],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn list_projects_in_dir_lists_and_sorts_newest_first() {
         let root = temp_root();
@@ -1483,8 +2843,264 @@ mod tests {
 
         let reopened = ProjectStore::open_project_at_path(&root).unwrap();
         assert_eq!(reopened.name, "Open Me");
-        assert_eq!(reopened.root_path, root.to_string_lossy().to_string());
+        assert_eq!(
+            reopened.root_path,
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        );
         assert_eq!(reopened.questions.len(), 2);
+    }
+
+    #[test]
+    fn speaking_attempts_persist_under_class_application_and_reload_without_duplication() {
+        let root = temp_root();
+        let store = ProjectStore::new();
+        let mut project = sample_project(&root, "Canonical speaking", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap();
+        project.school_classes.push(SchoolClass {
+            id: "class-11-a".to_string(),
+            name: "11A".to_string(),
+            display_name: "11A".to_string(),
+            normalized_name: "11-A".to_string(),
+            academic_year: Some("2026-2027".to_string()),
+            academic_year_id: Some("2026-2027".to_string()),
+            grade_level: Some(11),
+            section: Some("A".to_string()),
+            display_order: 0,
+            status: SchoolClassStatus::Active,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        let mut application = class_application("activity-1", "application-1", "class-11-a");
+        let attempt: crate::domain::speaking::SpeakingAttempt =
+            serde_json::from_value(serde_json::json!({
+                "id": "attempt-1",
+                "assessmentActivityId": "activity-1",
+                "classApplicationId": "application-1",
+                "schoolClassId": "class-11-a",
+                "examId": "activity-1",
+                "studentId": project.students[0].id,
+                "attemptNumber": 1,
+                "state": "teacher_review",
+                "startedAt": "2026-01-01T00:00:00Z"
+            }))
+            .expect("minimal speaking attempt should deserialize with defaults");
+        application.speaking_attempts.push(attempt);
+        project.assessment_activities.push(speaking_activity(
+            "activity-1",
+            "1. Konuşma",
+            "Bir anını anlat.",
+            vec![application],
+        ));
+        project.speaking_exams.push(new_exam(
+            "1. Konuşma".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Bir anını anlat.".to_string(),
+            180,
+            120,
+            240,
+        ));
+        project.speaking_exams[0].id = "activity-1".to_string();
+        project.speaking_exams[0].assessment_activity_id = Some("activity-1".to_string());
+
+        store
+            .save_project(&project)
+            .expect("canonical project should save");
+        let persisted_json = fs::read_to_string(root.join("project.json")).unwrap();
+        let persisted_value: serde_json::Value = serde_json::from_str(&persisted_json).unwrap();
+        assert_eq!(
+            persisted_value["assessmentActivities"][0]["classApplications"][0]["speakingAttempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(persisted_value["speakingExams"][0]["attempts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let reopened_store = ProjectStore::new();
+        let reopened = reopened_store
+            .open_project(root.to_string_lossy().to_string())
+            .expect("canonical project should reload");
+        assert_eq!(reopened.assessment_activities.len(), 1);
+        assert_eq!(
+            reopened.assessment_activities[0].class_applications.len(),
+            1
+        );
+        assert_eq!(
+            reopened.assessment_activities[0].class_applications[0]
+                .speaking_attempts
+                .len(),
+            1
+        );
+        let second_reload = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(
+            second_reload.assessment_activities[0]
+                .class_applications
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn legacy_assigned_class_ids_migrate_to_one_class_application_idempotently() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "Legacy speaking", "2026-01-01T00:00:00Z");
+        project.school_classes.push(SchoolClass {
+            id: "class-11-a".to_string(),
+            name: "11A".to_string(),
+            display_name: "11A".to_string(),
+            normalized_name: "11-A".to_string(),
+            academic_year: Some("2026-2027".to_string()),
+            academic_year_id: Some("2026-2027".to_string()),
+            grade_level: Some(11),
+            section: Some("A".to_string()),
+            display_order: 0,
+            status: SchoolClassStatus::Active,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        project.assessment_activities.push(speaking_activity(
+            "activity-legacy",
+            "1. Konuşma",
+            "Bir anını anlat.",
+            vec![],
+        ));
+        let mut legacy_exam = new_exam(
+            "1. Konuşma".to_string(),
+            vec!["class-11-a".to_string()],
+            SpeakingExamType::Prepared,
+            "Bir anını anlat.".to_string(),
+            180,
+            120,
+            240,
+        );
+        legacy_exam.id = "legacy-exam-1".to_string();
+        let mut value = serde_json::to_value(&project).unwrap();
+        value["speakingExams"] = serde_json::json!([legacy_exam]);
+        write_project_value(&root, &value);
+
+        let store = ProjectStore::new();
+        let (first, first_warnings) = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("legacy project should remain loadable");
+        assert_eq!(first.assessment_activities[0].class_applications.len(), 1);
+        assert!(first_warnings
+            .iter()
+            .any(|warning| warning.contains("backup")));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("project.json")).unwrap()).unwrap();
+        assert!(persisted["speakingExams"][0]["assignedClassIds"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        let (second, _) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("migrated project should reload");
+        assert_eq!(second.assessment_activities[0].class_applications.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_legacy_speaking_relation_stays_unresolved() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "Ambiguous speaking", "2026-01-01T00:00:00Z");
+        project.school_classes.push(SchoolClass {
+            id: "class-11-a".to_string(),
+            name: "11A".to_string(),
+            display_name: "11A".to_string(),
+            normalized_name: "11-A".to_string(),
+            academic_year: Some("2026-2027".to_string()),
+            academic_year_id: Some("2026-2027".to_string()),
+            grade_level: Some(11),
+            section: Some("A".to_string()),
+            display_order: 0,
+            status: SchoolClassStatus::Active,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        project.assessment_activities.extend([
+            speaking_activity("activity-a", "1. Konuşma", "Aynı görev", vec![]),
+            speaking_activity("activity-b", "1. Konuşma", "Aynı görev", vec![]),
+        ]);
+        let legacy_exam = new_exam(
+            "1. Konuşma".to_string(),
+            vec!["class-11-a".to_string()],
+            SpeakingExamType::Prepared,
+            "Aynı görev".to_string(),
+            180,
+            120,
+            240,
+        );
+        let mut value = serde_json::to_value(&project).unwrap();
+        value["speakingExams"] = serde_json::json!([legacy_exam]);
+        write_project_value(&root, &value);
+
+        let (reopened, warnings) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("ambiguous legacy project should remain loadable");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("birden fazla")));
+        assert!(reopened
+            .assessment_activities
+            .iter()
+            .all(|activity| activity.class_applications.is_empty()));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("project.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["speakingExams"][0]["assignedClassIds"][0],
+            "class-11-a"
+        );
+    }
+
+    #[test]
+    fn missing_legacy_speaking_class_stays_loadable_and_preserves_legacy_relation() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "Missing legacy class", "2026-01-01T00:00:00Z");
+        project.assessment_activities.push(speaking_activity(
+            "activity-missing-class",
+            "1. Konuşma",
+            "Görev",
+            vec![],
+        ));
+        let legacy_exam = new_exam(
+            "1. Konuşma".to_string(),
+            vec!["missing-class".to_string()],
+            SpeakingExamType::Prepared,
+            "Görev".to_string(),
+            180,
+            120,
+            240,
+        );
+        let mut value = serde_json::to_value(&project).unwrap();
+        value["speakingExams"] = serde_json::json!([legacy_exam]);
+        write_project_value(&root, &value);
+
+        let (reopened, warnings) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("missing legacy class must not block project load");
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("bulunamadı")));
+        assert!(reopened
+            .assessment_activities
+            .iter()
+            .all(|activity| activity.class_applications.is_empty()));
+        let persisted: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(root.join("project.json")).unwrap()).unwrap();
+        assert_eq!(
+            persisted["speakingExams"][0]["assignedClassIds"][0],
+            "missing-class"
+        );
     }
 
     #[test]
@@ -1564,7 +3180,7 @@ mod tests {
         let root = temp_root();
         let result = ProjectStore::open_project_at_path(&root);
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code, AppErrorCode::ProjectLoadFailed);
+        assert_eq!(result.unwrap_err().code, AppErrorCode::ProjectNotFound);
     }
 
     #[test]
@@ -1889,7 +3505,10 @@ mod tests {
         assert_eq!(project.name, "Created Project");
         assert_eq!(
             project.root_path,
-            project_root.to_string_lossy().to_string()
+            std::fs::canonicalize(&project_root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
         );
         assert!(project_root.join("project.json").is_file());
         assert!(project_root.join("documents").is_dir());
@@ -1901,6 +3520,87 @@ mod tests {
 
         let reopened = ProjectStore::open_project_at_path(&project_root).unwrap();
         assert_eq!(reopened.id, project.id);
+    }
+
+    #[test]
+    fn new_project_rejects_existing_project_and_non_empty_directory() {
+        let base = temp_root();
+        let existing = base.join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("project.json"), b"original").unwrap();
+        let store = ProjectStore::new();
+        let error = store
+            .create_project("Existing".into(), existing.to_string_lossy().to_string())
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectAlreadyExists);
+        assert_eq!(
+            fs::read(existing.join("project.json")).unwrap(),
+            b"original"
+        );
+
+        let non_empty = base.join("non-empty");
+        fs::create_dir_all(&non_empty).unwrap();
+        fs::write(non_empty.join("keep.txt"), b"keep").unwrap();
+        let error = ProjectStore::new()
+            .create_project("Non empty".into(), non_empty.to_string_lossy().to_string())
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectDirectoryNotEmpty);
+        assert_eq!(fs::read(non_empty.join("keep.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn malicious_stored_root_cannot_redirect_save_to_another_project() {
+        let base = temp_root();
+        let opened_root = base.join("opened");
+        let malicious_root = base.join("malicious");
+        fs::create_dir_all(&malicious_root).unwrap();
+        let malicious_original = b"do-not-change";
+        fs::write(malicious_root.join("project.json"), malicious_original).unwrap();
+
+        let store = ProjectStore::new();
+        let project = store
+            .create_project("Opened".into(), opened_root.to_string_lossy().to_string())
+            .unwrap();
+        let opened_file = opened_root.join("project.json");
+        let before = fs::read(&opened_file).unwrap();
+        let mut tampered = project.clone();
+        tampered.root_path = malicious_root.to_string_lossy().to_string();
+        store.save_project(&tampered).unwrap();
+
+        assert_eq!(
+            fs::read(malicious_root.join("project.json")).unwrap(),
+            malicious_original
+        );
+        assert_ne!(fs::read(opened_file).unwrap(), before);
+    }
+
+    #[test]
+    fn moved_project_opens_from_new_root_and_warns_without_using_old_root() {
+        let base = temp_root();
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        let store = ProjectStore::new();
+        let project = store
+            .create_project("Moved".into(), old_root.to_string_lossy().to_string())
+            .unwrap();
+        let old_root_string = project.root_path.clone();
+        fs::rename(&old_root, &new_root).unwrap();
+
+        let reopened_store = ProjectStore::new();
+        let (reopened, warnings) = reopened_store
+            .open_project_with_warnings(new_root.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(reopened.id, project.id);
+        assert_eq!(
+            reopened.root_path,
+            fs::canonicalize(&new_root).unwrap().to_string_lossy()
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("root metadata mismatch")));
+        assert!(!Path::new(&old_root_string).exists());
+        reopened_store.save_project(&reopened).unwrap();
+        assert!(new_root.join("project.json").is_file());
     }
 
     #[test]
@@ -1934,9 +3634,9 @@ mod tests {
         let original_scoring = value["scoringRecords"].clone();
         let content = serde_json::to_string(&value).unwrap();
 
-        let (first, warnings, first_changed) =
+        let (first, warnings, first_changed, _) =
             ProjectStore::deserialize_project(&root.join("project.json"), &content).unwrap();
-        let (second, _, second_changed) =
+        let (second, _, second_changed, _) =
             ProjectStore::deserialize_project(&root.join("project.json"), &content).unwrap();
 
         assert_eq!(first.school_classes.len(), 1);
@@ -2073,6 +3773,616 @@ mod tests {
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    #[test]
+    fn transactional_mutations_preserve_disjoint_updates_and_increment_revision_once() {
+        let root = temp_root();
+        let project = sample_project(&root, "Concurrent", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let project_id = opened.id.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let class_store = store.clone();
+        let class_barrier = barrier.clone();
+        let class_project_id = project_id.clone();
+        let class_task = std::thread::spawn(move || {
+            class_barrier.wait();
+            class_store
+                .mutate(
+                    &class_project_id,
+                    MutationOptions::new("test_update_school_class"),
+                    |project, _| {
+                        project.school_classes.push(SchoolClass {
+                            id: "class-a".to_string(),
+                            name: "11-A".to_string(),
+                            display_name: "11-A".to_string(),
+                            normalized_name: "11-A".to_string(),
+                            academic_year: Some("2026".to_string()),
+                            academic_year_id: Some("2026".to_string()),
+                            grade_level: Some(11),
+                            section: Some("A".to_string()),
+                            display_order: 1,
+                            status: SchoolClassStatus::Active,
+                            created_at: "now".to_string(),
+                            updated_at: "now".to_string(),
+                        });
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        });
+
+        let activity_store = store.clone();
+        let activity_barrier = barrier;
+        let activity_project_id = project_id.clone();
+        let activity_task = std::thread::spawn(move || {
+            activity_barrier.wait();
+            activity_store
+                .mutate(
+                    &activity_project_id,
+                    MutationOptions::new("test_update_assessment_activity"),
+                    |project, _| {
+                        project.assessment_activities.push(AssessmentActivity {
+                            id: "activity-a".to_string(),
+                            academic_year_id: "2026".to_string(),
+                            course_id: "turkce".to_string(),
+                            course_name: "Türkçe".to_string(),
+                            title: "1. Yazılı".to_string(),
+                            grade_level: 11,
+                            term: 1,
+                            assessment_type: AssessmentType::Written,
+                            workflow_family: WorkflowFamily::Written,
+                            sequence_number: 1,
+                            status: AssessmentStatus::Draft,
+                            common_document_ids: vec![],
+                            listening_details: None,
+                            speaking_configuration: None,
+                            class_applications: vec![],
+                            created_at: "now".to_string(),
+                            updated_at: "now".to_string(),
+                        });
+                        Ok(())
+                    },
+                )
+                .unwrap()
+        });
+
+        let first = class_task.join().unwrap();
+        let second = activity_task.join().unwrap();
+        let revisions = [first.snapshot.revision, second.snapshot.revision];
+        assert!(revisions.contains(&1));
+        assert!(revisions.contains(&2));
+
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.storage_revision, 2);
+        assert!(persisted
+            .school_classes
+            .iter()
+            .any(|value| value.id == "class-a"));
+        assert!(persisted
+            .assessment_activities
+            .iter()
+            .any(|value| value.id == "activity-a"));
+    }
+
+    #[test]
+    fn stale_candidates_from_one_initial_snapshot_do_not_lose_disjoint_updates() {
+        let root = temp_root();
+        let project = sample_project(&root, "Stale candidates", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let initial = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+
+        let mut class_candidate = initial.clone();
+        class_candidate.school_classes.push(SchoolClass {
+            id: "stale-class".to_string(),
+            name: "11-B".to_string(),
+            display_name: "11-B".to_string(),
+            normalized_name: "11-B".to_string(),
+            academic_year: Some("2026".to_string()),
+            academic_year_id: Some("2026".to_string()),
+            grade_level: Some(11),
+            section: Some("B".to_string()),
+            display_order: 2,
+            status: SchoolClassStatus::Active,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        });
+        let mut activity_candidate = initial.clone();
+        activity_candidate
+            .assessment_activities
+            .push(AssessmentActivity {
+                id: "stale-activity".to_string(),
+                academic_year_id: "2026".to_string(),
+                course_id: "turkce".to_string(),
+                course_name: "Türkçe".to_string(),
+                title: "2. Yazılı".to_string(),
+                grade_level: 11,
+                term: 1,
+                assessment_type: AssessmentType::Written,
+                workflow_family: WorkflowFamily::Written,
+                sequence_number: 2,
+                status: AssessmentStatus::Draft,
+                common_document_ids: vec![],
+                listening_details: None,
+                speaking_configuration: None,
+                class_applications: vec![],
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            });
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let class_store = store.clone();
+        let class_barrier = barrier.clone();
+        let class_task = std::thread::spawn(move || {
+            class_barrier.wait();
+            class_store.commit_snapshot_cas(&class_candidate).unwrap();
+        });
+        let activity_store = store.clone();
+        let activity_barrier = barrier;
+        let activity_task = std::thread::spawn(move || {
+            activity_barrier.wait();
+            activity_store
+                .commit_snapshot_cas(&activity_candidate)
+                .unwrap();
+        });
+        class_task.join().unwrap();
+        activity_task.join().unwrap();
+
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.storage_revision, 2);
+        assert!(persisted
+            .school_classes
+            .iter()
+            .any(|value| value.id == "stale-class"));
+        assert!(persisted
+            .assessment_activities
+            .iter()
+            .any(|value| value.id == "stale-activity"));
+    }
+
+    #[test]
+    fn expected_revision_conflict_does_not_use_last_write_wins() {
+        let root = temp_root();
+        let project = sample_project(&root, "CAS", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let revision = opened.storage_revision;
+        store
+            .mutate(
+                &opened.id,
+                MutationOptions {
+                    expected_revision: Some(revision),
+                    expected_fingerprint: None,
+                    operation: "first".to_string(),
+                    correlation_id: "first".to_string(),
+                },
+                |project, _| {
+                    project.name = "first".to_string();
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .mutate(
+                &opened.id,
+                MutationOptions {
+                    expected_revision: Some(revision),
+                    expected_fingerprint: None,
+                    operation: "stale".to_string(),
+                    correlation_id: "stale".to_string(),
+                },
+                |project, _| {
+                    project.name = "stale overwrite".to_string();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectRevisionConflict);
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.name, "first");
+        assert_eq!(persisted.storage_revision, 1);
+    }
+
+    #[test]
+    fn external_project_json_change_is_rejected_by_fingerprint() {
+        let root = temp_root();
+        let project = sample_project(&root, "External", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let snapshot = store
+            .get_project_snapshot_with_metadata(&opened.id)
+            .unwrap();
+        let mut external = snapshot.project.clone();
+        external.name = "external edit".to_string();
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::to_string_pretty(&external).unwrap(),
+        )
+        .unwrap();
+
+        let error = store
+            .mutate(
+                &opened.id,
+                MutationOptions {
+                    expected_revision: Some(snapshot.revision),
+                    expected_fingerprint: Some(snapshot.content_fingerprint),
+                    operation: "after_external_change".to_string(),
+                    correlation_id: "external".to_string(),
+                },
+                |project, _| {
+                    project.course_name = Some("must not overwrite".to_string());
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectExternallyModified);
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.name, "external edit");
+        assert_eq!(persisted.storage_revision, 0);
+    }
+
+    #[test]
+    fn different_project_roots_do_not_share_the_mutation_lock() {
+        let left = temp_root().canonicalize().unwrap();
+        let right = temp_root().canonicalize().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let started = std::time::Instant::now();
+        let left_barrier = barrier.clone();
+        let left_task = std::thread::spawn(move || {
+            let lock = project_lock_for(&left).unwrap();
+            let _guard = lock.lock().unwrap();
+            left_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        });
+        let right_barrier = barrier;
+        let right_task = std::thread::spawn(move || {
+            let lock = project_lock_for(&right).unwrap();
+            let _guard = lock.lock().unwrap();
+            right_barrier.wait();
+            std::thread::sleep(std::time::Duration::from_millis(120));
+        });
+        left_task.join().unwrap();
+        right_task.join().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(220));
+    }
+
+    #[test]
+    fn job_narrow_commit_preserves_unrelated_mutation_and_stale_source_is_not_applied() {
+        let root = temp_root();
+        let project = sample_project(&root, "Job", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let project_id = opened.id.clone();
+        let document_id = opened.documents[0].id.clone();
+        let source_checksum = opened.documents[0].checksum.clone();
+
+        store
+            .mutate(
+                &project_id,
+                MutationOptions::new("unrelated_school_class_edit"),
+                |project, _| {
+                    project.school_classes.push(SchoolClass {
+                        id: "class-job".to_string(),
+                        name: "10-B".to_string(),
+                        display_name: "10-B".to_string(),
+                        normalized_name: "10-B".to_string(),
+                        academic_year: None,
+                        academic_year_id: None,
+                        grade_level: Some(10),
+                        section: Some("B".to_string()),
+                        display_order: 1,
+                        status: SchoolClassStatus::Active,
+                        created_at: "now".to_string(),
+                        updated_at: "now".to_string(),
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        let applied = store.commit_job(
+            &project_id,
+            MutationOptions::new("ocr_narrow_commit"),
+            move |project, _| {
+                let document = project
+                    .documents
+                    .iter_mut()
+                    .find(|document| document.id == document_id)
+                    .ok_or_else(|| {
+                        project_error(
+                            AppErrorCode::ProjectEntityNotFound,
+                            "Belge bulunamadı.",
+                            None,
+                        )
+                    })?;
+                if document.checksum != source_checksum {
+                    return Err(project_error(
+                        AppErrorCode::ProjectEntityStale,
+                        "Belge değişti; iş sonucu güncel değil.",
+                        None,
+                    ));
+                }
+                document.checksum = Some("ocr-result".to_string());
+                Ok(())
+            },
+        );
+        assert!(matches!(applied, JobCommitResult::Applied(_)));
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(
+            persisted.documents[0].checksum.as_deref(),
+            Some("ocr-result")
+        );
+        assert!(persisted
+            .school_classes
+            .iter()
+            .any(|value| value.id == "class-job"));
+
+        let stale_document_id = persisted.documents[0].id.clone();
+        store
+            .mutate(
+                &project_id,
+                MutationOptions::new("document_source_changed"),
+                move |project, _| {
+                    project.documents[0].checksum = Some("new-source".to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let stale = store.commit_job(
+            &project_id,
+            MutationOptions::new("stale_ocr_result"),
+            move |project, _| {
+                let document = project
+                    .documents
+                    .iter_mut()
+                    .find(|document| document.id == stale_document_id)
+                    .ok_or_else(|| {
+                        project_error(
+                            AppErrorCode::ProjectEntityNotFound,
+                            "Belge bulunamadı.",
+                            None,
+                        )
+                    })?;
+                if document.checksum.as_deref() != Some("ocr-result") {
+                    return Err(project_error(
+                        AppErrorCode::ProjectEntityStale,
+                        "Belge değişti; iş sonucu güncel değil.",
+                        None,
+                    ));
+                }
+                document.checksum = Some("stale-result-must-not-apply".to_string());
+                Ok(())
+            },
+        );
+        assert!(matches!(stale, JobCommitResult::Stale { .. }));
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(
+            persisted.documents[0].checksum.as_deref(),
+            Some("new-source")
+        );
+    }
+
+    #[test]
+    fn fifty_concurrent_disjoint_mutations_keep_valid_json_and_all_entities() {
+        let root = temp_root();
+        let project = sample_project(&root, "Stress", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let project_id = opened.id;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(50));
+        let mut tasks = Vec::new();
+        for index in 0..50u32 {
+            let store = store.clone();
+            let project_id = project_id.clone();
+            let barrier = barrier.clone();
+            tasks.push(std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .mutate(
+                        &project_id,
+                        MutationOptions::new(format!("stress_{index}")),
+                        move |project, _| {
+                            match index % 3 {
+                                0 => project.school_classes.push(SchoolClass {
+                                    id: format!("stress-class-{index}"),
+                                    name: format!("{index}-A"),
+                                    display_name: format!("{index}-A"),
+                                    normalized_name: format!("{index}-A"),
+                                    academic_year: None,
+                                    academic_year_id: None,
+                                    grade_level: Some(index + 1),
+                                    section: Some("A".to_string()),
+                                    display_order: index,
+                                    status: SchoolClassStatus::Active,
+                                    created_at: "now".to_string(),
+                                    updated_at: "now".to_string(),
+                                }),
+                                1 => project.assessment_activities.push(AssessmentActivity {
+                                    id: format!("stress-activity-{index}"),
+                                    academic_year_id: "2026".to_string(),
+                                    course_id: format!("course-{index}"),
+                                    course_name: "Türkçe".to_string(),
+                                    title: format!("Activity {index}"),
+                                    grade_level: 1,
+                                    term: 1,
+                                    assessment_type: AssessmentType::Written,
+                                    workflow_family: WorkflowFamily::Written,
+                                    sequence_number: index + 1,
+                                    status: AssessmentStatus::Draft,
+                                    common_document_ids: vec![],
+                                    listening_details: None,
+                                    speaking_configuration: None,
+                                    class_applications: vec![],
+                                    created_at: "now".to_string(),
+                                    updated_at: "now".to_string(),
+                                }),
+                                _ => project.documents.push(Document {
+                                    id: format!("stress-document-{index}"),
+                                    role: DocumentRole::Export,
+                                    file_name: format!("note-{index}.pdf"),
+                                    stored_path: format!("outputs/note-{index}.pdf"),
+                                    page_count: 1,
+                                    added_at: "now".to_string(),
+                                    checksum: Some(format!("checksum-{index}")),
+                                    preview: None,
+                                }),
+                            }
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.join().unwrap();
+        }
+
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.storage_revision, 50);
+        assert_eq!(persisted.school_classes.len(), 18);
+        assert_eq!(persisted.assessment_activities.len(), 17);
+        assert_eq!(persisted.documents.len(), 19);
+        let json: Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join("project.json")).unwrap())
+                .unwrap();
+        assert!(json.is_object());
+    }
+
+    #[test]
+    fn atomic_write_failure_keeps_previous_project_and_revision() {
+        let root = temp_root();
+        let project = sample_project(&root, "Atomic failure", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let before = fs::read_to_string(root.join("project.json")).unwrap();
+        fs::create_dir(root.join("project.tmp")).unwrap();
+
+        let error = store
+            .mutate(
+                &opened.id,
+                MutationOptions::new("atomic_write_failure"),
+                |project, _| {
+                    project.name = "must not persist".to_string();
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, AppErrorCode::ProjectSaveFailed);
+        assert_eq!(
+            fs::read_to_string(root.join("project.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            ProjectStore::open_project_at_path(&root)
+                .unwrap()
+                .storage_revision,
+            0
+        );
+    }
+
+    #[test]
+    fn production_services_do_not_use_blind_full_project_save() {
+        let service_files = [
+            "document_service.rs",
+            "student_scan_service.rs",
+            "student_answer_ocr_service.rs",
+            "pdf_preview_service.rs",
+            "rubric_extraction_service.rs",
+            "exam_package_build_service.rs",
+            "scoring_service.rs",
+            "school_class_service.rs",
+            "assessment_organization_service.rs",
+            "speaking_exam_service.rs",
+            "analysis_service.rs",
+            "workflow_engine.rs",
+        ];
+        let services_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/services");
+        for file_name in service_files {
+            let source = fs::read_to_string(services_root.join(file_name)).unwrap();
+            let production_lines = source
+                .lines()
+                .take_while(|line| !line.contains("#[cfg(test)]"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !production_lines.contains("save_project("),
+                "production writer remained in {file_name}"
+            );
+        }
+        let store_source = fs::read_to_string(services_root.join("project_store.rs")).unwrap();
+        assert!(store_source.contains("#[cfg(test)]\n    pub(crate) fn save_project"));
+    }
+
+    #[test]
+    fn legacy_project_starts_at_revision_zero_and_first_mutation_writes_one() {
+        let base = temp_root();
+        let root = base.join("legacy-revision");
+        let setup_store = ProjectStore::new();
+        let project = setup_store
+            .create_project(
+                "Legacy revision".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .unwrap();
+        let mut value = serde_json::to_value(&project).unwrap();
+        value.as_object_mut().unwrap().remove("storageRevision");
+        let original = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("project.json"), &original).unwrap();
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        assert_eq!(opened.storage_revision, 0);
+        assert_eq!(
+            std::fs::read_to_string(root.join("project.json")).unwrap(),
+            original
+        );
+        store
+            .mutate(
+                &opened.id,
+                MutationOptions::new("first_legacy_mutation"),
+                |project, _| {
+                    project.name = "migrated by mutation".to_string();
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let reopened = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(reopened.storage_revision, 1);
     }
 
     #[test]

@@ -1,12 +1,10 @@
-import { Link } from 'react-router-dom';
-import type { JobSnapshot, ProjectSnapshot, WorkflowSnapshot } from '../../api/types';
-import { projectNavigation } from '../../app/projectRoutes';
-import { useProjectContext } from '../../state/useProjectContext';
-import { BlockingReasons } from './BlockingReasons';
-import { NextActions } from './NextActions';
-import { getPrimaryWorkflowAction } from './workflowUi';
-import { getWorkflowSummaryText } from './workflowSummary';
-import { summarizeWorkflowAreas, type OverviewStatus } from './projectOverview';
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { commands } from "../../api/commands";
+import type { AssessmentActivity, JobSnapshot, ProjectSnapshot, WorkflowSnapshot } from "../../api/types";
+import { useProjectContext } from "../../state/useProjectContext";
+import { assessmentTypeLabels } from "../../pages/assessmentOrganizationUi";
+import { resolveNextExamStep } from "../../app/examWorkspace";
 
 type WorkflowPanelProps = {
   workflow?: WorkflowSnapshot;
@@ -14,88 +12,86 @@ type WorkflowPanelProps = {
   jobs?: JobSnapshot[];
 };
 
-const statusLabels: Record<OverviewStatus, string> = {
-  pending: 'Henüz başlanmadı',
-  running: 'İşlem devam ediyor',
-  succeeded: 'Tamamlandı',
-  failed: 'Başarısız',
-  partial: 'Kontrol gerekli',
-};
-
-export function WorkflowPanel({ workflow, project }: WorkflowPanelProps) {
+export function WorkflowPanel({ workflow }: WorkflowPanelProps) {
   const { projectId } = useProjectContext();
+
+  const activitiesQuery = useQuery({
+    queryKey: ["assessment-activities", projectId, "home"],
+    queryFn: () => commands.listAssessmentActivities({ projectId }),
+    enabled: !!projectId,
+  });
+
   if (!workflow) return <div>Yükleniyor…</div>;
 
-  const primaryAction = getPrimaryWorkflowAction(workflow.nextActions);
-  const areas = summarizeWorkflowAreas(workflow.summary.steps);
-  const summaryText = getWorkflowSummaryText(workflow);
-  const ocrRecords = project?.studentAnswerOcrRecords ?? [];
-  const approvedOcrCount = ocrRecords.filter((record) => record.status === 'teacher_approved').length;
-  const reviewOcrCount = ocrRecords.filter((record) => record.needsReview).length;
-  const scoringReviewCount = (project?.scoringRecords ?? []).filter((record) => record.needsReview).length;
+  const activities = activitiesQuery.data ?? [];
 
-  const areaPath = (area: 'exam' | 'students' | 'ocr' | 'grading') =>
-    projectNavigation.find((item) => item.area === area)?.path(projectId) ?? '#';
+  if (activities.length === 0) {
+    return (
+      <div style={{ display: "grid", gap: "1.5rem", maxWidth: "720px", margin: "3rem auto 0" }}>
+        <section style={{ padding: "3.5rem 2rem", background: "#fff", border: "1px dashed #cbd5e1", borderRadius: "1.25rem", textAlign: "center" }}>
+          <h2 style={{ fontSize: "1.35rem", fontWeight: 800, color: "#0f172a", margin: 0 }}>Henüz sınav oluşturulmadı</h2>
+          <p style={{ margin: "0.75rem 0 1.75rem", color: "#64748b", fontSize: "0.925rem", lineHeight: 1.55 }}>
+            Yazılı, dinleme veya konuşma sınavı oluşturarak başlayın.
+          </p>
+          <Link to={`/project/${encodeURIComponent(projectId)}/activities`} className="button button--primary" style={{ padding: "0.75rem 1.75rem", fontSize: "0.95rem" }}>
+            Yeni sınav oluştur
+          </Link>
+        </section>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ display: 'grid', gap: '1.5rem', maxWidth: '1180px', margin: '0 auto' }}>
-      <section style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) auto', gap: '1.5rem', alignItems: 'center', padding: '1.5rem', color: '#fff', background: 'linear-gradient(135deg, #312e81, #4f46e5)', borderRadius: '1rem' }}>
-        <div>
-          <div style={{ fontSize: '0.75rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', color: '#c7d2fe' }}>Sonraki adım</div>
-          <h2 style={{ margin: '0.45rem 0 0', fontSize: '1.35rem' }}>{primaryAction?.label ?? 'İş akışı tamamlandı'}</h2>
-          <p style={{ margin: '0.6rem 0 0', maxWidth: '680px', color: '#e0e7ff', lineHeight: 1.55 }}>
-            {primaryAction?.disabledReason || summaryText || 'Projenin güncel durumu backend iş akışı tarafından doğrulandı.'}
-          </p>
-        </div>
-        {primaryAction && <NextActions actions={[primaryAction]} />}
-      </section>
-
-      {workflow.blockingReasons.length > 0 && (
-        <section aria-label="İş akışı engelleri">
-          <BlockingReasons reasons={workflow.blockingReasons} />
-        </section>
-      )}
-
-      <section>
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'end', marginBottom: '0.9rem' }}>
+    <div style={{ display: "grid", gap: "1.5rem", maxWidth: "1180px", margin: "0 auto" }}>
+      <section aria-label="Devam eden sınavlar">
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.9rem" }}>
           <div>
-            <h2 style={{ margin: 0, fontSize: '1.05rem' }}>Proje aşamaları</h2>
-            <p style={{ margin: '0.35rem 0 0', color: '#64748b', fontSize: '0.8rem' }}>Durumlar backend iş akışı özetinden gelir.</p>
+            <h2 style={{ margin: 0, fontSize: "1.05rem" }}>Sınavlar</h2>
+            <p style={{ margin: "0.25rem 0 0", color: "#64748b", fontSize: "0.8rem" }}>Ders alanındaki ortak sınavlar ve sınıf uygulamaları.</p>
           </div>
-          <span style={{ color: '#475569', fontSize: '0.75rem', fontWeight: 700 }}>{workflow.currentStageLabel}</span>
+          <Link to={`/project/${encodeURIComponent(projectId)}/activities`} className="button button--secondary" style={{ fontSize: "0.85rem" }}>
+            Tüm sınavları yönet
+          </Link>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.9rem' }}>
-          {areas.map((area) => (
-            <Link key={area.area} to={areaPath(area.area)} style={{ padding: '1rem', color: '#0f172a', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '0.9rem', textDecoration: 'none' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center' }}>
-                <strong style={{ fontSize: '0.9rem' }}>{area.label}</strong>
-                <span style={{ width: 10, height: 10, flex: '0 0 10px', borderRadius: '50%', background: area.status === 'succeeded' ? '#10b981' : area.status === 'failed' ? '#ef4444' : area.status === 'running' ? '#4f46e5' : '#f59e0b' }} aria-hidden="true" />
-              </div>
-              <p style={{ margin: '0.6rem 0 0', color: '#475569', fontSize: '0.78rem', fontWeight: 700 }}>{statusLabels[area.status]}</p>
-              <p style={{ margin: '0.3rem 0 0', color: '#64748b', fontSize: '0.75rem', lineHeight: 1.45 }}>{area.message}</p>
-              {area.current !== undefined && area.total !== undefined && area.total > 0 && (
-                <p style={{ margin: '0.55rem 0 0', color: '#3730a3', fontSize: '0.75rem', fontWeight: 800 }}>{area.current} / {area.total}</p>
-              )}
-            </Link>
-          ))}
-        </div>
-      </section>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: "1rem" }}>
+          {activities.map((activity: AssessmentActivity) => {
+            const applications = activity.classApplications.filter((app) => app.status !== "archived");
+            const typeLabel = assessmentTypeLabels[activity.assessmentType] ?? activity.assessmentType;
+            const nextStep = resolveNextExamStep(activity, workflow);
+            const continuePath = `/project/${encodeURIComponent(projectId)}/activities/${encodeURIComponent(activity.id)}/${nextStep.id}`;
 
-      <section>
-        <h2 style={{ margin: '0 0 0.9rem', fontSize: '1.05rem' }}>Özet</h2>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(170px, 1fr))', gap: '0.9rem' }}>
-          {[
-            ['Öğrenci', project?.students?.length ?? 0],
-            ['Soru', project?.questions?.length ?? 0],
-            ['Onaylanan OCR', `${approvedOcrCount} / ${ocrRecords.length}`],
-            ['OCR kontrolü', reviewOcrCount],
-            ['Puan kontrolü', scoringReviewCount],
-          ].map(([label, value]) => (
-            <div key={label} style={{ padding: '1rem', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '0.9rem' }}>
-              <div style={{ color: '#64748b', fontSize: '0.75rem' }}>{label}</div>
-              <div style={{ marginTop: '0.35rem', fontSize: '1.35rem', fontWeight: 800 }}>{value}</div>
-            </div>
-          ))}
+            return (
+              <article key={activity.id} style={{ padding: "1.25rem", background: "#fff", border: "1px solid #e2e8f0", borderRadius: "0.9rem", display: "flex", flexDirection: "column", justifyContent: "space-between", gap: "0.85rem" }}>
+                <div>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "0.5rem" }}>
+                    <h3 style={{ margin: 0, fontSize: "1rem", fontWeight: 700, color: "#0f172a" }}>
+                      {activity.title || `${activity.term}. Dönem ${activity.sequenceNumber}. ${typeLabel}`}
+                    </h3>
+                    <span style={{ fontSize: "0.7rem", fontWeight: 700, padding: "0.2rem 0.5rem", background: "#e0e7ff", color: "#3730a3", borderRadius: "0.5rem", whiteSpace: "nowrap" }}>
+                      {typeLabel}
+                    </span>
+                  </div>
+                  <p style={{ margin: "0.4rem 0 0", color: "#64748b", fontSize: "0.8rem" }}>
+                    {applications.length > 0
+                      ? `Sınıflar: ${applications.map((app) => app.schoolClassId).join(", ")}`
+                      : "Sınıf uygulaması yok"}
+                  </p>
+                  <div style={{ marginTop: "0.65rem", padding: "0.6rem 0.75rem", background: "#f8fafc", borderRadius: "0.6rem", border: "1px solid #f1f5f9" }}>
+                    <span style={{ fontSize: "0.72rem", color: "#64748b", fontWeight: 600, display: "block" }}>Sıradaki işlem</span>
+                    <strong style={{ fontSize: "0.85rem", color: "#1e293b" }}>{nextStep.label}</strong>
+                  </div>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: "1px solid #f1f5f9", paddingTop: "0.75rem" }}>
+                  <span style={{ fontSize: "0.75rem", color: "#475569", fontWeight: 600 }}>
+                    {activity.status === "completed" ? "Tamamlandı" : "Devam ediyor"}
+                  </span>
+                  <Link to={continuePath} className="button button--secondary" style={{ padding: "0.4rem 0.85rem", fontSize: "0.8rem" }}>
+                    Devam et →
+                  </Link>
+                </div>
+              </article>
+            );
+          })}
         </div>
       </section>
     </div>
