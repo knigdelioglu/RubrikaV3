@@ -53,9 +53,11 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           if (!examSource) {
             throw {
               code: 'PDF_DOCUMENT_NOT_FOUND',
-              message: 'Sınav PDF’i bulunamadı.',
-              recoverable: true,
+              safeMessage: 'Sınav PDF’i bulunamadı.',
+              recoveryAction: 'Önce sınav PDF’ini içe aktarın.',
+              retryable: true,
               correlationId: 'unknown',
+              detailsAvailable: false,
             } as AppError;
           }
           await commands.startPdfPreviewRender({ projectId, documentId: examSource.id });
@@ -72,9 +74,11 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           if (!examSource) {
             throw {
               code: 'PDF_DOCUMENT_NOT_FOUND',
-              message: 'Sınav PDF’i bulunamadı.',
-              recoverable: true,
+              safeMessage: 'Sınav PDF’i bulunamadı.',
+              recoveryAction: 'Önce sınav PDF’ini içe aktarın.',
+              retryable: true,
               correlationId: 'unknown',
+              detailsAvailable: false,
             } as AppError;
           }
           navigate(`/project/${encodeURIComponent(projectId)}/exam/documents?documentId=${encodeURIComponent(examSource.id)}&documentType=exam`);
@@ -87,9 +91,11 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           if (!examSource) {
             throw {
               code: 'PDF_DOCUMENT_NOT_FOUND',
-              message: 'Sınav PDF’i bulunamadı.',
-              recoverable: true,
+              safeMessage: 'Sınav PDF’i bulunamadı.',
+              recoveryAction: 'Önce sınav PDF’ini içe aktarın.',
+              retryable: true,
               correlationId: 'unknown',
+              detailsAvailable: false,
             } as AppError;
           }
           await commands.startQuestionTextExtraction({
@@ -195,9 +201,11 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           if (!studentScan) {
             throw {
               code: 'STUDENT_SCAN_NOT_FOUND',
-              message: 'Öğrenci cevap PDF’i bulunamadı.',
-              recoverable: true,
+              safeMessage: 'Öğrenci cevap PDF’i bulunamadı.',
+              recoveryAction: 'Önce öğrenci cevap PDF’ini içe aktarın.',
+              retryable: true,
               correlationId: 'unknown',
+              detailsAvailable: false,
             } as AppError;
           }
           await commands.startStudentScanPreviewRender({ projectId, documentId: studentScan.id });
@@ -221,9 +229,10 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
         default:
           setError({
             code: 'UNKNOWN_ERROR',
-            message: `Bu aksiyon henüz desteklenmiyor: ${action.label}`,
-            recoverable: true,
+            safeMessage: `Bu aksiyon henüz desteklenmiyor: ${action.label}`,
+            retryable: true,
             correlationId: 'unknown',
+            detailsAvailable: false,
           } as AppError);
           break;
       }

@@ -23,6 +23,13 @@ enum Command {
     Doctor {
         project_path: PathBuf,
     },
+    /// Acquires the project write lease and holds it for `hold_seconds`
+    /// (0 means hold until stdin closes). Used by process-fixture tests.
+    LockHold {
+        project_path: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        hold_seconds: u64,
+    },
     Inspect {
         #[command(subcommand)]
         target: InspectTarget,
@@ -102,6 +109,31 @@ async fn main() {
                 2
             }
         },
+        Command::LockHold {
+            project_path,
+            hold_seconds,
+        } => {
+            match app_lib::platform::project_write_lease::ProjectWriteLease::acquire(&project_path)
+            {
+                Ok(lease) => {
+                    println!("LOCKED {}", lease.lock_path().display());
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(hold_seconds);
+                    while std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{}", error.message);
+                    if error.code == app_lib::domain::errors::AppErrorCode::ProjectAlreadyOpen {
+                        7
+                    } else {
+                        3
+                    }
+                }
+            }
+        }
         Command::Inspect { target } => match target {
             InspectTarget::Project { project_path } => match ctx.inspect_project(&project_path) {
                 Ok(report) => {

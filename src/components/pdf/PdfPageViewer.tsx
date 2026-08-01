@@ -16,6 +16,7 @@ type OverlayItem = {
 
 type PdfPageViewerProps = {
   imagePath?: string | null;
+  projectId?: string;
   pageNumber: number;
   zoom: number;
   width?: number;
@@ -43,7 +44,7 @@ function pointFromEvent(event: PointerEvent<HTMLElement>) {
   };
 }
 
-export function PdfPageViewer({ imagePath, pageNumber, zoom, width, height, overlayBox, overlayBoxes, overlayItems, editable, onOverlayChange, emptyState, minimal, fitToPage = false, altText }: PdfPageViewerProps) {
+export function PdfPageViewer({ imagePath, projectId, pageNumber, zoom, width, height, overlayBox, overlayBoxes, overlayItems, editable, onOverlayChange, emptyState, minimal, fitToPage = false, altText }: PdfPageViewerProps) {
   const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
   const [draftBox, setDraftBox] = useState<OverlayBox | null>(null);
 
@@ -55,7 +56,7 @@ export function PdfPageViewer({ imagePath, pageNumber, zoom, width, height, over
     );
   }
 
-  const src = resolveImageSrc(imagePath);
+  const src = resolveImageSrc(imagePath, projectId);
   const displayWidth = width ? Math.round(width * zoom) : undefined;
   const displayHeight = height ? Math.round(height * zoom) : undefined;
   const shownItems: OverlayItem[] = draftBox

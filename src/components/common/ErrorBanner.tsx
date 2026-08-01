@@ -13,18 +13,17 @@ export function ErrorBanner({
   const isConflict = isProjectConflictError(error);
   return (
     <div style={{ padding: '1rem', background: '#fee2e2', color: '#991b1b', borderRadius: '4px' }}>
-      <strong>Hata:</strong> {error.message}
-      {error.suggestedAction && <p>Öneri: {error.suggestedAction}</p>}
+      <strong>Hata:</strong> {error.safeMessage}
+      {error.recoveryAction && <p>Öneri: {error.recoveryAction}</p>}
       {isConflict && onRefresh && (
         <button type="button" onClick={() => void onRefresh()}>
           Son durumu yenile
         </button>
       )}
-      {showTechnicalDetails && error.technicalDetails && (
-        <details style={{ marginTop: '0.5rem' }}>
-          <summary style={{ cursor: 'pointer' }}>Teknik ayrıntılar</summary>
-          <pre style={{ whiteSpace: 'pre-wrap', marginTop: '0.5rem' }}>{error.technicalDetails}</pre>
-        </details>
+      {showTechnicalDetails && error.detailsAvailable && (
+        <p style={{ marginTop: '0.5rem', fontSize: '0.8rem', opacity: 0.8 }}>
+          Teknik ayrıntılar Tanılama görünümünde {error.correlationId} koduyla erişilebilir.
+        </p>
       )}
     </div>
   );

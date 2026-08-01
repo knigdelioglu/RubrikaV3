@@ -130,9 +130,19 @@ pub async fn accept_student_answer_ocr_generation(
     state: State<'_, AppState>,
     input: OcrGenerationInput,
 ) -> Result<OcrGeneration, AppError> {
-    state
+    let generation = state
         .student_answer_ocr_service
-        .accept_student_answer_ocr_generation(&input.project_id, &input.generation_id)
+        .accept_student_answer_ocr_generation(&input.project_id, &input.generation_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "ocr_generation_accepted",
+            "OCR nesli öğretmen tarafından kabul edildi.",
+        )
+        .entity("ocr_generation", &input.generation_id),
+    )?;
+    Ok(generation)
 }
 
 #[tauri::command]
@@ -140,9 +150,19 @@ pub async fn reject_student_answer_ocr_generation(
     state: State<'_, AppState>,
     input: OcrGenerationInput,
 ) -> Result<OcrGeneration, AppError> {
-    state
+    let generation = state
         .student_answer_ocr_service
-        .reject_student_answer_ocr_generation(&input.project_id, &input.generation_id)
+        .reject_student_answer_ocr_generation(&input.project_id, &input.generation_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "ocr_generation_rejected",
+            "OCR nesli öğretmen tarafından reddedildi.",
+        )
+        .entity("ocr_generation", &input.generation_id),
+    )?;
+    Ok(generation)
 }
 
 #[tauri::command]

@@ -80,6 +80,9 @@ import type {
   TeachingAssignment,
   UpdateCourseInfoInput,
   BatchCreateTeachingAssignmentsInput,
+  GcReport,
+  StartBackupJobOutput,
+  StartRestoreJobOutput,
 } from './types';
 import type { AppError } from './errors';
 
@@ -88,10 +91,11 @@ function handleInvokeError(e: unknown): never {
   if (msg.includes('command') && msg.includes('not found')) {
     throw {
       code: 'COMMAND_NOT_AVAILABLE',
-      message: 'Bu komut henüz backend tarafında uygulanmadı.',
-      recoverable: true,
+      safeMessage: 'Bu komut henüz backend tarafında uygulanmadı.',
+      recoveryAction: 'Uygulamayı güncelleyip yeniden deneyin.',
       correlationId: crypto.randomUUID?.() || 'unknown',
-      technicalDetails: msg,
+      retryable: true,
+      detailsAvailable: false,
     } as AppError;
   }
   
@@ -101,10 +105,11 @@ function handleInvokeError(e: unknown): never {
 
   throw {
     code: 'UNKNOWN_ERROR',
-    message: 'Bilinmeyen bir hata oluştu.',
-    recoverable: false,
+    safeMessage: 'Bilinmeyen bir hata oluştu.',
+    recoveryAction: undefined,
     correlationId: crypto.randomUUID?.() || 'unknown',
-    technicalDetails: msg,
+    retryable: false,
+    detailsAvailable: false,
   } as AppError;
 }
 
@@ -1102,6 +1107,29 @@ export const commands = {
     try {
       return await invoke<ModelServerArgsPreview>('preview_model_server_args', {
         input: { profileId },
+      });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  runGenerationGc: async (projectId: string, dryRun = false): Promise<GcReport> => {
+    try {
+      return await invoke<GcReport>('run_generation_gc', { input: { projectId, dryRun } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  startBackupJob: async (projectId: string): Promise<StartBackupJobOutput> => {
+    try {
+      return await invoke<StartBackupJobOutput>('start_backup_job', { input: { projectId } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  startRestoreJob: async (archivePath: string, destinationPath: string): Promise<StartRestoreJobOutput> => {
+    try {
+      return await invoke<StartRestoreJobOutput>('start_restore_job', {
+        input: { archivePath, destinationPath },
       });
     } catch (e) {
       handleInvokeError(e);

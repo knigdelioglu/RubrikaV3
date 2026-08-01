@@ -37,17 +37,18 @@ function isAppError(value: unknown): value is AppError {
   if (typeof value !== 'object' || value === null) return false;
   const candidate = value as Record<string, unknown>;
   return typeof candidate.code === 'string'
-    && typeof candidate.message === 'string'
-    && typeof candidate.recoverable === 'boolean';
+    && typeof candidate.safeMessage === 'string'
+    && typeof candidate.retryable === 'boolean';
 }
 
 function operationError(value: unknown, message: string, suggestedAction: string): AppError {
   return {
     code: isAppError(value) ? value.code : 'UNKNOWN_ERROR',
-    message,
-    recoverable: true,
-    suggestedAction,
+    safeMessage: message,
+    retryable: true,
+    recoveryAction: suggestedAction,
     correlationId: isAppError(value) ? value.correlationId : crypto.randomUUID?.() || 'unknown',
+    detailsAvailable: false,
   };
 }
 
@@ -757,6 +758,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
                 documentName={selectedDocument.fileName}
                 previews={pagePreviews}
                 initialPage={currentPage}
+                projectId={projectId}
                 onPageChange={(page) => {
                   setCurrentPage(page);
                   updateDeepLink(selectedRole, selectedDocument.id, page);

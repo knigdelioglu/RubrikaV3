@@ -1317,7 +1317,7 @@ mod tests {
 
         let reg = jm
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: project.id.clone(),
                     project_root_path: Some(project.root_path.clone()),
@@ -1335,7 +1335,7 @@ mod tests {
             .unwrap();
 
         // Request cancellation before run_render
-        jm.cancel_job(&handle, &reg.snapshot.id).unwrap();
+        jm.cancel_job(handle, &reg.snapshot.id).unwrap();
 
         // Perform run_render with cancellation requested
         let rt = tokio::runtime::Runtime::new().unwrap();

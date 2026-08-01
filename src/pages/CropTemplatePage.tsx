@@ -196,6 +196,7 @@ export function CropTemplatePage() {
             
             <PdfPageViewer
               imagePath={previewMode === 'original' ? (templatePreview?.imagePath ?? null) : (cleanTemplatePreview?.outputImagePath ?? templatePreview?.imagePath ?? null)}
+              projectId={projectId}
               pageNumber={templatePageNumber ?? 1}
               zoom={0.8}
               overlayBox={selectedTemplateOnCurrentPage?.bbox ?? null}
@@ -254,6 +255,7 @@ export function CropTemplatePage() {
 
             <PdfPageViewer
               imagePath={previewMode === 'original' ? (templatePreview?.imagePath ?? null) : (cleanTemplatePreview?.outputImagePath ?? templatePreview?.imagePath ?? null)}
+              projectId={projectId}
               pageNumber={templatePageNumber ?? 1}
               zoom={0.8}
               overlayBox={identityDraft?.pageIndexWithinSubmission === templatePageIndex ? identityDraft.bbox : null}

@@ -115,11 +115,11 @@ export type AppErrorCode =
 
 export type AppError = {
   code: AppErrorCode;
-  message: string;
-  recoverable: boolean;
-  suggestedAction?: string;
-  technicalDetails?: string;
+  safeMessage: string;
+  recoveryAction?: string;
   correlationId: string;
+  retryable: boolean;
+  detailsAvailable: boolean;
 };
 
 export const projectConflictCodes: ReadonlySet<AppErrorCode> = new Set([

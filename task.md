@@ -18,3 +18,34 @@
 - UI organizasyon sayfası ve Kurulum → Sınıflar bağlantısı eklendi.
 
 Doğrulama sonucu ve gerçek UI smoke sonucu teslim raporunda güncellenecektir.
+
+## Faz 6 — final security audit kapanışı
+
+- Model gateway: streaming 32 MiB response / 128 MiB request limitleri,
+  connect/first-byte/idle timeout'ları, content-type doğrulaması,
+  `ModelResponseTooLarge` typed hatası; raw body loglanmaz.
+- Public error sözleşmesi: `PublicErrorDto`; `AppError` Tauri sınırında
+  `technical_details` içermez; frontend `safeMessage`/`recoveryAction`/
+  `retryable`/`detailsAvailable` kullanır; workflow hata yolu
+  `WorkflowUnavailable` yerine typed hata + UI'da [Yeniden dene]/[Tanılama].
+- Hard-coded `/Users/kadir` ve `llm/models` production kaynaklarından
+  temizlendi (proof_22); model seçimi config'ten gelir, eksik path typed
+  `ModelServerPathMissing`.
+- Speaking "Sınavı Başlat" backend `startSpeakingExam` komutuna bağlandı;
+  duplicate session koruması ve revision kanıtı
+  (`speaking_backend_persistence.rs`).
+- OS project lock: `ProjectWriteLease` (flock) + process-içi paylaşım;
+  gerçek ikinci-process fixture testi; app single-instance flock lease.
+- Portable asset serving: `managed-asset://` protokolü, relative managed
+  path, traversal/symlink reddi, 32 MiB bound; asset scope genişletilmedi.
+- Audit: append-only sha256 zinciri (`AuditService`), tamper/silme tespiti,
+  kritik kararlarda fake success yasağı.
+- Backup/restore: sınırlı `.rbackup` formatı, staging + atomic activation,
+  traversal/symlink/checksum korumaları; JobManager job'ları.
+- Generation GC: dry-run plan, protected set, bounded cleanup, orphan
+  staging; `run_generation_gc` komutu + Ayarlar butonu.
+- Doctor `SecurityDoctorSummary` sayaçları; proof_18–proof_31 testleri.
+- Gates: frontend build/typecheck/lint/129 test PASS; fmt/clippy PASS;
+  lib 362 PASS / 6 environment-blocked (loopback TCP, sandbox);
+  integration proof'ları PASS; `.app` üretildi; DMG hdiutil sandbox'ta
+  engellendi (environment-blocked).

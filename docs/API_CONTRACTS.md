@@ -461,6 +461,25 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - Request diagnostics should include prompt length, image count, image bytes, and base64 size estimates
 
 *Note: Some commands listed above are explicitly planned and may not be fully implemented yet.*
+
+## Faz 6 — security & maintenance commands
+
+```text
+start_backup_job({ projectId }) -> { jobId, status }            # JobKind: project_backup
+start_restore_job({ archivePath, destinationPath }) -> { jobId, status } # JobKind: project_restore
+run_generation_gc({ projectId, dryRun? }) -> GcReport           # protected/candidates/deleted/deferred/orphanStaging
+get_workflow_snapshot({ projectId }) -> WorkflowSnapshotDto     # explicit DTO (F1)
+```
+
+Error contract: bütün komut hataları `PublicErrorDto` olarak serializelenir
+(`code`, `safeMessage`, `recoveryAction`, `correlationId`, `retryable`,
+`detailsAvailable`). `AppError.technical_details` Tauri sınırını geçmez.
+Yeni kodlar: `MODEL_RESPONSE_TOO_LARGE`, `MODEL_RESPONSE_TRUNCATED`,
+`MODEL_RESPONSE_INVALID_CONTENT_TYPE`, `MODEL_REQUEST_TOO_LARGE`,
+`PROJECT_ALREADY_OPEN`, `PROJECT_WRITE_LEASE_MISSING`, `AUDIT_WRITE_FAILED`,
+`AUDIT_CHAIN_INVALID`, `BACKUP_FAILED`, `BACKUP_ARCHIVE_INVALID`,
+`BACKUP_CANCELLED`, `RESTORE_FAILED`, `RESTORE_DESTINATION_CONFLICT`,
+`RESTORE_CANCELLED`, `GENERATION_GC_FAILED`, `APP_ALREADY_RUNNING`.
 ## Faz 2 — ProjectStore concurrency contract
 
 `Project` JSON'unda backend-authoritative `storageRevision` alanı bulunur. Alanı olmayan legacy projeler `0` revision ile yüklenir; salt açılış rewrite yapmaz. Başarılı canonical mutation revision'ı tam bir kez artırır.

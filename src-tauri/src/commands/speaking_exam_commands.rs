@@ -199,7 +199,7 @@ pub async fn start_speaking_exam(
         .maximum_seconds
         .unwrap_or_else(|| input.maximum_minutes.saturating_mul(60));
 
-    state
+    let output = state
         .speaking_exam_service
         .start(
             &input.project_id,
@@ -215,7 +215,17 @@ pub async fn start_speaking_exam(
             input.teacher_note,
             input.exam_date,
         )
-        .await
+        .await?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "speaking_session_started",
+            "Konuşma sınavı oturumu başlatıldı.",
+        )
+        .entity("speaking_exam", &output.exam_id),
+    )?;
+    Ok(output)
 }
 
 #[tauri::command]
@@ -471,12 +481,22 @@ pub async fn approve_speaking_attempt(
     state: State<'_, AppState>,
     input: ApproveSpeakingAttemptInput,
 ) -> Result<crate::domain::speaking::SpeakingAttempt, AppError> {
-    state.speaking_exam_service.approve_attempt(
+    let attempt = state.speaking_exam_service.approve_attempt(
         &input.project_id,
         &input.exam_id,
         &input.attempt_id,
         input.teacher_note,
-    )
+    )?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "speaking_attempt_approved",
+            "Konuşma değerlendirmesi öğretmen tarafından onaylandı.",
+        )
+        .entity("speaking_attempt", &input.attempt_id),
+    )?;
+    Ok(attempt)
 }
 
 #[tauri::command]

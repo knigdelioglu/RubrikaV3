@@ -79,7 +79,7 @@ export function GradedExamReviewPage() {
             </div>
           </div>
         )}
-        {review && !reviewLoading && <ScoredExamReviewPanel review={review} />}
+        {review && !reviewLoading && <ScoredExamReviewPanel review={review} projectId={projectId} />}
       </div>
     </div>
   );

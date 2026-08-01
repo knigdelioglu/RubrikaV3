@@ -11,6 +11,8 @@ const jobLabels: Record<JobKind, string> = {
   scoring: 'Notlandırma yapılıyor',
   speaking_evaluation: 'Konuşma değerlendirmesi yapılıyor',
   assessment_analysis: 'Sınav analizi hazırlanıyor',
+  project_backup: 'Proje yedeği hazırlanıyor',
+  project_restore: 'Proje yedeği geri yükleniyor',
 };
 
 export function getJobLabel(kind: JobKind): string {

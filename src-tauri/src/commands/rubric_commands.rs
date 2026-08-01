@@ -65,9 +65,19 @@ pub async fn confirm_question_rubric(
     state: State<'_, AppState>,
     input: ConfirmQuestionRubricInput,
 ) -> Result<Question, AppError> {
-    state
+    let question = state
         .rubric_service
-        .confirm_question_rubric(&input.project_id, &input.question_id)
+        .confirm_question_rubric(&input.project_id, &input.question_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "rubric_confirmed",
+            "Soru rubriği öğretmen tarafından onaylandı.",
+        )
+        .entity("question", &input.question_id),
+    )?;
+    Ok(question)
 }
 
 #[derive(serde::Deserialize)]
@@ -81,7 +91,18 @@ pub async fn confirm_all_rubrics(
     state: State<'_, AppState>,
     input: ConfirmAllRubricsInput,
 ) -> Result<Project, AppError> {
-    state.rubric_service.confirm_all_rubrics(&input.project_id)
+    let project = state
+        .rubric_service
+        .confirm_all_rubrics(&input.project_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "rubric_confirmed_all",
+            "Tüm rubrikler öğretmen tarafından onaylandı.",
+        ),
+    )?;
+    Ok(project)
 }
 
 #[derive(serde::Deserialize)]

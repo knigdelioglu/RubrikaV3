@@ -1,9 +1,12 @@
 pub mod analysis_service;
 pub mod assessment_organization_service;
+pub mod audit_service;
+pub mod backup_service;
 // Domain services
 pub mod document_content_extraction_service;
 pub mod document_service;
 pub mod exam_package_build_service;
+pub mod generation_gc_service;
 pub mod graded_exam_review_service;
 pub mod llama_server_gateway;
 pub mod model_config_service;

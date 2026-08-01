@@ -121,6 +121,33 @@ pub struct WorkflowSnapshot {
     pub summary: WorkflowSummary,
 }
 
+/// Teacher-facing workflow snapshot crossing the Tauri command boundary.
+///
+/// Contains only display data (stage, blocking reasons, next actions,
+/// summary). Internal persistence fields and readiness computation stay in
+/// the domain layer.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowSnapshotDto {
+    pub current_stage: WorkflowStage,
+    pub current_stage_label: String,
+    pub blocking_reasons: Vec<BlockingReason>,
+    pub next_actions: Vec<WorkflowAction>,
+    pub summary: WorkflowSummary,
+}
+
+impl From<WorkflowSnapshot> for WorkflowSnapshotDto {
+    fn from(snapshot: WorkflowSnapshot) -> Self {
+        Self {
+            current_stage: snapshot.current_stage,
+            current_stage_label: snapshot.current_stage_label,
+            blocking_reasons: snapshot.blocking_reasons,
+            next_actions: snapshot.next_actions,
+            summary: snapshot.summary,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkflowSummaryFields {

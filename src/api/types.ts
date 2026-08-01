@@ -17,7 +17,9 @@ export type JobKind =
   | 'student_identity_ocr'
   | 'scoring'
   | 'speaking_evaluation'
-  | 'assessment_analysis';
+  | 'assessment_analysis'
+  | 'project_backup'
+  | 'project_restore';
 
 export type JobStatus =
   | 'queued'
@@ -1614,4 +1616,37 @@ export type BatchCreateTeachingAssignmentsInput = {
   courseId: string;
   courseName: string;
   classSectionIds: string[];
+};
+
+export type GcReport = {
+  dryRun: boolean;
+  protectedGenerations: number;
+  cleanupCandidates: number;
+  deletedGenerations: number;
+  deferredCleanup: number;
+  orphanStagingDirs: number;
+};
+
+export type BackupSummary = {
+  archivePath: string;
+  entryCount: number;
+  totalSize: number;
+  sha256: string;
+  createdAt: string;
+};
+
+export type RestoreSummary = {
+  destination: string;
+  entryCount: number;
+  restoredProjectId: string;
+};
+
+export type StartBackupJobOutput = {
+  jobId: string;
+  status: string;
+};
+
+export type StartRestoreJobOutput = {
+  jobId: string;
+  status: string;
 };

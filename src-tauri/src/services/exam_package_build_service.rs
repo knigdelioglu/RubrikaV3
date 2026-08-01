@@ -949,12 +949,11 @@ mod tests {
         let model_config = ModelConfigService::new();
         let model_process_manager =
             ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
-        let model_runtime_service =
-            ModelRuntimeService::new(model_config, model_process_manager);
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
         let model_input_image_service = Arc::new(ModelInputImageService::default());
-        let document_content_extraction_service = Arc::new(
-            DocumentContentExtractionService::new(model_input_image_service),
-        );
+        let document_content_extraction_service = Arc::new(DocumentContentExtractionService::new(
+            model_input_image_service,
+        ));
         let question_text_service = Arc::new(QuestionTextService::new(
             project_store.clone(),
             model_gateway_impl.clone(),

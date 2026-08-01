@@ -106,7 +106,21 @@ pub async fn delete_student_submission(
     state: State<'_, AppState>,
     input: DeleteStudentSubmissionInput,
 ) -> Result<(), AppError> {
-    state.student_scan_service.delete_student_submission(input)
+    let project_id = input.project_id.clone();
+    let submission_id = input.submission_id.clone();
+    state
+        .student_scan_service
+        .delete_student_submission(input)?;
+    super::audit_critical(
+        &state,
+        &project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "submission_deleted",
+            "Öğrenci cevap kaydı silindi.",
+        )
+        .entity("student_submission", &submission_id),
+    )?;
+    Ok(())
 }
 
 #[tauri::command]

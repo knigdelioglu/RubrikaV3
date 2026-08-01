@@ -321,9 +321,11 @@ export function ExamPackageWorkspacePage() {
         const documentId = questionStatusQuery.data?.documentId;
         if (!documentId) throw {
           code: 'DOCUMENT_NOT_FOUND',
-          message: 'Soru metni çıkarmak için sınav PDF’i bulunamadı.',
-          recoverable: true,
+          safeMessage: 'Soru metni çıkarmak için sınav PDF’i bulunamadı.',
+          recoveryAction: 'Önce sınav PDF’ini içe aktarın.',
+          retryable: true,
           correlationId: 'unknown',
+          detailsAvailable: false,
         } as AppError;
         await commands.startQuestionTextExtraction({ projectId, documentId });
       }

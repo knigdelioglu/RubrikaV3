@@ -558,7 +558,7 @@ mod tests {
 
         let reg = jm
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: project.id.clone(),
                     project_root_path: Some(project.root_path.clone()),
@@ -575,7 +575,7 @@ mod tests {
             )
             .unwrap();
 
-        jm.set_running(&handle, &reg.snapshot.id).unwrap();
+        jm.set_running(handle, &reg.snapshot.id).unwrap();
         reg.cancellation_token.cancel();
 
         let res = import_document_with_job(
@@ -584,7 +584,7 @@ mod tests {
             &project.id,
             source.to_string_lossy().as_ref(),
             DocumentRole::ExamSource,
-            Some((&jm, &handle)),
+            Some((&jm, handle)),
             Some("corr-p15".into()),
         );
 

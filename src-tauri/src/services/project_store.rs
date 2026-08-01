@@ -15,6 +15,7 @@ use crate::domain::rubric::RubricStatus;
 use crate::domain::school_class::normalize_school_class_name;
 use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
 use crate::platform::project_paths::TrustedProjectRoot;
+use crate::platform::project_write_lease::{acquire_or_share, ProjectWriteLease};
 use crate::services::workflow_engine;
 use serde_json::{Map, Value};
 
@@ -131,6 +132,7 @@ static PROJECT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceL
 pub struct ProjectStore {
     current_project: Arc<Mutex<Option<Project>>>,
     trusted_root: Arc<Mutex<Option<TrustedProjectRoot>>>,
+    write_lease: Arc<Mutex<Option<Arc<ProjectWriteLease>>>>,
     current_fingerprint: Arc<Mutex<Option<String>>>,
     revision_history: Arc<Mutex<HashMap<(String, u64), Project>>>,
     stale_job_result_count: Arc<AtomicU64>,
@@ -150,6 +152,7 @@ impl ProjectStore {
         Self {
             current_project: Arc::new(Mutex::new(None)),
             trusted_root: Arc::new(Mutex::new(None)),
+            write_lease: Arc::new(Mutex::new(None)),
             current_fingerprint: Arc::new(Mutex::new(None)),
             revision_history: Arc::new(Mutex::new(HashMap::new())),
             stale_job_result_count: Arc::new(AtomicU64::new(0)),
@@ -352,6 +355,7 @@ impl ProjectStore {
             technical_details: Some(error.to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
+        self.ensure_write_lease(&trusted_root)?;
         let project_path = trusted_root.managed("project.json")?;
         if let Err(error) = trusted_root.create_new_file(&project_path, &content) {
             if root_was_created {
@@ -371,11 +375,30 @@ impl ProjectStore {
             .map(|(project, _)| project)
     }
 
+    /// Ensures this store holds the OS-level write lease for `root`.
+    ///
+    /// A different root releases the previous lease first. If another
+    /// process holds the lease, `ProjectAlreadyOpen` is returned and no
+    /// writer path may proceed.
+    fn ensure_write_lease(&self, root: &TrustedProjectRoot) -> Result<(), AppError> {
+        let mut lease_slot = self.write_lease.lock().map_err(lock_error)?;
+        if let Some(lease) = lease_slot.as_ref() {
+            if lease.lock_path().parent() == Some(root.root()) {
+                return Ok(());
+            }
+            *lease_slot = None;
+        }
+        let lease = acquire_or_share(root.root())?;
+        *lease_slot = Some(lease);
+        Ok(())
+    }
+
     pub fn open_project_with_warnings(
         &self,
         root_path: String,
     ) -> Result<(Project, Vec<String>), AppError> {
         let trusted_root = TrustedProjectRoot::open_selected(Path::new(&root_path))?;
+        self.ensure_write_lease(&trusted_root)?;
         let mut loaded = Self::load_project_file_with_root(&trusted_root, true)?;
         let interrupted_generations = loaded
             .project
@@ -663,6 +686,7 @@ impl ProjectStore {
         F: FnOnce(&mut Project, &MutationContext) -> Result<T, AppError>,
     {
         let trusted_root = self.trusted_project_root(project_id)?;
+        self.ensure_write_lease(&trusted_root)?;
         let project_lock = project_lock_for(trusted_root.root())?;
         let _guard = project_lock.lock().map_err(lock_error)?;
         let current = self.read_disk_snapshot(&trusted_root)?;
@@ -3584,6 +3608,7 @@ mod tests {
             .create_project("Moved".into(), old_root.to_string_lossy().to_string())
             .unwrap();
         let old_root_string = project.root_path.clone();
+        drop(store);
         fs::rename(&old_root, &new_root).unwrap();
 
         let reopened_store = ProjectStore::new();

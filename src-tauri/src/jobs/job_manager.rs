@@ -968,7 +968,7 @@ mod tests {
 
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "p1".to_string(),
                     project_root_path: None,
@@ -985,18 +985,18 @@ mod tests {
             )
             .unwrap();
 
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
         let snapshot_before = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
         assert_eq!(snapshot_before.status, JobStatus::Running);
         assert!(!snapshot_before.cancellation_requested);
 
-        let cancelled_snapshot = manager.cancel_job(&handle, &reg.snapshot.id).unwrap();
+        let cancelled_snapshot = manager.cancel_job(handle, &reg.snapshot.id).unwrap();
         assert!(cancelled_snapshot.cancellation_requested);
         assert!(reg.cancellation_token.is_cancelled());
 
         // Simulated worker checkpoint observing token cancel
         if reg.cancellation_token.is_cancelled() {
-            manager.mark_cancelled(&handle, &reg.snapshot.id).unwrap();
+            manager.mark_cancelled(handle, &reg.snapshot.id).unwrap();
         }
 
         let snapshot_after = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
@@ -1012,7 +1012,7 @@ mod tests {
 
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "p1".to_string(),
                     project_root_path: None,
@@ -1029,10 +1029,10 @@ mod tests {
             )
             .unwrap();
 
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
         manager
             .partial(
-                &handle,
+                handle,
                 &reg.snapshot.id,
                 Some(serde_json::json!({ "succeeded": 8, "failed": 2 })),
             )
@@ -1055,7 +1055,7 @@ mod tests {
         let manager1 = JobManager::new();
         let reg = manager1
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "proj_restart".to_string(),
                     project_root_path: Some(root_path.to_string_lossy().to_string()),
@@ -1072,7 +1072,7 @@ mod tests {
             )
             .unwrap();
 
-        manager1.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager1.set_running(handle, &reg.snapshot.id).unwrap();
 
         // Simulate app restart by constructing a new JobManager instance reading the same directory
         let manager2 = JobManager::new();
@@ -1153,7 +1153,7 @@ mod tests {
 
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "proj_retry".to_string(),
                     project_root_path: None,
@@ -1170,10 +1170,10 @@ mod tests {
             )
             .unwrap();
 
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
         manager
             .fail(
-                &handle,
+                handle,
                 &reg.snapshot.id,
                 AppError {
                     code: AppErrorCode::OcrFailed,
@@ -1186,7 +1186,7 @@ mod tests {
             )
             .unwrap();
 
-        let retry_reg = manager.retry_job(&handle, &reg.snapshot.id).unwrap();
+        let retry_reg = manager.retry_job(handle, &reg.snapshot.id).unwrap();
 
         assert_ne!(retry_reg.snapshot.id, reg.snapshot.id);
         assert_eq!(
@@ -1214,7 +1214,7 @@ mod tests {
 
         let reg1 = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "p_shut".to_string(),
                     project_root_path: None,
@@ -1230,15 +1230,15 @@ mod tests {
                 },
             )
             .unwrap();
-        manager.set_running(&handle, &reg1.snapshot.id).unwrap();
+        manager.set_running(handle, &reg1.snapshot.id).unwrap();
 
-        manager.shutdown_all_jobs(&handle);
+        manager.shutdown_all_jobs(handle);
 
         let snap1 = manager.get_job_snapshot(&reg1.snapshot.id).unwrap();
         assert_eq!(snap1.status, JobStatus::Interrupted);
 
         let new_reg = manager.register_or_get_active_job(
-            &handle,
+            handle,
             JobRegistrationInput {
                 project_id: "p_shut".to_string(),
                 project_root_path: None,
@@ -1276,7 +1276,7 @@ mod tests {
         for i in 0..5 {
             let reg = manager
                 .register_or_get_active_job(
-                    &handle,
+                    handle,
                     JobRegistrationInput {
                         project_id: "proj_ret".to_string(),
                         project_root_path: Some(root_path.to_string_lossy().to_string()),
@@ -1292,8 +1292,8 @@ mod tests {
                     },
                 )
                 .unwrap();
-            manager.set_running(&handle, &reg.snapshot.id).unwrap();
-            manager.succeed(&handle, &reg.snapshot.id, None).unwrap();
+            manager.set_running(handle, &reg.snapshot.id).unwrap();
+            manager.succeed(handle, &reg.snapshot.id, None).unwrap();
             job_ids.push(reg.snapshot.id);
         }
 
@@ -1309,7 +1309,10 @@ mod tests {
         std::fs::create_dir_all(&root_path_buf).unwrap();
         let store = crate::services::project_store::ProjectStore::new();
         let project = store
-            .create_project("proj_corr".into(), root_path_buf.to_string_lossy().to_string())
+            .create_project(
+                "proj_corr".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
             .unwrap();
 
         let manager = JobManager::new();
@@ -1323,7 +1326,7 @@ mod tests {
         // 2. JobSnapshot Correlation ID
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: project.id.clone(),
                     project_root_path: Some(project.root_path.clone()),
@@ -1342,7 +1345,7 @@ mod tests {
 
         assert_eq!(command_corr_id, reg.snapshot.correlation_id);
 
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
 
         // 3. Lease Correlation ID Context
         let lease_corr_id = reg.snapshot.correlation_id.clone();
@@ -1380,7 +1383,7 @@ mod tests {
             correlation_id: project_store_corr_id.to_string(),
         };
 
-        manager.fail(&handle, &reg.snapshot.id, err).unwrap();
+        manager.fail(handle, &reg.snapshot.id, err).unwrap();
 
         let snap = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
         let terminal_event_corr_id = snap.error.as_ref().unwrap().correlation_id.clone();
@@ -1397,7 +1400,7 @@ mod tests {
 
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: "proj_panic".to_string(),
                     project_root_path: None,
@@ -1414,7 +1417,7 @@ mod tests {
             )
             .unwrap();
 
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
 
         // Simulate panic recovery in task wrapper
         let panic_err = AppError {
@@ -1426,7 +1429,7 @@ mod tests {
             correlation_id: reg.snapshot.correlation_id.clone(),
         };
 
-        manager.fail(&handle, &reg.snapshot.id, panic_err).unwrap();
+        manager.fail(handle, &reg.snapshot.id, panic_err).unwrap();
 
         let snap = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
         assert_eq!(snap.status, JobStatus::Failed);
@@ -1440,7 +1443,10 @@ mod tests {
         std::fs::create_dir_all(&root_path_buf).unwrap();
         let store = crate::services::project_store::ProjectStore::new();
         let project = store
-            .create_project("proj_relaunch".into(), root_path_buf.to_string_lossy().to_string())
+            .create_project(
+                "proj_relaunch".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
             .unwrap();
 
         let manager = JobManager::new();
@@ -1450,7 +1456,7 @@ mod tests {
         // 1. Register and run long job
         let reg = manager
             .register_or_get_active_job(
-                &handle,
+                handle,
                 JobRegistrationInput {
                     project_id: project.id.clone(),
                     project_root_path: Some(project.root_path.clone()),
@@ -1466,10 +1472,10 @@ mod tests {
                 },
             )
             .unwrap();
-        manager.set_running(&handle, &reg.snapshot.id).unwrap();
+        manager.set_running(handle, &reg.snapshot.id).unwrap();
 
         // 2. Simulate Tauri ExitRequested handler (lib.rs)
-        manager.shutdown_all_jobs(&handle);
+        manager.shutdown_all_jobs(handle);
 
         let active_snap = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
         assert_eq!(active_snap.status, JobStatus::Interrupted);

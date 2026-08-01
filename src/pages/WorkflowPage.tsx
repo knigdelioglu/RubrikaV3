@@ -12,13 +12,13 @@ export function WorkflowPage() {
   const { projectId, projectPath, isResolving } = useProjectContext();
   const queryClient = useQueryClient();
 
-  const { data: project, error: projectError, isLoading: projectLoading } = useQuery({
+  const { data: project, error: projectError, isLoading: projectLoading, refetch: refetchProject } = useQuery({
     queryKey: ['project-snapshot', projectId],
     queryFn: () => commands.getProjectSnapshot(projectId),
     enabled: !!projectId,
   });
 
-  const { data: workflow, error: workflowError, isLoading: workflowLoading } = useQuery({
+  const { data: workflow, error: workflowError, isLoading: workflowLoading, refetch: refetchWorkflow } = useQuery({
     queryKey: ['workflow-snapshot', projectId],
     queryFn: () => commands.getWorkflowSnapshot(projectId),
     enabled: !!projectId,
@@ -57,6 +57,10 @@ export function WorkflowPage() {
 
   const error = projectError || workflowError;
 
+  const refresh = async () => {
+    await Promise.allSettled([refetchProject(), refetchWorkflow()]);
+  };
+
   if (isResolving) {
     return <ProjectContextState pageLabel="İş akışı" loading projectPath={projectPath} />;
   }
@@ -67,7 +71,13 @@ export function WorkflowPage() {
 
   return (
     <div style={{ padding: '2rem', height: '100%', boxSizing: 'border-box' }}>
-      {error && <ErrorBanner error={error as unknown as AppError} />}
+      {error && (
+        <ErrorBanner
+          error={error as unknown as AppError}
+          onRefresh={() => void refresh()}
+          showTechnicalDetails
+        />
+      )}
 
       {(projectLoading || workflowLoading) && <div>Yükleniyor...</div>}
 

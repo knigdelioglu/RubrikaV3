@@ -22,6 +22,8 @@ pub enum JobKind {
     Scoring,
     SpeakingEvaluation,
     AssessmentAnalysis,
+    ProjectBackup,
+    ProjectRestore,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]

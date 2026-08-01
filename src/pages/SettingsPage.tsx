@@ -3,7 +3,7 @@ import { useParams, Link } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
-import type { ModelServerArgsPreview } from '../api/types';
+import type { GcReport, ModelServerArgsPreview } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { useProjectContext } from '../state/useProjectContext';
 import { Loader2, RefreshCw } from 'lucide-react';
@@ -19,6 +19,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(defaultTab || 'general');
   const [error, setError] = useState<AppError | null>(null);
   const [preview, setPreview] = useState<ModelServerArgsPreview | null>(null);
+  const [gcReport, setGcReport] = useState<GcReport | null>(null);
 
   const projectQuery = useQuery({
     queryKey: ['project-snapshot', activeProjectId],
@@ -53,13 +54,40 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
       if (!result.started && !result.healthOk) {
         setError({
           code: 'MODEL_PORT_ALREADY_IN_USE',
-          message: result.message,
-          recoverable: true,
+          safeMessage: result.message,
+          recoveryAction: 'Portu serbest bırakıp yeniden deneyin.',
+          retryable: true,
           correlationId: crypto.randomUUID(),
+          detailsAvailable: false,
         });
       }
     },
     onError: (err: AppError) => setError(err),
+  });
+
+  const gcMutation = useMutation({
+    mutationFn: async () => {
+      const dryRun = await commands.runGenerationGc(activeProjectId, true);
+      const report = await commands.runGenerationGc(activeProjectId, false);
+      return { dryRun, report };
+    },
+    onSuccess: ({ report }) => {
+      setGcReport(report);
+      setError(null);
+    },
+    onError: (mutationError: unknown) => {
+      setError(mutationError as AppError);
+    },
+  });
+
+  const backupMutation = useMutation({
+    mutationFn: () => commands.startBackupJob(activeProjectId),
+    onSuccess: () => {
+      setError(null);
+    },
+    onError: (mutationError: unknown) => {
+      setError(mutationError as AppError);
+    },
   });
 
   const stopMutation = useMutation({
@@ -260,6 +288,45 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
                 <strong style={{ color: '#0f172a' }}>{project?.documents?.length ?? 0} dosya</strong>
               </div>
             </div>
+          </article>
+          <article style={{ padding: '1.5rem', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '1rem' }}>
+            <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: '#0f172a' }}>Yedekleme ve Depolama Temizliği</h3>
+            <p style={{ margin: '0.35rem 0 1rem', color: '#64748b', fontSize: '0.875rem' }}>
+              Yedek; belgeler, rubrik, OCR ve notlandırma verilerini doğrulanmış tek arşiv olarak kaydeder.
+              Temizlik yalnızca referanssız, eski veya başarısız üretimleri siler.
+            </p>
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="button button--primary"
+                onClick={() => backupMutation.mutate()}
+                disabled={backupMutation.isPending || !activeProjectId}
+                style={{ fontSize: '0.85rem' }}
+              >
+                {backupMutation.isPending ? 'Yedekleniyor…' : 'Yedek Oluştur'}
+              </button>
+              <button
+                type="button"
+                className="button button--secondary"
+                onClick={() => gcMutation.mutate()}
+                disabled={gcMutation.isPending || !activeProjectId}
+                style={{ fontSize: '0.85rem' }}
+              >
+                {gcMutation.isPending ? 'Taranıyor…' : 'Depolamayı Temizle'}
+              </button>
+            </div>
+            {gcReport && (
+              <div style={{ marginTop: '1rem', padding: '0.85rem', background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: '0.75rem', fontSize: '0.85rem' }}>
+                <strong style={{ color: '#0f172a' }}>Temizlik sonucu:</strong>{' '}
+                {gcReport.deletedGenerations} silindi, {gcReport.deferredCleanup} ertelendi,
+                {gcReport.protectedGenerations} korundu, {gcReport.orphanStagingDirs} staging temizlendi.
+              </div>
+            )}
+            {backupMutation.isSuccess && (
+              <p style={{ marginTop: '0.75rem', fontSize: '0.85rem', color: '#047857' }}>
+                Yedek işi kuyruğa alındı. İş merkezinden ilerlemeyi takip edebilirsiniz.
+              </p>
+            )}
           </article>
         </section>
       )}

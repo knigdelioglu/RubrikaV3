@@ -8,6 +8,7 @@ pub mod services;
 use jobs::job_manager::JobManager;
 use services::analysis_service::AnalysisService;
 use services::assessment_organization_service::AssessmentOrganizationService;
+use services::audit_service::AuditService;
 use services::document_content_extraction_service::DocumentContentExtractionService;
 use services::exam_package_build_service::ExamPackageBuildService;
 use services::graded_exam_review_service::GradedExamReviewService;
@@ -31,11 +32,13 @@ use services::student_answer_crop_service::StudentAnswerCropService;
 use services::student_answer_ocr_service::StudentAnswerOcrService;
 use services::student_scan_service::StudentScanService;
 use speakoflow_engine::SpeakoflowEngine;
+use std::borrow::Cow;
 use std::sync::Arc;
 use tauri::Manager;
 
 pub struct AppState {
     pub project_store: ProjectStore,
+    pub audit_service: Arc<AuditService>,
     pub model_gateway: Arc<dyn ModelGateway>,
     pub model_gateway_impl: Arc<LlamaServerGateway>,
     pub model_config_service: ModelConfigService,
@@ -65,7 +68,24 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Err(error) = platform::single_instance::AppInstanceLease::acquire() {
+        log::error!("{}", error.message);
+        std::process::exit(0);
+    }
     tauri::Builder::default()
+        .register_uri_scheme_protocol("managed-asset", |ctx, request| {
+            use crate::platform::managed_asset;
+            let request_path = request.uri().path();
+            let store = ctx.app_handle().state::<ProjectStore>();
+            match managed_asset::resolve_managed_asset(&store, request_path) {
+                Ok(asset) => http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", asset.mime)
+                    .body(Cow::Owned(asset.bytes))
+                    .unwrap_or_else(|_| managed_asset_error_response()),
+                Err(_) => managed_asset_error_response(),
+            }
+        })
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -133,6 +153,7 @@ pub fn run() {
                 pdf_preview_service.clone(),
             ));
             let school_class_service = Arc::new(SchoolClassService::new(project_store.clone()));
+            let audit_service = Arc::new(AuditService::new());
             let assessment_organization_service = Arc::new(AssessmentOrganizationService::new(
                 project_store.clone(),
                 school_class_service.clone(),
@@ -163,6 +184,7 @@ pub fn run() {
 
             AppState {
                 project_store: project_store.clone(),
+                audit_service: audit_service.clone(),
                 model_gateway: model_gateway.clone(),
                 model_gateway_impl,
                 model_config_service,
@@ -207,6 +229,8 @@ pub fn run() {
             commands::analysis_commands::finish_assessment,
             commands::analysis_commands::get_assessment_analysis,
             commands::analysis_commands::list_assessment_analyses,
+            commands::backup_commands::start_backup_job,
+            commands::backup_commands::start_restore_job,
             commands::project_commands::list_projects,
             commands::project_commands::create_project,
             commands::project_commands::update_course_info,
@@ -214,6 +238,7 @@ pub fn run() {
             commands::project_commands::get_project_snapshot,
             commands::project_commands::get_default_project_path,
             commands::exam_package_commands::start_exam_package_build,
+            commands::generation_gc_commands::run_generation_gc,
             commands::document_commands::import_exam_source_pdf,
             commands::document_commands::import_answer_key_pdf,
             commands::student_scan_commands::import_student_scan_pdf,
@@ -337,4 +362,16 @@ pub fn run() {
                 }
             }
         });
+}
+
+fn managed_asset_error_response() -> http::Response<Cow<'static, [u8]>> {
+    http::Response::builder()
+        .status(404)
+        .body(Cow::Borrowed(&b""[..]))
+        .unwrap_or_else(|_| {
+            http::Response::builder()
+                .status(500)
+                .body(Cow::Borrowed(&b""[..]))
+                .unwrap_or_else(|_| http::Response::new(Cow::Borrowed(&b""[..])))
+        })
 }

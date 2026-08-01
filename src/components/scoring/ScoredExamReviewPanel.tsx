@@ -6,11 +6,12 @@ import { annotationColors, calculateFitScale, calculatePreservedPageScale, forma
 
 type ScoredExamReviewPanelProps = {
   review: GradedExamReview;
+  projectId: string;
 };
 
 const PAPER_FIT_PADDING = 28;
 
-export function ScoredExamReviewPanel({ review }: ScoredExamReviewPanelProps) {
+export function ScoredExamReviewPanel({ review, projectId }: ScoredExamReviewPanelProps) {
   const viewportRef = useRef<HTMLElement | null>(null);
   const fitReferenceRef = useRef<{ width: number; height: number } | null>(null);
   const [pageIndex, setPageIndex] = useState(0);
@@ -91,7 +92,7 @@ export function ScoredExamReviewPanel({ review }: ScoredExamReviewPanelProps) {
       <div style={{ minHeight: 0, display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 224px' }}>
         <main ref={viewportRef} style={{ minWidth: 0, minHeight: 0, overflow: 'auto', padding: '0.85rem', background: '#cbd5e1', display: 'grid', placeItems: 'center' }}>
           <div style={{ width: `${renderedWidth}px`, height: `${renderedHeight}px`, position: 'relative', flexShrink: 0, background: 'white', boxShadow: '0 16px 42px rgba(15, 23, 42, 0.24)', transition: 'width 120ms ease, height 120ms ease' }}>
-            <img src={resolveImageSrc(page.imagePath)} alt={`Puanlı sınav sayfası ${page.pageNumber}`} style={{ display: 'block', width: '100%', height: '100%', objectFit: 'fill' }} />
+            <img src={resolveImageSrc(page.imagePath, projectId)} alt={`Puanlı sınav sayfası ${page.pageNumber}`} style={{ display: 'block', width: '100%', height: '100%', objectFit: 'fill' }} />
             {page.annotations.map((annotation) => {
               const colors = annotationColors(annotation);
               const breakdown = scoreBreakdown(annotation);

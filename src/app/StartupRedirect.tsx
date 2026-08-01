@@ -42,8 +42,8 @@ export function StartupRedirect() {
       })
       .catch((error: unknown) => {
         const reason =
-          typeof error === 'object' && error !== null && 'message' in error
-            ? String((error as { message: unknown }).message)
+          typeof error === 'object' && error !== null && 'safeMessage' in error
+            ? String((error as { safeMessage: unknown }).safeMessage)
             : 'Proje açılamadı.';
         setMessage(reason);
       });

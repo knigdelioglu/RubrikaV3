@@ -1,5 +1,6 @@
 use crate::domain::errors::AppError;
 use crate::domain::project::Project;
+use crate::services::audit_service::AuditEntryInput;
 use crate::services::project_store::ListProjectsOutput;
 use crate::AppState;
 use tauri::State;
@@ -63,6 +64,10 @@ pub async fn create_project(
         input.course_id,
         input.course_name,
     )?;
+    let _ = state.audit_service.append(
+        std::path::Path::new(&project.root_path),
+        AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.").project(&project.id),
+    );
     Ok(CreateProjectOutput {
         project_path: project.root_path.clone(),
         project,
@@ -83,6 +88,10 @@ pub async fn open_project(
     let (project, warnings) = state
         .project_store
         .open_project_with_warnings(project_path.clone())?;
+    let _ = state.audit_service.append(
+        std::path::Path::new(&project.root_path),
+        AuditEntryInput::new("project_opened", "Proje açıldı.").project(&project.id),
+    );
     let _ = state
         .job_manager
         .rehydrate_jobs(std::path::Path::new(&project.root_path));

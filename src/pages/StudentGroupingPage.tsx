@@ -94,9 +94,11 @@ export function StudentGroupingPage() {
       if (!activeDocument) {
         throw {
           code: 'STUDENT_SCAN_NOT_FOUND',
-          message: 'Öğrenci cevap PDF’i bulunamadı.',
-          recoverable: true,
+          safeMessage: 'Öğrenci cevap PDF’i bulunamadı.',
+          recoveryAction: 'Önce öğrenci cevap PDF’ini içe aktarın.',
+          retryable: true,
           correlationId: 'unknown',
+          detailsAvailable: false,
         } as AppError;
       }
       return commands.createStudentPageGroups({

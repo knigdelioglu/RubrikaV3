@@ -668,3 +668,35 @@ Tauri Command (Correlation ID)
 ```
 
 Tüm job iptal senaryoları, correlation ID eşitliği, retention temizliği ve 16 production proof testi [`docs/JOB_LIFECYCLE_AND_CANCELLATION.md`](JOB_LIFECYCLE_AND_CANCELLATION.md) içinde tanımlıdır.
+
+## Faz 6 — güvenlik ve bakım akışları
+
+```text
+Konuşma "Sınavı Başlat"
+→ commands.startSpeakingExam (backend)   [local-only authority kaldırıldı]
+→ SpeakingExamService.start → ProjectStore commit (revision artar)
+→ audit: speaking_session_started
+→ refresh/restart → session persisted InProgress
+
+Yedek Oluştur (Ayarlar → Depolama)
+→ start_backup_job → JobManager (project_backup)
+→ sınırlı tarama + manifest/hash → outputs/backups/*.rbackup
+→ audit: backup_created
+
+Restore
+→ start_restore_job → arşiv doğrulama → staging → canonical root rewrite
+→ atomic activation → ProjectStore açılış doğrulaması → audit: project_restored
+
+Depolamayı Temizle
+→ run_generation_gc(projectId) → dry-run plan → protected set → bounded delete
+→ metadata commit (student_answer_ocr_generations retain)
+
+Asset Görüntüleme (taşınmış proje)
+→ frontend relative managed path → managed-asset://localhost/<projectId>/<rel>
+→ backend containment + symlink check + 32 MiB bound → safe MIME
+```
+
+Faz 1–5 proof'larına ek olarak proof_18–proof_31 semantic kanıtları
+`src-tauri/tests/final_security_proofs.rs`,
+`src-tauri/tests/project_lock_process_fixture.rs` ve
+`src-tauri/tests/speaking_backend_persistence.rs` içindedir.

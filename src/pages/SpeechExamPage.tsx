@@ -44,8 +44,8 @@ function studentLabel(student: Student): string {
 }
 
 function errorMessage(error: unknown, fallback: string): string {
-  if (typeof error === 'object' && error !== null && 'message' in error) {
-    const message = (error as Partial<AppError>).message;
+  if (typeof error === 'object' && error !== null && 'safeMessage' in error) {
+    const message = (error as Partial<AppError>).safeMessage;
     if (message?.trim()) return message;
   }
   return fallback;
@@ -385,9 +385,24 @@ export function SpeechExamPage() {
     setPageError(null);
     setIsStarting(true);
     try {
-      setExamId(assessmentActivityId);
-      setStatusMessage('Merkezi sınav organizasyonu yürütme ekranına açıldı.');
+      const result = await commands.startSpeakingExam({
+        projectId,
+        examName,
+        examType,
+        taskText,
+        assignedClassIds: selectedClassIds,
+        assessmentActivityId,
+        targetSeconds: recSecCalculated,
+        minimumSeconds: minSecCalculated,
+        maximumSeconds: maxSecCalculated,
+        examId: examId || undefined,
+        teacherNote: optionalTeacherNote || undefined,
+      });
+      setExamId(result.examId);
+      setStatusMessage(result.message);
       setStage('session');
+      await queryClient.invalidateQueries({ queryKey: ['speaking-exam', projectId] });
+      await queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
     } catch (error) {
       setPageError(errorMessage(error, 'Konuşma sınavı kaydedilemedi.'));
     } finally {

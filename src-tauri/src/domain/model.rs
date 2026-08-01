@@ -1,7 +1,6 @@
 use crate::domain::errors::AppError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -742,28 +741,13 @@ impl SupportFlags {
 }
 
 pub fn default_model_profile() -> ModelProfile {
-    let local = local_model_paths();
     ModelProfile {
         id: "gemma4-ocr-q8".to_string(),
         display_name: "Gemma 4 OCR Q4_K_XL".to_string(),
         mode: ModelMode::External,
-        server_path: local
-            .as_ref()
-            .map(|paths| paths.server_path.clone())
-            .unwrap_or_else(|| {
-                "/Users/kadir/Desktop/llm/atomic-llama-cpp-turboquant/build/bin/llama-server"
-                    .to_string()
-            }),
-        model_path: local
-            .as_ref()
-            .map(|paths| paths.model_path.clone())
-            .unwrap_or_else(|| {
-                "/Users/kadir/Desktop/llm/models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf".to_string()
-            }),
-        mmproj_path: local
-            .as_ref()
-            .map(|paths| paths.mmproj_path.clone())
-            .unwrap_or_else(|| "/Users/kadir/Desktop/llm/models/mmproj-F32.gguf".to_string()),
+        server_path: String::new(),
+        model_path: String::new(),
+        mmproj_path: String::new(),
         host: "127.0.0.1".to_string(),
         port: 8080,
         base_url: "http://127.0.0.1:8080".to_string(),
@@ -771,29 +755,14 @@ pub fn default_model_profile() -> ModelProfile {
     }
 }
 
+/// Legacy developer-machine bootstrap.
+///
+/// Rubrika v3 no longer ships hard-coded user/model paths in production
+/// sources. A saved per-user configuration remains the only migration
+/// source and is loaded by `ModelConfigService`; nothing is silently
+/// bootstrapped from a developer machine path.
 pub fn local_model_paths() -> Option<ModelProfile> {
-    let server_path = "/Users/kadir/Desktop/llm/atomic-llama-cpp-turboquant/build/bin/llama-server";
-    let model_path = "/Users/kadir/Desktop/llm/models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf";
-    let mmproj_path = "/Users/kadir/Desktop/llm/models/mmproj-F32.gguf";
-    if Path::new(server_path).exists()
-        && Path::new(model_path).exists()
-        && Path::new(mmproj_path).exists()
-    {
-        Some(ModelProfile {
-            id: "gemma4-ocr-q8".to_string(),
-            display_name: "Gemma 4 OCR Q4_K_XL".to_string(),
-            mode: ModelMode::External,
-            server_path: server_path.to_string(),
-            model_path: model_path.to_string(),
-            mmproj_path: mmproj_path.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 8080,
-            base_url: "http://127.0.0.1:8080".to_string(),
-            runtime_preset: ModelRuntimePreset::Standard,
-        })
-    } else {
-        None
-    }
+    None
 }
 
 pub const SPEAKING_ASR_CLEANUP_PROFILE_ID: &str = "speaking_transcript_cleanup_12b";
@@ -804,10 +773,8 @@ pub fn speaking_asr_cleanup_model_profile() -> ModelProfile {
         id: SPEAKING_ASR_CLEANUP_PROFILE_ID.to_string(),
         display_name: "Gemma 4 12B — Konuşma Transkript Temizleme".to_string(),
         mode: ModelMode::Managed,
-        server_path: "/Users/kadir/Desktop/llm/atomic-llama-cpp-turboquant/build/bin/llama-server"
-            .to_string(),
-        model_path: "/Users/kadir/Desktop/llm/models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-            .to_string(),
+        server_path: String::new(),
+        model_path: String::new(),
         mmproj_path: String::new(),
         host: "127.0.0.1".to_string(),
         port: 8080,
@@ -821,10 +788,8 @@ pub fn speaking_rubric_model_profile() -> ModelProfile {
         id: SPEAKING_RUBRIC_PROFILE_ID.to_string(),
         display_name: "Gemma 4 12B — Konuşma Rubrik Değerlendirme".to_string(),
         mode: ModelMode::Managed,
-        server_path: "/Users/kadir/Desktop/llm/atomic-llama-cpp-turboquant/build/bin/llama-server"
-            .to_string(),
-        model_path: "/Users/kadir/Desktop/llm/models/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"
-            .to_string(),
+        server_path: String::new(),
+        model_path: String::new(),
         mmproj_path: String::new(),
         host: "127.0.0.1".to_string(),
         port: 8080,
@@ -1111,25 +1076,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_profile_matches_expected_paths() {
+    fn default_profile_has_no_hard_coded_user_paths() {
         let profile = default_model_profile();
         assert_eq!(profile.id, "gemma4-ocr-q8");
         assert_eq!(profile.display_name, "Gemma 4 OCR Q4_K_XL");
         assert_eq!(profile.base_url, "http://127.0.0.1:8080");
-        assert!(profile.server_path.contains("llama-server"));
+        assert!(profile.server_path.is_empty());
+        assert!(profile.model_path.is_empty());
+        assert!(profile.mmproj_path.is_empty());
     }
 
     #[test]
-    fn speaking_profiles_use_one_12b_text_runtime_for_two_tasks() {
+    fn speaking_profiles_require_explicit_user_model_selection() {
         let cleanup = speaking_asr_cleanup_model_profile();
         let rubric = speaking_rubric_model_profile();
 
         assert_eq!(cleanup.id, SPEAKING_ASR_CLEANUP_PROFILE_ID);
         assert_eq!(cleanup.base_url, "http://127.0.0.1:8080");
-        assert!(cleanup.model_path.contains("12B"));
         assert_eq!(rubric.id, SPEAKING_RUBRIC_PROFILE_ID);
         assert_eq!(rubric.base_url, "http://127.0.0.1:8080");
-        assert!(rubric.model_path.contains("12B"));
+        assert!(cleanup.server_path.is_empty());
+        assert!(cleanup.model_path.is_empty());
+        assert!(rubric.server_path.is_empty());
+        assert!(rubric.model_path.is_empty());
         assert!(cleanup.mmproj_path.is_empty());
         assert!(rubric.mmproj_path.is_empty());
     }

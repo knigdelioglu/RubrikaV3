@@ -234,9 +234,10 @@ export function ScoringPage() {
     if (trimmedScore !== '' && Number.isNaN(Number(trimmedScore))) {
       setError({
         code: 'UNKNOWN_ERROR',
-        message: 'Manuel puan sayısal olmalı.',
-        recoverable: true,
+        safeMessage: 'Manuel puan sayısal olmalı.',
+        retryable: true,
         correlationId: crypto.randomUUID?.() || 'unknown',
+        detailsAvailable: false,
       });
       return;
     }

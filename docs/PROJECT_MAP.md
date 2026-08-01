@@ -213,3 +213,33 @@ Tüm asenkron arka plan işlerinin tek yürütücüsü `src-tauri/src/jobs/job_m
 Faz 5C kapsamında 10 domain servisinin tüm uzun işlemlerine (DocumentImport, PdfPreviewRender, QuestionTextExtraction, RubricPdfImport, ExamPackageBuild, StudentAnswerOcr, StudentIdentityOcr, Scoring, SpeakingEvaluation, AssessmentAnalysis) cancellation checkpoint'leri eklenmiş ve 16 production proof testi ile doğrulanmıştır.
 
 Ayrıntılı job envanteri, iptal noktaları ve UI event sözleşmesi için [`docs/JOB_LIFECYCLE_AND_CANCELLATION.md`](JOB_LIFECYCLE_AND_CANCELLATION.md) okunmalıdır.
+
+## Faz 6 — final security, privacy, audit, backup/restore ve GC
+
+- `platform/project_write_lease.rs`: OS `flock` tabanlı `ProjectWriteLease` +
+  process içi paylaşım (`acquire_or_share`); ikinci OS process
+  `ProjectAlreadyOpen` alır. `platform/single_instance.rs`: app-level flock
+  lease (offline registry nedeniyle resmî plugin yerine güvenli eşdeğer).
+- `services/audit_service.rs`: append-only sha256 hash-zincirli audit
+  (`logs/audit.jsonl`), tamper/silme tespiti, kritik kararlarda fake success
+  yasağı.
+- `services/backup_service.rs`: sınırlı `.rbackup` formatı (manifest + entry
+  hash), traversal/symlink/duplicate/boyut korumaları, staging + atomic
+  activation; restore arşivdeki `root_path`'e güvenmez.
+- `services/generation_gc_service.rs`: dry-run plan + koruma seti (active,
+  candidate, approved, son başarılı, referenced) + bounded cleanup +
+  orphan staging; `run_generation_gc` komutu.
+- `services/llama_server_gateway.rs`: streaming `max_response_body_bytes`
+  (32 MiB), `max_request_body_bytes` (128 MiB), connect/first-byte/idle
+  timeout'ları, content-type doğrulaması.
+- `platform/managed_asset.rs` + `managed-asset://` protokolü: taşınan proje
+  için backend-authoritative, containment/symlink kontrollü asset serving;
+  asset scope genişletilmez.
+- `diagnostics.rs` `SecurityDoctorSummary`: privacy, gateway, config,
+  speaking, locking, asset, audit, backup ve GC sayaçları (PII'siz).
+
+Detaylar: [`docs/PRIVACY_LOGGING_AND_PUBLIC_ERRORS.md`](PRIVACY_LOGGING_AND_PUBLIC_ERRORS.md),
+[`docs/MODEL_GATEWAY_LIMITS_AND_CONFIGURATION.md`](MODEL_GATEWAY_LIMITS_AND_CONFIGURATION.md),
+[`docs/PROJECT_LOCK_AND_PORTABLE_ASSETS.md`](PROJECT_LOCK_AND_PORTABLE_ASSETS.md),
+[`docs/AUDIT_BACKUP_RESTORE_AND_RETENTION.md`](AUDIT_BACKUP_RESTORE_AND_RETENTION.md),
+[`docs/FINAL_SECURITY_RELEASE_AUDIT.md`](FINAL_SECURITY_RELEASE_AUDIT.md).

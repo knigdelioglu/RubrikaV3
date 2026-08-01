@@ -172,7 +172,7 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
                       {renderStatusBadge(job)}
                     </div>
                     {job.status === 'failed' || job.status === 'interrupted' || job.status === 'cancelled' ? (
-                      <p className="job-center__error">{job.error?.message ?? job.lastMessage ?? (job.status === 'cancelled' ? 'İşlem iptal edildi.' : 'İşlem tamamlanamadı.')}</p>
+                      <p className="job-center__error">{job.error?.safeMessage ?? job.lastMessage ?? (job.status === 'cancelled' ? 'İşlem iptal edildi.' : 'İşlem tamamlanamadı.')}</p>
                     ) : (
                       <>
                         <div className="job-center__track" aria-label={`İlerleme: yüzde ${percent}`}>

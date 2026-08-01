@@ -596,6 +596,7 @@ export function StudentAnswerOcrPage() {
                           <div style={{ flex: 1, minHeight: '150px', background: '#f1f5f9', borderRadius: '0.5rem', border: '1px solid #cbd5e1', overflow: 'hidden', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                             <PdfPageViewer
                               imagePath={modelInputImage}
+                              projectId={projectId}
                               pageNumber={record.questionNumber}
                               zoom={0.8}
                               overlayBox={overlayBox}
@@ -706,6 +707,7 @@ export function StudentAnswerOcrPage() {
                                    <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600 }}>Orijinal crop</div>
                                    <PdfPageViewer
                                      imagePath={originalCropImage}
+                                     projectId={projectId}
                                      pageNumber={record.questionNumber}
                                      zoom={0.8}
                                      minimal
@@ -716,6 +718,7 @@ export function StudentAnswerOcrPage() {
                                    <div style={{ fontSize: '0.75rem', color: '#64748b', fontWeight: 600 }}>{selectedComparisonLabel}</div>
                                    <PdfPageViewer
                                      imagePath={selectedComparisonImage}
+                                     projectId={projectId}
                                      pageNumber={record.questionNumber}
                                      zoom={0.8}
                                      minimal

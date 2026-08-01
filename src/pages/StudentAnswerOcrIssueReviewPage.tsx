@@ -769,6 +769,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                     <div style={{ background: '#0f172a', padding: '0.75rem', minHeight: '320px' }}>
                       <PdfPageViewer
                         imagePath={currentRow.record.modelInputCropRef ?? currentRow.record.originalCropRefs?.[0] ?? currentRow.record.cropRefs[0] ?? currentRow.record.preprocessedCropRefs?.[0] ?? currentRow.record.fullPagePreviewRefs[0] ?? null}
+                        projectId={projectId}
                         pageNumber={currentRow.record.questionNumber}
                         zoom={0.95}
                         overlayItems={currentRow.overlayBoxes.map((box) => ({ box, label: currentRow.issueSummary }))}

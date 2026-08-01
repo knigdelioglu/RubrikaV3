@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::time::Duration;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -34,18 +36,69 @@ const STUDENT_IDENTITY_OCR_MAX_TOKENS: u32 = 1024;
 const CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING: &str = "critical_keyword_ocr_uncertain";
 const MIN_STUDENT_ANSWER_OCR_CONFIDENCE: f32 = 0.72;
 
+/// Default upper bound for a single model HTTP response body (bytes).
+///
+/// The body is read with a streaming, bounded reader; a larger body is
+/// rejected with `ModelResponseTooLarge` and never parsed or committed.
+pub const DEFAULT_MAX_RESPONSE_BODY_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Default upper bound for a single model HTTP request body (bytes).
+///
+/// A request that exceeds this limit is rejected before it is sent.
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 128 * 1024 * 1024;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded transport limits for model gateway HTTP calls.
+#[derive(Debug, Clone, Copy)]
+pub struct GatewayLimits {
+    pub max_response_body_bytes: u64,
+    pub max_request_body_bytes: u64,
+    pub connect_timeout: Duration,
+    pub first_byte_timeout: Duration,
+    pub idle_chunk_timeout: Duration,
+}
+
+impl Default for GatewayLimits {
+    fn default() -> Self {
+        Self {
+            max_response_body_bytes: DEFAULT_MAX_RESPONSE_BODY_BYTES,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            connect_timeout: CONNECT_TIMEOUT,
+            first_byte_timeout: FIRST_BYTE_TIMEOUT,
+            idle_chunk_timeout: IDLE_CHUNK_TIMEOUT,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LlamaServerGateway {
     client: Client,
     base_url: String,
+    limits: GatewayLimits,
 }
 
 impl LlamaServerGateway {
     pub fn new(base_url: String) -> Self {
+        Self::new_with_limits(base_url, GatewayLimits::default())
+    }
+
+    pub fn new_with_limits(base_url: String, limits: GatewayLimits) -> Self {
+        let client = Client::builder()
+            .connect_timeout(limits.connect_timeout)
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             base_url,
+            limits,
         }
+    }
+
+    pub fn limits(&self) -> GatewayLimits {
+        self.limits
     }
 
     fn health_url(&self, base_url: &str) -> String {
@@ -64,10 +117,31 @@ impl LlamaServerGateway {
         request_kind: &str,
     ) -> Result<(u16, String, u64), AppError> {
         let url = self.chat_url(base_url);
+        let body_bytes = serde_json::to_vec(&body).map_err(|error| {
+            app_error(
+                AppErrorCode::ModelRequestTooLarge,
+                "Model isteği hazırlanamadı.",
+                Some(format!("request serialization failed: {error}")),
+                Some("İsteği küçültüp yeniden deneyin.".to_string()),
+            )
+        })?;
+        if (body_bytes.len() as u64) > self.limits.max_request_body_bytes {
+            return Err(app_error(
+                AppErrorCode::ModelRequestTooLarge,
+                "Model isteği çok büyük.",
+                Some(format!(
+                    "request_bytes={} limit_bytes={}",
+                    body_bytes.len(),
+                    self.limits.max_request_body_bytes
+                )),
+                Some("Daha az sayıda belge veya görselle yeniden deneyin.".to_string()),
+            ));
+        }
+
         let start = std::time::Instant::now();
         let response = timeout(
             std::time::Duration::from_secs(timeout_seconds),
-            self.client.post(&url).json(&body).send(),
+            self.client.post(&url).body(body_bytes).send(),
         )
         .await
         .map_err(|_| {
@@ -81,17 +155,35 @@ impl LlamaServerGateway {
         .map_err(|error| map_transport_error(error, &url))?;
 
         let status = response.status().as_u16();
-        let body_text = timeout(std::time::Duration::from_secs(30), response.text())
-            .await
-            .map_err(|_| {
-                app_error(
-                    AppErrorCode::ModelTimeout,
-                    "Model yanıtı okunurken zaman aşımı oldu.",
-                    Some(url.clone()),
-                    Some("Yanıt büyük olabilir ya da model takılmış olabilir.".to_string()),
-                )
-            })?
-            .map_err(|error| map_transport_error(error, &url))?;
+
+        if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
+            let value = content_type
+                .to_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let safe = value.contains("json")
+                || value.contains("text/plain")
+                || value.contains("application/octet-stream")
+                || value.contains("*/*")
+                || value.is_empty();
+            if !safe {
+                return Err(app_error(
+                    AppErrorCode::ModelResponseInvalidContentType,
+                    "Model yanıtı beklenen biçimde değil.",
+                    Some(format!("status={status} content_type={value}")),
+                    Some("Model sürümünü kontrol edip yeniden deneyin.".to_string()),
+                ));
+            }
+        }
+
+        let body_text = read_bounded_body(
+            response,
+            self.limits.max_response_body_bytes,
+            self.limits.first_byte_timeout,
+            self.limits.idle_chunk_timeout,
+            &url,
+        )
+        .await?;
 
         Ok((status, body_text, start.elapsed().as_millis() as u64))
     }
@@ -3364,6 +3456,79 @@ fn map_transport_error(error: reqwest::Error, url: &str) -> AppError {
     )
 }
 
+/// Reads a model HTTP response body with a streaming byte cap.
+///
+/// The full body is never accumulated past `max_bytes`. A chunked or
+/// streamed response that exceeds the cap in total is rejected with
+/// `ModelResponseTooLarge`; no partial body is parsed or committed.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    first_byte_timeout: Duration,
+    idle_chunk_timeout: Duration,
+    url: &str,
+) -> Result<String, AppError> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut first = true;
+    loop {
+        let chunk_future = response.chunk();
+        let chunk = if first {
+            timeout(first_byte_timeout, chunk_future)
+                .await
+                .map_err(|_| {
+                    app_error(
+                        AppErrorCode::ModelTimeout,
+                        "Model ilk yanıt baytını gönderemedi.",
+                        Some(format!(
+                            "endpoint={url} first_byte_timeout={:?}",
+                            first_byte_timeout
+                        )),
+                        Some("Model server durumunu kontrol edip yeniden deneyin.".to_string()),
+                    )
+                })?
+        } else {
+            timeout(idle_chunk_timeout, chunk_future)
+                .await
+                .map_err(|_| {
+                    app_error(
+                        AppErrorCode::ModelTimeout,
+                        "Model yanıtı gönderilirken durdu.",
+                        Some(format!(
+                            "endpoint={url} idle_chunk_timeout={:?}",
+                            idle_chunk_timeout
+                        )),
+                        Some("Ağı veya model server durumunu kontrol edin.".to_string()),
+                    )
+                })?
+        }
+        .map_err(|error| map_transport_error(error, url))?;
+        first = false;
+        match chunk {
+            Some(bytes) => {
+                let new_len = body.len() as u64 + bytes.len() as u64;
+                if new_len > max_bytes {
+                    return Err(app_error(
+                        AppErrorCode::ModelResponseTooLarge,
+                        "Model yanıtı çok büyük.",
+                        Some(format!("received_bytes={new_len} limit_bytes={max_bytes}")),
+                        Some("Model çıktı ayarlarını küçültüp yeniden deneyin.".to_string()),
+                    ));
+                }
+                body.extend_from_slice(&bytes);
+            }
+            None => break,
+        }
+    }
+    String::from_utf8(body).map_err(|_| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidJson,
+            "Model yanıtı geçerli metin değil.",
+            Some("model response is not valid UTF-8".to_string()),
+            Some("Model çıktı biçimini kontrol edin.".to_string()),
+        )
+    })
+}
+
 fn build_payload_summary(
     prompt_length: u32,
     timeout_seconds: u64,
@@ -4313,5 +4478,204 @@ mod tests {
             extract_assistant_content(body).unwrap(),
             "{\"segments\":[]}"
         );
+    }
+
+    fn spawn_raw_server(
+        response_head: &'static str,
+        body_chunks: Vec<&'static [u8]>,
+        chunked: bool,
+    ) -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(error) => panic!("failed to bind test server: {error}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let mut head = response_head.to_string();
+                if chunked {
+                    for chunk in body_chunks.iter() {
+                        head.push_str(&format!("{:x}\r\n", chunk.len()));
+                        head.push_str(&String::from_utf8_lossy(chunk));
+                        head.push_str("\r\n");
+                    }
+                    head.push_str("0\r\n\r\n");
+                } else {
+                    let total: usize = body_chunks.iter().map(|chunk| chunk.len()).sum();
+                    head.push_str(&format!("Content-Length: {total}\r\n"));
+                    head.push_str("\r\n");
+                    let _ = stream.write_all(head.as_bytes());
+                    for chunk in body_chunks.iter() {
+                        let _ = stream.write_all(chunk);
+                    }
+                    return;
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Some(format!("http://{}", addr))
+    }
+
+    fn minimal_limits(max_response: u64, max_request: u64) -> GatewayLimits {
+        GatewayLimits {
+            max_response_body_bytes: max_response,
+            max_request_body_bytes: max_request,
+            connect_timeout: Duration::from_secs(5),
+            first_byte_timeout: Duration::from_secs(5),
+            idle_chunk_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn test_response_one_byte_below_limit_is_accepted() {
+        let payload = br#"{"choices":[{"message":{"content":"OK"}}]}"#;
+        let base_url = match spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            vec![payload.as_slice()],
+            false,
+        ) {
+            Some(url) => url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let base = base_url.clone();
+            let gateway = LlamaServerGateway::new_with_limits(
+                base_url,
+                minimal_limits((payload.len() + 1) as u64, 1024 * 1024),
+            );
+            let result = gateway
+                .send_chat_request(&base, json!({"x": 1}), 10, "test")
+                .await
+                .expect("response should be accepted");
+            assert_eq!(result.0, 200);
+            assert!(result.1.contains("OK"));
+        });
+    }
+
+    #[test]
+    fn test_response_one_byte_above_limit_is_rejected_without_raw_body() {
+        let payload = b"{\"choices\":[{\"message\":{\"content\":\"MODEL_SECRET_47bf\"}}]}";
+        let base_url = match spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            vec![payload.as_slice()],
+            false,
+        ) {
+            Some(url) => url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let base = base_url.clone();
+            let gateway = LlamaServerGateway::new_with_limits(
+                base_url,
+                minimal_limits((payload.len() - 1) as u64, 1024 * 1024),
+            );
+            let error = gateway
+                .send_chat_request(&base, json!({"x": 1}), 10, "test")
+                .await
+                .expect_err("response must be rejected");
+            assert_eq!(error.code, AppErrorCode::ModelResponseTooLarge);
+            let serialized = format!("{error:?}");
+            assert!(!serialized.contains("MODEL_SECRET_47bf"));
+        });
+    }
+
+    #[test]
+    fn test_chunked_response_exceeding_total_limit_is_stopped() {
+        let base_url = match spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n",
+            vec![b"aaaaaaaaaa".as_slice(), b"bbbbbbbbbb".as_slice()],
+            true,
+        ) {
+            Some(url) => url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let base = base_url.clone();
+            let gateway =
+                LlamaServerGateway::new_with_limits(base_url, minimal_limits(12, 1024 * 1024));
+            let error = gateway
+                .send_chat_request(&base, json!({"x": 1}), 10, "test")
+                .await
+                .expect_err("chunked body must be rejected once the total cap is crossed");
+            assert_eq!(error.code, AppErrorCode::ModelResponseTooLarge);
+        });
+    }
+
+    #[test]
+    fn test_request_body_over_limit_is_rejected_before_send() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let gateway = LlamaServerGateway::new_with_limits(
+                "http://127.0.0.1:1".to_string(),
+                minimal_limits(1024 * 1024, 8),
+            );
+            let big_body = json!({"prompt": "x".repeat(64)});
+            let error = gateway
+                .send_chat_request("http://placeholder", big_body, 5, "test")
+                .await
+                .expect_err("oversized request must be rejected before any network IO");
+            assert_eq!(error.code, AppErrorCode::ModelRequestTooLarge);
+        });
+    }
+
+    #[test]
+    fn test_oversized_response_never_becomes_ocr_result() {
+        let payload = b"{\"answerText\":\"OCR_SECRET_17ce\",\"confidence\":0.99}";
+        let base_url = match spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n",
+            vec![payload.as_slice()],
+            false,
+        ) {
+            Some(url) => url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let base = base_url.clone();
+            let gateway = LlamaServerGateway::new_with_limits(
+                base_url,
+                minimal_limits((payload.len() - 1) as u64, 1024 * 1024),
+            );
+            let error = gateway
+                .send_chat_request(&base, json!({"x": 1}), 10, "test")
+                .await
+                .expect_err("oversized body must be rejected");
+            assert_eq!(error.code, AppErrorCode::ModelResponseTooLarge);
+        });
+    }
+
+    #[test]
+    fn test_non_json_content_type_is_rejected() {
+        let base_url = match spawn_raw_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n",
+            vec![b"<html>MODEL_SECRET_47bf</html>".as_slice()],
+            false,
+        ) {
+            Some(url) => url,
+            None => return,
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let base = base_url.clone();
+            let gateway = LlamaServerGateway::new_with_limits(
+                base_url,
+                minimal_limits(1024 * 1024, 1024 * 1024),
+            );
+            let error = gateway
+                .send_chat_request(&base, json!({"x": 1}), 10, "test")
+                .await
+                .expect_err("text/html must be rejected");
+            assert_eq!(error.code, AppErrorCode::ModelResponseInvalidContentType);
+            let serialized = format!("{error:?}");
+            assert!(!serialized.contains("MODEL_SECRET_47bf"));
+        });
     }
 }

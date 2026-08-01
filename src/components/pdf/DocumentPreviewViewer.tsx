@@ -9,6 +9,7 @@ type DocumentPreviewViewerProps = {
   previews: PdfPagePreview[];
   initialPage: number;
   onPageChange: (page: number) => void;
+  projectId: string;
 };
 
 export function DocumentPreviewViewer({
@@ -16,6 +17,7 @@ export function DocumentPreviewViewer({
   previews,
   initialPage,
   onPageChange,
+  projectId,
 }: DocumentPreviewViewerProps) {
   const [currentPage, setCurrentPage] = useState(initialPage);
   const [zoom, setZoom] = useState(1);
@@ -72,6 +74,7 @@ export function DocumentPreviewViewer({
       <div className="document-viewer__canvas">
         <PdfPageViewer
           imagePath={currentPreview?.imagePath}
+          projectId={projectId}
           pageNumber={currentPage}
           zoom={zoom}
           fitToPage={fitToPage}

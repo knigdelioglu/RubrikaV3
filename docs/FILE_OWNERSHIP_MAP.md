@@ -92,3 +92,16 @@ Production writer envanteri ve servis başına owned fields [`docs/PROJECTSTORE_
 | Job retry & correlation chain | `JobManager::retry_job` | Terminal işten yeni job ID, `retry_of_job_id` takibi, taze `correlation_id` |
 | History retention cleanup | `JobManager::cleanup_job_history` | Active ve retry-referenced işlerin korunması, top `N` terminal job saklanması |
 | Controlled app shutdown | `JobManager::shutdown_all_jobs` | `accepting_new_jobs = false`, cancel signal ve `Interrupted` rehydration |
+
+## Faz 6 security ownership
+
+| Alan | Tek sahibi | Güvenli yazma sınırı |
+| --- | --- | --- |
+| Proje yazma kilidi (OS) | `platform/project_write_lease.rs` | `flock LOCK_EX|LOCK_NB`; lease olmadan `ProjectStore` writer açılmaz; crash'te OS release |
+| App single-instance | `platform/single_instance.rs` | App-support dizininde OS flock; ikinci instance writer başlatmaz |
+| Audit zinciri | `services/audit_service.rs` | Append-only JSONL + sha256 `previous_record_hash`; kritik karar yazılamazsa fake success yok |
+| Backup/restore | `services/backup_service.rs` | Manifest+hash doğrulama, staging, atomic activation; `root_path` arşivden otorite alınmaz |
+| Generation retention/GC | `services/generation_gc_service.rs` | Protected/referenced asla silinmez; bounded per-run; dry-run plan |
+| Model transport limitleri | `services/llama_server_gateway.rs` | Streaming byte limit, timeout'lar, content-type doğrulaması; raw body loglanmaz |
+| Managed asset serving | `platform/managed_asset.rs` + `managed-asset://` | Yalnız relative managed path; traversal/symlink reddi; 32 MiB bound; scope genişletilmez |
+| Public error DTO | `domain/errors.rs` (`PublicErrorDto`) | `technical_details` Tauri sınırını geçmez; frontend yalnız safe fields alır |
