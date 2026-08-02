@@ -2,6 +2,7 @@ pub mod analysis_commands;
 pub mod app_commands;
 pub mod assessment_organization_commands;
 pub mod backup_commands;
+pub mod diagnostics_commands;
 pub mod document_commands;
 pub mod exam_package_commands;
 pub mod generation_gc_commands;
@@ -42,6 +43,11 @@ pub(crate) fn audit_critical(
     );
     state
         .audit_service
-        .append(Path::new(&project.root_path), input)
+        .append_transactionally(
+            Path::new(&project.root_path),
+            input,
+            project.storage_revision.checked_sub(1),
+            Some(project.storage_revision),
+        )
         .map(|_| ())
 }

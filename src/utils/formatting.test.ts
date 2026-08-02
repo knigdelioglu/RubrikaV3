@@ -3,7 +3,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatPageRange } from './formatting.ts';
+import { formatDate, formatDateTime, formatPageRange } from './formatting.ts';
+
+test('formatDateTime accepts Rust RFC3339 timestamps with microseconds', () => {
+  const formatted = formatDateTime('2026-08-02T20:34:29.902921+00:00');
+
+  assert.ok(formatted);
+  assert.notEqual(formatted, null);
+});
+
+test('invalid timestamps do not throw during project-shell rendering', () => {
+  assert.equal(formatDateTime('not-a-date'), null);
+  assert.equal(formatDate('not-a-date'), 'Tarih bilinmiyor');
+});
 
 test('formatPageRange collapses consecutive pages into ranges', () => {
   assert.equal(formatPageRange([1, 2, 3, 5, 6, 8]), '1-3, 5-6, 8');

@@ -688,8 +688,9 @@ Restore
 → atomic activation → ProjectStore açılış doğrulaması → audit: project_restored
 
 Depolamayı Temizle
-→ run_generation_gc(projectId) → dry-run plan → protected set → bounded delete
-→ metadata commit (student_answer_ocr_generations retain)
+→ run_generation_gc(projectId) → dry-run plan → protected set
+→ canonical metadata commit (student_answer_ocr_generations retain)
+→ latest protected-pointer recheck → bounded filesystem cleanup
 
 Asset Görüntüleme (taşınmış proje)
 → frontend relative managed path → managed-asset://localhost/<projectId>/<rel>
@@ -700,3 +701,41 @@ Faz 1–5 proof'larına ek olarak proof_18–proof_31 semantic kanıtları
 `src-tauri/tests/final_security_proofs.rs`,
 `src-tauri/tests/project_lock_process_fixture.rs` ve
 `src-tauri/tests/speaking_backend_persistence.rs` içindedir.
+
+## Final pre-use data-loss flow
+
+## Integrity recovery flow (2026-08-02)
+
+Read-only source manifest and process check
+→ external complete verified backup
+→ archive reopen, traversal, duplicate, symlink and SHA-256 verification
+→ independent source-restore plus domain/artifact equality
+→ forensic copy
+→ repaired-candidate from verified archive only
+→ immutable historical audit copy plus RecoveryAnchor genesis
+→ active audit chain plus deterministic transaction completion
+→ byte-preserving orphan quarantine when classified safe
+→ audit/revision/speaking/transaction/doctor/full preflight
+→ source remains DO_NOT_OPEN_FOR_WRITING
+
+The frontend safety banner blocks project-page button actions while preflight
+is unavailable or returns DO_NOT_OPEN_FOR_WRITING. A repair action must call
+the recovery-copy job with a new destination; it cannot call repair,
+migration, cleanup, quarantine or audit append against the source path.
+
+```text
+Read-only reference inventory
+→ exact temporary audit copy
+→ DataLossPreflightReport (no migration/recovery writes)
+→ backup verification + active-pointer/orphan checks
+→ only after explicit approval: normal write-capable open
+```
+
+The complete pre-use decision, remaining process-kill/fault-injection gaps and
+the required `SAFE_TO_OPEN*`/`DO_NOT_OPEN_FOR_WRITING` semantics are canonical
+in [`docs/FINAL_PRE_USE_DATA_LOSS_AUDIT.md`](FINAL_PRE_USE_DATA_LOSS_AUDIT.md).
+
+The 11_46 flow currently ends with a verified backup, PASS restore equality and
+PASS real destructive proofs, but `RECOVERED_COPY_NOT_SAFE` because the full
+Cargo/check:all marker is not verified. The source path always ends at
+`DO_NOT_OPEN_FOR_WRITING`.

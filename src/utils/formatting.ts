@@ -1,5 +1,45 @@
+function parseSafeDate(value: string | null | undefined): Date | null {
+  if (!value?.trim()) return null;
+
+  // Rust's RFC3339 formatter may emit more than JavaScript's portable
+  // three-digit millisecond precision. Truncating extra fractional digits
+  // keeps the timestamp valid in older WKWebView implementations too.
+  const normalized = value
+    .trim()
+    .replace(/\.(\d{3})\d+(?=(?:Z|[+-]\d{2}:\d{2})$)/, '.$1');
+  const date = new Date(normalized);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 export function formatDate(isoString: string): string {
-  return new Date(isoString).toLocaleDateString('tr-TR');
+  const date = parseSafeDate(isoString);
+  return date ? date.toLocaleDateString('tr-TR') : 'Tarih bilinmiyor';
+}
+
+export function formatDateTime(value: string | null | undefined): string | null {
+  const date = parseSafeDate(value);
+  if (!date) return null;
+
+  try {
+    return new Intl.DateTimeFormat('tr-TR', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(date);
+  } catch {
+    // Keep rendering safe on older WebViews that do not support dateStyle or
+    // timeStyle even when the date itself is valid.
+    try {
+      return date.toLocaleString('tr-TR', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+    } catch {
+      return null;
+    }
+  }
 }
 
 export function formatPageCount(pageCount?: number | null): string {

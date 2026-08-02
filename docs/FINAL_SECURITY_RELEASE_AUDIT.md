@@ -198,6 +198,20 @@ sırasıyla ~44 MiB ikili set ve ~17.5 MiB DMG).
 
 ## Kalan sınırlamalar
 
+## Integrity recovery and verified-backup delta (2026-08-02)
+
+services/integrity_recovery_service.rs now owns source-preserving recursive
+manifests, backup verification, audit forensics, orphan classification,
+append-only recovery anchoring, recovery-copy generation and explained
+source/candidate diffs. backup_service.rs archives the complete external
+regular-file tree and never writes backup metadata into the source project.
+ProjectRecovery is a separate job kind; its command accepts only a verified
+external archive and a new destination.
+
+The real 11_46 source remains read-only and remains
+DO_NOT_OPEN_FOR_WRITING. The verified backup and repaired candidate evidence
+are recorded in docs/11_46_INTEGRITY_RECOVERY_REPORT.md.
+
 - Tam `cargo test` (tüm hedefler) bu sandbox ortamında 7 model-sunucu
   başlatma testi yüzünden tamamlanamıyor: `model_process_manager` /
   `rubric_extraction_service` / `student_answer_ocr_service` içindeki
@@ -221,3 +235,33 @@ sırasıyla ~44 MiB ikili set ve ~17.5 MiB DMG).
   zenginleştirir; workflow-authoritative proje yükleme ve iş geçmişi
   hataları typed `PublicErrorDto` olarak yayılır ve default readiness'e
   çevrilmez.
+
+## Superseding final pre-use data-loss audit (2026-08-02)
+
+The earlier security-release result above is historical and is not a
+permission to open a real project for writing. The final destructive-operation
+audit is [`FINAL_PRE_USE_DATA_LOSS_AUDIT.md`](FINAL_PRE_USE_DATA_LOSS_AUDIT.md).
+It records the read-only `DataLossPreflightReport`, explicit open/migration
+modes, verified-backup gate, transaction journal, atomic durability, document
+staging/hash verification, audit revision checks, metadata-first GC ordering
+and scoring/teacher-state preservation. The full quality, smoke, release and
+exact-name proof suites are green, with proxy limitations explicitly recorded.
+The real reference project still has an unknown orphan, no verified backup,
+an invalid audit chain and audit/project revision divergence. Therefore the
+current pre-use decision remains `DO_NOT_OPEN_FOR_WRITING`.
+
+## Superseding 11_46 integrity-recovery closure (2026-08-02)
+
+The prior release text above is historical. A verified external backup was
+created and re-opened successfully; the archive SHA-256 is
+`3450757a07f49a05314cff0e9d00e1e8839befe68eb6c88e4d1ec4c865172896`.
+Real child-process process-kill, filesystem-fault and two-process race proofs
+pass. The source remains byte-identical and is still read-only. The source
+orphan remains `UNKNOWN`, and the historical audit remains invalid but is
+anchored only in the repaired candidate.
+
+The release build and Tauri smoke pass, but the full Cargo suite has 6
+loopback-listener model-runtime fixture failures in this environment; hence
+`npm run check:all` exits 101 and no full-validation marker is accepted. The
+repaired candidate decision is `RECOVERED_COPY_NOT_SAFE`; the real source
+decision remains `DO_NOT_OPEN_FOR_WRITING`.

@@ -3,13 +3,15 @@ import React from 'react';
 interface LoadingButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   loading?: boolean;
   disabledReason?: string;
+  projectWrite?: boolean;
 }
 
-export function LoadingButton({ loading, disabledReason, children, ...props }: LoadingButtonProps) {
+export function LoadingButton({ loading, disabledReason, projectWrite = true, children, ...props }: LoadingButtonProps) {
   const isDisabled = loading || props.disabled || !!disabledReason;
   return (
     <button 
       {...props} 
+      data-project-write={projectWrite ? 'true' : 'false'}
       disabled={isDisabled} 
       title={disabledReason}
       style={{

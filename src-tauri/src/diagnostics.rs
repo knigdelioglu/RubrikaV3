@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::domain::document::{DocumentRole, PdfPreviewStatus};
 use crate::domain::errors::{AppError, AppErrorCode};
@@ -51,6 +53,8 @@ pub struct DiagnosticsContext {
 #[serde(rename_all = "camelCase")]
 pub struct DoctorReport {
     pub project_path: String,
+    pub read_only: bool,
+    pub writes_performed: bool,
     pub project_file_exists: bool,
     pub project_readable: bool,
     pub project: Option<ProjectInspectReport>,
@@ -120,6 +124,86 @@ pub struct DoctorReport {
     pub security: SecurityDoctorSummary,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataLossPreflightReport {
+    pub project_path: String,
+    pub read_only: bool,
+    pub read_only_guarantee_verified: bool,
+    pub project_file_exists: bool,
+    pub project_parse_ok: bool,
+    pub project_id: Option<String>,
+    pub storage_revision: Option<u64>,
+    pub project_revision: Option<u64>,
+    pub project_fingerprint: Option<String>,
+    pub source_manifest_hash: String,
+    pub source_byte_changes: u64,
+    pub pending_migration: bool,
+    pub migration_backup_status: String,
+    pub recursive_file_count: u64,
+    pub recursive_byte_count: u64,
+    pub recursive_inventory_sha256: String,
+    pub symlink_count: u64,
+    pub symlink_paths: Vec<String>,
+    pub missing_active_pointer_count: u64,
+    pub missing_referenced_artifact_count: u64,
+    pub broken_active_pointer_count: u64,
+    pub orphan_artifact_count: u64,
+    pub unknown_orphan_count: u64,
+    pub orphan_artifacts: Vec<OrphanArtifactReport>,
+    pub orphan_restore_staging_count: u64,
+    pub unsafe_restore_staging_count: u64,
+    pub unsafe_import_staging_count: u64,
+    pub speaking_audio_without_metadata_count: u64,
+    pub speaking_metadata_without_audio_count: u64,
+    pub recoverable_audio_orphan_count: u64,
+    pub stale_gc_plan_count: u64,
+    pub incomplete_transaction_count: u64,
+    pub ambiguous_transaction_count: u64,
+    pub audit_project_divergence_count: u64,
+    pub active_revision_divergence_count: u64,
+    pub original_audit_status: String,
+    pub active_audit_status: String,
+    pub historical_recovery_anchor_status: String,
+    pub durability_uncertain_count: u64,
+    pub second_writer_detected: bool,
+    pub initialization_write_allowed: bool,
+    pub audit: crate::services::audit_service::AuditChainReport,
+    pub verified_backup_count: u64,
+    pub failed_backup_count: u64,
+    pub backup_paths: Vec<String>,
+    pub latest_verified_backup_path: Option<String>,
+    pub verified_backup_path: Option<String>,
+    pub verified_backup_sha256: Option<String>,
+    pub verified_backup_restore_status: String,
+    pub latest_verified_backup_age: Option<String>,
+    pub process_kill_proofs_status: String,
+    pub disk_fault_proofs_status: String,
+    pub destructive_race_proofs_status: String,
+    pub full_test_suite_green: bool,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub decision: String,
+    pub safe_to_open_for_writing: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanArtifactReport {
+    pub relative_path: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub file_type: String,
+    pub probable_subsystem: String,
+    pub probable_entity_or_generation: Option<String>,
+    pub reason: String,
+    pub indirect_reference_possible: bool,
+    pub teacher_content_possible: bool,
+    pub classification: String,
+    pub recommended_action: String,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -575,6 +659,686 @@ struct DocumentContentFreshAnalysis {
     vision_fallback_needed: bool,
 }
 
+#[derive(Debug, Default)]
+struct PreflightInventory {
+    file_count: u64,
+    byte_count: u64,
+    inventory_sha256: String,
+    symlink_count: u64,
+    symlink_paths: Vec<String>,
+}
+
+fn preflight_inventory(root: &Path) -> Result<PreflightInventory, String> {
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("project root canonicalize failed: {error}"))?;
+    let mut entries = Vec::new();
+    preflight_collect_entries(&root, &root, &mut entries)?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut hasher = Sha256::new();
+    let mut inventory = PreflightInventory::default();
+    let mut symlinks = Vec::new();
+    for (relative, kind, size, digest) in entries {
+        hasher.update(relative.as_bytes());
+        hasher.update([0]);
+        hasher.update(kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(size.to_string().as_bytes());
+        hasher.update([0]);
+        hasher.update(digest.as_bytes());
+        hasher.update([b'\n']);
+        if kind == "file" {
+            inventory.file_count += 1;
+            inventory.byte_count = inventory.byte_count.saturating_add(size);
+        } else if kind == "symlink" {
+            inventory.symlink_count += 1;
+            symlinks.push(relative);
+        }
+    }
+    inventory.inventory_sha256 = hex::encode(hasher.finalize());
+    inventory.symlink_paths = symlinks;
+    Ok(inventory)
+}
+
+fn preflight_collect_entries(
+    root: &Path,
+    directory: &Path,
+    entries: &mut Vec<(String, String, u64, String)>,
+) -> Result<(), String> {
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|error| format!("read_dir {} failed: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("metadata {} failed: {error}", path.display()))?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| format!("inventory path escaped root: {error}"))?
+            .to_string_lossy()
+            .to_string();
+        if metadata.file_type().is_symlink() {
+            entries.push((relative, "symlink".to_string(), 0, "symlink".to_string()));
+        } else if metadata.is_dir() {
+            preflight_collect_entries(root, &path, entries)?;
+        } else if metadata.is_file() {
+            let digest = preflight_sha256_file(&path)?;
+            entries.push((relative, "file".to_string(), metadata.len(), digest));
+        } else {
+            entries.push((
+                relative,
+                "special".to_string(),
+                metadata.len(),
+                "special".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn preflight_sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {} failed: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {} failed: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn preflight_reference_exists(root: &Path, reference: &str) -> bool {
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let path = if Path::new(reference).is_absolute() {
+        PathBuf::from(reference)
+    } else {
+        root.join(reference)
+    };
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    if metadata.file_type().is_symlink() {
+        return false;
+    }
+    path.canonicalize()
+        .map(|canonical| canonical.starts_with(&root))
+        .unwrap_or(false)
+}
+
+fn preflight_missing_active_pointers(root: &Path, project: &Project) -> u64 {
+    let mut missing = 0;
+    for document in &project.documents {
+        if let Some(preview) = document.preview.as_ref() {
+            if let Some(generation_id) = preview.active_generation_id.as_deref() {
+                let path = root
+                    .join("outputs/previews")
+                    .join(&document.id)
+                    .join("generations")
+                    .join(generation_id);
+                if !std::fs::symlink_metadata(path)
+                    .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    missing += 1;
+                }
+            }
+        }
+    }
+    if let Some(run_id) = project.latest_scoring_run_id.as_deref() {
+        if !project
+            .scoring_records
+            .iter()
+            .any(|record| record.run_id == run_id)
+        {
+            missing += 1;
+        }
+    }
+    missing
+}
+
+fn preflight_missing_referenced_artifacts(root: &Path, project: &Project) -> u64 {
+    let mut missing = preflight_missing_active_pointers(root, project);
+    for generation in &project.student_answer_ocr_generations {
+        for record in &generation.result {
+            for reference in record
+                .source_image_refs
+                .iter()
+                .chain(record.crop_refs.iter())
+                .chain(record.original_crop_refs.iter())
+                .chain(record.preprocessed_crop_refs.iter())
+                .chain(record.full_page_preview_refs.iter())
+            {
+                if !reference.trim().is_empty() && !preflight_reference_exists(root, reference) {
+                    missing += 1;
+                }
+            }
+            if let Some(reference) = record.model_input_crop_ref.as_deref() {
+                if !reference.trim().is_empty() && !preflight_reference_exists(root, reference) {
+                    missing += 1;
+                }
+            }
+        }
+    }
+    for exam in &project.speaking_exams {
+        for attempt in &exam.attempts {
+            if let Some(reference) = attempt.audio_path.as_deref() {
+                if !preflight_reference_exists(root, reference) {
+                    missing += 1;
+                }
+            }
+        }
+    }
+    if let Some(run_id) = project.latest_scoring_run_id.as_deref() {
+        if !project
+            .scoring_records
+            .iter()
+            .any(|record| record.run_id == run_id)
+        {
+            missing += 1;
+        }
+    }
+    missing
+}
+
+#[allow(dead_code)]
+fn preflight_orphan_artifacts(root: &Path, project: &Project) -> u64 {
+    let mut orphan_count = 0;
+    let generation_ids = project
+        .student_answer_ocr_generations
+        .iter()
+        .map(|generation| generation.generation_id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let generation_root = root.join("outputs/ocr_generations");
+    if let Ok(entries) = std::fs::read_dir(&generation_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !generation_ids.contains(name))
+            {
+                orphan_count += 1;
+            }
+        }
+    }
+    let referenced_audio = project
+        .speaking_exams
+        .iter()
+        .flat_map(|exam| exam.attempts.iter())
+        .filter_map(|attempt| attempt.audio_path.as_deref())
+        .map(|path| {
+            if Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                root.join(path)
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let speaking_root = root.join("artifacts/speaking-exams");
+    if let Ok(entries) = std::fs::read_dir(&speaking_root) {
+        for entry in entries.flatten() {
+            let audio = entry.path().join("audio-original.wav");
+            if audio.is_file() && !referenced_audio.contains(&audio) {
+                orphan_count += 1;
+            }
+        }
+    }
+    let referenced_documents = project
+        .documents
+        .iter()
+        .map(|document| {
+            if Path::new(&document.stored_path).is_absolute() {
+                PathBuf::from(&document.stored_path)
+            } else {
+                root.join(&document.stored_path)
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let documents_root = root.join("documents");
+    if let Ok(entries) = std::fs::read_dir(&documents_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if std::fs::symlink_metadata(&path)
+                .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                .unwrap_or(false)
+                && !referenced_documents.contains(&path)
+            {
+                orphan_count += 1;
+            }
+        }
+    }
+    orphan_count
+}
+
+fn preflight_orphan_artifact_reports(root: &Path, project: &Project) -> Vec<OrphanArtifactReport> {
+    let mut reports = Vec::new();
+    let generation_ids = project
+        .student_answer_ocr_generations
+        .iter()
+        .map(|generation| generation.generation_id.as_str())
+        .collect::<HashSet<_>>();
+    let generation_root = root.join("outputs/ocr_generations");
+    if let Ok(entries) = std::fs::read_dir(&generation_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_directory = std::fs::symlink_metadata(&path)
+                .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                .unwrap_or(false);
+            let generation_id = path.file_name().and_then(|name| name.to_str());
+            if is_directory && generation_id.is_some_and(|id| !generation_ids.contains(id)) {
+                reports.push(orphan_report(
+                    root,
+                    &path,
+                    "ocr",
+                    generation_id.map(str::to_string),
+                    "Filesystem generation directory is not present in canonical metadata.",
+                    "UNKNOWN",
+                    "KEEP_UNTIL_MANUAL_REVIEW",
+                ));
+            }
+        }
+    }
+
+    let referenced_documents = project
+        .documents
+        .iter()
+        .map(|document| resolve_preflight_reference(root, &document.stored_path))
+        .collect::<HashSet<_>>();
+    let documents_root = root.join("documents");
+    if let Ok(entries) = std::fs::read_dir(&documents_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if metadata.file_type().is_symlink() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if name.starts_with('.') && name.ends_with(".importing") {
+                reports.push(orphan_report(
+                    root,
+                    &path,
+                    "document-import",
+                    None,
+                    "Import staging is not an active canonical document.",
+                    "UNKNOWN",
+                    "KEEP_UNTIL_MANUAL_REVIEW",
+                ));
+            } else if metadata.is_file()
+                && !referenced_documents.contains(&canonical_or_self(&path))
+            {
+                reports.push(orphan_report(
+                    root,
+                    &path,
+                    "document",
+                    None,
+                    "Document file is not referenced by project.documents.",
+                    "UNKNOWN",
+                    "KEEP_UNTIL_MANUAL_REVIEW",
+                ));
+            }
+        }
+    }
+
+    let referenced_audio = project
+        .speaking_exams
+        .iter()
+        .flat_map(|exam| exam.attempts.iter())
+        .filter_map(|attempt| attempt.audio_path.as_deref())
+        .map(|path| resolve_preflight_reference(root, path))
+        .collect::<HashSet<_>>();
+    let speaking_root = root.join("artifacts/speaking-exams");
+    if let Ok(entries) = std::fs::read_dir(&speaking_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let audio = path.join("audio-original.wav");
+            if audio.is_file() && !referenced_audio.contains(&canonical_or_self(&audio)) {
+                reports.push(orphan_report(
+                    root,
+                    &audio,
+                    "speaking",
+                    path.file_name()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_string),
+                    "Finalized audio has no canonical speaking attempt pointer.",
+                    "UNKNOWN",
+                    "KEEP_UNTIL_MANUAL_REVIEW",
+                ));
+            }
+        }
+    }
+    reports
+}
+
+fn orphan_report(
+    root: &Path,
+    path: &Path,
+    subsystem: &str,
+    entity: Option<String>,
+    reason: &str,
+    classification: &str,
+    action: &str,
+) -> OrphanArtifactReport {
+    let metadata = std::fs::symlink_metadata(path).ok();
+    let relative_path = path
+        .strip_prefix(root)
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+    OrphanArtifactReport {
+        relative_path,
+        size: metadata.as_ref().map(|value| value.len()).unwrap_or(0),
+        sha256: metadata
+            .as_ref()
+            .filter(|value| value.is_file())
+            .and_then(|_| preflight_sha256_file(path).ok()),
+        file_type: metadata
+            .map(|value| {
+                if value.file_type().is_symlink() {
+                    "symlink".to_string()
+                } else if value.is_dir() {
+                    "directory".to_string()
+                } else {
+                    "file".to_string()
+                }
+            })
+            .unwrap_or_else(|| "missing".to_string()),
+        probable_subsystem: subsystem.to_string(),
+        probable_entity_or_generation: entity,
+        reason: reason.to_string(),
+        indirect_reference_possible: true,
+        teacher_content_possible: true,
+        classification: classification.to_string(),
+        recommended_action: action.to_string(),
+    }
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolve_preflight_reference(root: &Path, reference: &str) -> PathBuf {
+    if Path::new(reference).is_absolute() {
+        canonical_or_self(Path::new(reference))
+    } else {
+        canonical_or_self(&root.join(reference))
+    }
+}
+
+fn preflight_import_staging_count(root: &Path) -> u64 {
+    std::fs::read_dir(root.join("documents"))
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            name.starts_with('.') && name.ends_with(".importing")
+        })
+        .count() as u64
+}
+
+fn preflight_speaking_artifact_counts(root: &Path) -> (u64, u64) {
+    let mut audio_without_metadata = 0;
+    let mut metadata_without_audio = 0;
+    if let Ok(entries) = std::fs::read_dir(root.join("artifacts/speaking-exams")) {
+        for entry in entries.flatten() {
+            let directory = entry.path();
+            if !directory.is_dir() {
+                continue;
+            }
+            let audio = directory.join("audio-original.wav");
+            let metadata = directory.join("metadata.json");
+            if audio.is_file() && !metadata.is_file() {
+                audio_without_metadata += 1;
+            }
+            if metadata.is_file() && !audio.is_file() {
+                metadata_without_audio += 1;
+            }
+        }
+    }
+    (audio_without_metadata, metadata_without_audio)
+}
+
+fn preflight_backup_inventory(
+    project_path: &Path,
+    project_id: Option<&str>,
+) -> (u64, u64, Vec<String>, Option<String>, Option<String>) {
+    let mut candidates = Vec::new();
+    if let Ok(directory) = crate::services::backup_service::verified_backup_directory(project_path)
+    {
+        candidates.push((directory, true));
+    }
+    // Older in-project archives remain visible as failed/unverified data;
+    // they are never treated as the independent verified backup requirement.
+    candidates.push((project_path.join("outputs/backups"), false));
+
+    let mut verified = 0;
+    let mut failed = 0;
+    let mut paths = Vec::new();
+    let mut latest: Option<(std::time::SystemTime, String)> = None;
+
+    // A repaired candidate carries a read-only reference to the independent
+    // verified archive that produced it.  The reference is not a new backup
+    // and is counted only when the external archive and its receipt still
+    // verify successfully.
+    let recovery_receipt = project_path.join("logs/recovery/verified-backup.manifest.json");
+    if let Ok(content) = std::fs::read_to_string(&recovery_receipt) {
+        if let Ok(receipt) = serde_json::from_str::<
+            crate::services::backup_service::BackupVerificationReceipt,
+        >(&content)
+        {
+            let archive = Path::new(&receipt.archive_path);
+            let valid = archive.is_file()
+                && receipt.archive_sha256 == preflight_sha256_file(archive).unwrap_or_default()
+                && crate::services::backup_service::verify_archive(archive).is_ok()
+                && project_id.map_or(true, |id| receipt.project_id == id);
+            if valid {
+                let path = archive.to_string_lossy().to_string();
+                paths.push(path.clone());
+                verified += 1;
+                if let Ok(modified) =
+                    std::fs::metadata(archive).and_then(|metadata| metadata.modified())
+                {
+                    latest = Some((modified, path));
+                }
+            } else {
+                failed += 1;
+            }
+        } else {
+            failed += 1;
+        }
+    }
+    for (directory, independent) in candidates {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("rbackup") {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                failed += 1;
+                continue;
+            }
+            let path_string = path.to_string_lossy().to_string();
+            paths.push(path_string.clone());
+            let receipt_path = path.with_extension("sha256.json");
+            let valid_receipt = std::fs::symlink_metadata(&receipt_path)
+                .ok()
+                .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+                .and_then(|_| std::fs::read_to_string(&receipt_path).ok())
+                .and_then(|content| {
+                    serde_json::from_str::<
+                            crate::services::backup_service::BackupVerificationReceipt,
+                        >(&content)
+                        .ok()
+                })
+                .is_some_and(|receipt| {
+                    receipt.archive_path == path_string
+                        && receipt.source_project_path == project_path.to_string_lossy().as_ref()
+                        && project_id.map_or(true, |id| receipt.project_id == id)
+                        && receipt.archive_sha256
+                            == preflight_sha256_file(&path).unwrap_or_default()
+                });
+            if independent
+                && valid_receipt
+                && crate::services::backup_service::verify_archive(&path).is_ok()
+            {
+                verified += 1;
+                if let Ok(modified) =
+                    std::fs::metadata(&path).and_then(|metadata| metadata.modified())
+                {
+                    if latest
+                        .as_ref()
+                        .map_or(true, |(current, _)| modified > *current)
+                    {
+                        latest = Some((modified, path_string));
+                    }
+                }
+            } else {
+                failed += 1;
+            }
+        }
+    }
+    paths.sort();
+    let latest_path = latest.as_ref().map(|(_, path)| path.clone());
+    let latest_age = latest.and_then(|(modified, _)| {
+        std::time::SystemTime::now()
+            .duration_since(modified)
+            .ok()
+            .map(|duration| format!("{}s", duration.as_secs()))
+    });
+    (verified, failed, paths, latest_path, latest_age)
+}
+
+fn preflight_second_writer_detected(root: &Path) -> bool {
+    if !root.join(".rubrika.lock").is_file() {
+        return false;
+    }
+    // The active application process may already own this project's lease.
+    // Share that in-process lease before probing the OS lock; otherwise the
+    // read-only preflight reports the current application as a second writer.
+    match crate::platform::project_write_lease::acquire_or_share_existing(root) {
+        Ok(lease) => {
+            drop(lease);
+            false
+        }
+        Err(error) => error.code == AppErrorCode::ProjectAlreadyOpen,
+    }
+}
+
+fn is_pristine_project_for_initialization(project: &Project) -> bool {
+    project.storage_revision == 0
+        && project.sections.is_empty()
+        && project.students.is_empty()
+        && project.school_classes.is_empty()
+        && project.teaching_assignments.is_empty()
+        && project.assessment_activities.is_empty()
+        && project.student_scan_batches.is_empty()
+        && project.student_submissions.is_empty()
+        && project.student_answer_ocr_records.is_empty()
+        && project.student_answer_ocr_generations.is_empty()
+        && project.student_answer_crop_template.items.is_empty()
+        && project.student_answer_crop_template.updated_at.is_none()
+        && project.student_identity_crop_template.is_none()
+        && project.student_scan_document_id.is_none()
+        && project.student_grouping_mode.is_none()
+        && project.student_pages_per_student.is_none()
+        && project.student_grouping_complete_at.is_none()
+        && project.expected_question_count.is_none()
+        && project.exam_package_freeze.is_none()
+        && project.documents.is_empty()
+        && project.questions.is_empty()
+        && project.scoring_records.is_empty()
+        && project.speaking_exams.is_empty()
+        && project.latest_scoring_run_id.is_none()
+}
+
+fn validation_marker_status(path: &str) -> String {
+    let valid = std::fs::read_to_string(path).ok().is_some_and(|content| {
+        content.lines().any(|line| line.trim() == "status=PASS")
+            || content.contains("\"status\":\"PASS\"")
+            || content.contains("\"status\": \"PASS\"")
+    });
+    if valid {
+        "PASS".to_string()
+    } else {
+        "NOT_VERIFIED".to_string()
+    }
+}
+
+fn transaction_preflight_counts(root: &Path) -> (u64, u64) {
+    let Ok(records) = crate::services::transaction_journal::list(root) else {
+        return (1, 1);
+    };
+    let incomplete = records
+        .iter()
+        .filter(|record| !matches!(record.status.as_str(), "complete" | "aborted"))
+        .count() as u64;
+    let ambiguous = records
+        .iter()
+        .filter(|record| {
+            !matches!(record.status.as_str(), "complete" | "aborted")
+                && !matches!(
+                    record.status.as_str(),
+                    "intent" | "project_committed" | "audit_missing" | "durability_uncertain"
+                )
+        })
+        .count() as u64;
+    (incomplete, ambiguous)
+}
+
+fn preflight_restore_staging_count(root: &Path) -> u64 {
+    let mut count = 0;
+    if let Some(parent) = root.parent() {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            count += entries
+                .flatten()
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".rubrika-restore-staging-")
+                })
+                .count() as u64;
+        }
+    }
+    let backups = root.join("outputs/backups");
+    if let Ok(entries) = std::fs::read_dir(backups) {
+        count += entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".staging-"))
+            .count() as u64;
+    }
+    count
+}
+
 fn speaking_doctor_summary(project: Option<&Project>) -> SpeakingDoctorSummary {
     let mut summary = SpeakingDoctorSummary {
         assessment_activity_count: 0,
@@ -775,8 +1539,388 @@ impl DiagnosticsContext {
             .open_project(project_path.to_string_lossy().to_string())
     }
 
+    /// Loads a project for diagnostics without acquiring the writer lease or
+    /// running migration/recovery side effects. Repair commands deliberately
+    /// continue to use `open_project`.
+    pub fn open_project_read_only(&self, project_path: &Path) -> Result<Project, AppError> {
+        ProjectStore::open_project_at_path(project_path)
+    }
+
+    /// Performs the final destructive-operation preflight. This method is
+    /// intentionally independent from the writer-bound ProjectStore session:
+    /// it parses and hashes the selected tree, checks pointers and backups,
+    /// and never migrates, recovers, repairs, or appends an audit record.
+    pub fn data_loss_preflight(
+        &self,
+        project_path: &Path,
+    ) -> Result<DataLossPreflightReport, AppError> {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+        let project_file = project_path.join("project.json");
+        let project_file_exists = project_file.is_file();
+        let inventory = match preflight_inventory(project_path) {
+            Ok(inventory) => inventory,
+            Err(error) => {
+                errors.push(error);
+                PreflightInventory::default()
+            }
+        };
+        let source_manifest =
+            crate::services::integrity_recovery_service::build_source_manifest(project_path).ok();
+        let source_manifest_hash = source_manifest
+            .as_ref()
+            .map(|manifest| manifest.manifest_sha256.clone())
+            .unwrap_or_else(|| inventory.inventory_sha256.clone());
+
+        let project = match ProjectStore::open_project_at_path(project_path) {
+            Ok(project) => Some(project),
+            Err(error) => {
+                if project_file_exists {
+                    errors.push(error.message);
+                } else {
+                    errors.push("project.json missing".to_string());
+                }
+                None
+            }
+        };
+
+        let project_fingerprint = if project_file_exists {
+            preflight_sha256_file(&project_file).ok()
+        } else {
+            None
+        };
+        let after_inventory = preflight_inventory(project_path).ok();
+        let read_only_guarantee_verified = after_inventory.as_ref().is_some_and(|after| {
+            after.inventory_sha256 == inventory.inventory_sha256
+                && after.file_count == inventory.file_count
+                && after.byte_count == inventory.byte_count
+                && after.symlink_count == inventory.symlink_count
+        });
+        if !read_only_guarantee_verified {
+            errors.push(
+                "Salt-okunur preflight açılış zincirinde byte/hash manifesti değişti.".to_string(),
+            );
+        }
+        let after_source_manifest =
+            crate::services::integrity_recovery_service::build_source_manifest(project_path).ok();
+        let source_byte_changes = match (source_manifest.as_ref(), after_source_manifest.as_ref()) {
+            (Some(before), Some(after))
+                if before.byte_manifest_sha256() == after.byte_manifest_sha256() =>
+            {
+                0
+            }
+            (Some(_), Some(_)) => 1,
+            _ => 1,
+        };
+
+        let (project_id, storage_revision, missing_active_pointer_count, orphan_artifacts) =
+            if let Some(project) = project.as_ref() {
+                (
+                    Some(project.id.clone()),
+                    Some(project.storage_revision),
+                    preflight_missing_active_pointers(project_path, project),
+                    preflight_orphan_artifact_reports(project_path, project),
+                )
+            } else {
+                (None, None, 0, Vec::new())
+            };
+        let unknown_orphan_count = orphan_artifacts
+            .iter()
+            .filter(|artifact| artifact.classification == "UNKNOWN")
+            .count() as u64;
+        let missing_referenced_artifact_count = project
+            .as_ref()
+            .map(|value| preflight_missing_referenced_artifacts(project_path, value))
+            .unwrap_or(0);
+
+        let audit = match (
+            self.audit_service.verify_chain(project_path),
+            project.as_ref(),
+        ) {
+            (Ok(_), Some(project)) => self
+                .audit_service
+                .verify_chain_against_project(project_path, project)
+                .unwrap_or_else(|error| crate::services::audit_service::AuditChainReport {
+                    record_count: 0,
+                    chain_valid: false,
+                    tamper_count: 1,
+                    reasons: vec![error.message],
+                    project_revision_divergence_count: 1,
+                    ..Default::default()
+                }),
+            (Ok(report), None) => report,
+            (Err(error), _) => {
+                errors.push(format!("audit verification failed: {}", error.message));
+                crate::services::audit_service::AuditChainReport {
+                    record_count: 0,
+                    chain_valid: false,
+                    tamper_count: 1,
+                    reasons: vec![error.message],
+                    project_revision_divergence_count: 1,
+                    ..Default::default()
+                }
+            }
+        };
+
+        let (
+            verified_backup_count,
+            failed_backup_count,
+            backup_paths,
+            latest_verified_backup_path,
+            latest_verified_backup_age,
+        ) = preflight_backup_inventory(
+            project_path,
+            project.as_ref().map(|value| value.id.as_str()),
+        );
+        if failed_backup_count > 0 {
+            errors.push("Bir veya daha fazla backup arşivi doğrulanamadı.".to_string());
+        }
+
+        let orphan_restore_staging_count = preflight_restore_staging_count(project_path);
+        let unsafe_import_staging_count = preflight_import_staging_count(project_path);
+        let (speaking_audio_without_metadata_count, speaking_metadata_without_audio_count) =
+            project
+                .as_ref()
+                .map(|_| preflight_speaking_artifact_counts(project_path))
+                .unwrap_or((0, 0));
+        let pending_migration =
+            ProjectStore::migration_required_at_path(project_path).unwrap_or(true);
+        let (incomplete_transaction_count, ambiguous_transaction_count) =
+            transaction_preflight_counts(project_path);
+        let audit_project_divergence_count = audit.project_revision_divergence_count;
+        let active_revision_divergence_count = audit.active_revision_divergence_count;
+        let durability_uncertain_count = crate::services::transaction_journal::list(project_path)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter(|record| record.status.contains("durability"))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        let second_writer_detected = preflight_second_writer_detected(project_path);
+        // This marker is deliberately external to the project and is only
+        // produced by the release validation procedure; tests cannot opt in
+        // through an application environment variable.
+        let full_test_suite_green =
+            validation_marker_status("/tmp/RubrikaV3-data-loss-closure-full-validation.green")
+                == "PASS";
+        let process_kill_proofs_status =
+            validation_marker_status("/tmp/RubrikaV3-process-kill-proofs.green");
+        let disk_fault_proofs_status =
+            validation_marker_status("/tmp/RubrikaV3-disk-fault-proofs.green");
+        let destructive_race_proofs_status =
+            validation_marker_status("/tmp/RubrikaV3-destructive-race-proofs.green");
+        let verified_backup_restore_status =
+            validation_marker_status("/tmp/RubrikaV3-11_46-recovery/backup-restore-equality.pass");
+        let verified_backup_sha256 = latest_verified_backup_path
+            .as_deref()
+            .and_then(|path| preflight_sha256_file(Path::new(path)).ok());
+        let recoverable_audio_orphan_count = orphan_artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.classification == "UNKNOWN" && artifact.relative_path.ends_with(".wav")
+            })
+            .count() as u64;
+        // A newly created project has no teacher, student, document, or exam
+        // data that could be lost. Allow only its initial setup writes while
+        // preserving the full preflight gate for every data-bearing project.
+        // The global destructive-proof and restore markers still need to be
+        // valid; only the external backup and full-suite release markers are
+        // intentionally deferred until the project contains real data.
+        let initialization_write_allowed = project.as_ref().is_some_and(|project| {
+            is_pristine_project_for_initialization(project)
+                && read_only_guarantee_verified
+                && source_byte_changes == 0
+                && inventory.symlink_count == 0
+                && missing_active_pointer_count == 0
+                && missing_referenced_artifact_count == 0
+                && orphan_artifacts.is_empty()
+                && orphan_restore_staging_count == 0
+                && unsafe_import_staging_count == 0
+                && speaking_audio_without_metadata_count == 0
+                && speaking_metadata_without_audio_count == 0
+                && incomplete_transaction_count == 0
+                && ambiguous_transaction_count == 0
+                && audit_project_divergence_count == 0
+                && active_revision_divergence_count == 0
+                && durability_uncertain_count == 0
+                && !pending_migration
+                && !second_writer_detected
+                && failed_backup_count == 0
+                && audit.chain_valid
+                && audit.active_audit_status == "VALID"
+                && process_kill_proofs_status == "PASS"
+                && disk_fault_proofs_status == "PASS"
+                && destructive_race_proofs_status == "PASS"
+                && verified_backup_restore_status == "PASS"
+                && errors.is_empty()
+        });
+        if inventory.symlink_count > 0 {
+            warnings.push("Symlink bulundu; yazma işlemi güvenli kabul edilmedi.".to_string());
+        }
+        if missing_active_pointer_count > 0 {
+            warnings
+                .push("Canonical active pointer eksik bir artefakta işaret ediyor.".to_string());
+        }
+        if !orphan_artifacts.is_empty() || orphan_restore_staging_count > 0 {
+            warnings.push(
+                "Yetim artefakt/staging bulundu; önce backup ve kontrollü cleanup gerekir."
+                    .to_string(),
+            );
+        }
+        if verified_backup_count == 0 {
+            warnings.push("Bağımsız doğrulanmış backup bulunamadı.".to_string());
+        }
+        if source_byte_changes > 0 {
+            errors.push("Kaynak byte manifesti işlem boyunca değişti.".to_string());
+        }
+
+        let mut blockers = errors.clone();
+        let critical_conditions = [
+            (project.is_none(), "project parse başarısız"),
+            (
+                !read_only_guarantee_verified,
+                "read-only hash guarantee doğrulanmadı",
+            ),
+            (verified_backup_count == 0, "verified backup yok"),
+            (
+                verified_backup_restore_status != "PASS",
+                "verified backup restore doğrulanmadı",
+            ),
+            (failed_backup_count > 0, "failed/unverified backup var"),
+            (inventory.symlink_count > 0, "symlink bulundu"),
+            (
+                missing_referenced_artifact_count > 0,
+                "missing referenced artifact var",
+            ),
+            (unknown_orphan_count > 0, "unknown orphan var"),
+            (!audit.chain_valid, "audit chain geçersiz"),
+            (
+                audit_project_divergence_count > 0,
+                "audit/project revision divergence var",
+            ),
+            (
+                active_revision_divergence_count > 0,
+                "active audit/project revision divergence var",
+            ),
+            (
+                incomplete_transaction_count > 0,
+                "incomplete transaction var",
+            ),
+            (ambiguous_transaction_count > 0, "ambiguous transaction var"),
+            (pending_migration, "pending migration var"),
+            (unsafe_import_staging_count > 0, "unsafe import staging var"),
+            (
+                orphan_restore_staging_count > 0,
+                "unsafe restore staging var",
+            ),
+            (
+                speaking_metadata_without_audio_count > 0,
+                "speaking metadata/audio mismatch var",
+            ),
+            (second_writer_detected, "ikinci writer aktif"),
+            (
+                process_kill_proofs_status != "PASS",
+                "process-kill proof failure",
+            ),
+            (
+                disk_fault_proofs_status != "PASS",
+                "disk fault proof failure",
+            ),
+            (
+                destructive_race_proofs_status != "PASS",
+                "destructive race proof failure",
+            ),
+            (
+                audit.active_audit_status != "VALID",
+                "active audit chain invalid",
+            ),
+            (!full_test_suite_green, "full validation marker yok"),
+        ];
+        for (condition, reason) in critical_conditions {
+            if condition && !blockers.iter().any(|item| item == reason) {
+                blockers.push(reason.to_string());
+            }
+        }
+        let decision = if !blockers.is_empty() {
+            "DO_NOT_OPEN_FOR_WRITING"
+        } else if !warnings.is_empty() {
+            "SAFE_TO_OPEN_WITH_BACKUP"
+        } else {
+            "SAFE_TO_OPEN"
+        }
+        .to_string();
+        let safe_to_open_for_writing = decision != "DO_NOT_OPEN_FOR_WRITING";
+
+        Ok(DataLossPreflightReport {
+            project_path: project_path.to_string_lossy().to_string(),
+            read_only: true,
+            read_only_guarantee_verified,
+            project_file_exists,
+            project_parse_ok: project.is_some(),
+            project_id,
+            storage_revision,
+            project_revision: storage_revision,
+            project_fingerprint,
+            source_manifest_hash,
+            source_byte_changes,
+            pending_migration,
+            migration_backup_status: if verified_backup_count > 0 {
+                "verified".to_string()
+            } else {
+                "missing".to_string()
+            },
+            recursive_file_count: inventory.file_count,
+            recursive_byte_count: inventory.byte_count,
+            recursive_inventory_sha256: inventory.inventory_sha256,
+            symlink_count: inventory.symlink_count,
+            symlink_paths: inventory.symlink_paths,
+            missing_active_pointer_count,
+            missing_referenced_artifact_count,
+            broken_active_pointer_count: missing_active_pointer_count,
+            orphan_artifact_count: orphan_artifacts.len() as u64,
+            unknown_orphan_count,
+            orphan_artifacts,
+            orphan_restore_staging_count,
+            unsafe_restore_staging_count: orphan_restore_staging_count,
+            unsafe_import_staging_count,
+            speaking_audio_without_metadata_count,
+            speaking_metadata_without_audio_count,
+            recoverable_audio_orphan_count,
+            stale_gc_plan_count: 0,
+            incomplete_transaction_count,
+            ambiguous_transaction_count,
+            audit_project_divergence_count,
+            active_revision_divergence_count,
+            original_audit_status: audit.original_audit_status.clone(),
+            active_audit_status: audit.active_audit_status.clone(),
+            historical_recovery_anchor_status: audit.historical_recovery_anchor_status.clone(),
+            durability_uncertain_count,
+            second_writer_detected,
+            initialization_write_allowed,
+            audit,
+            verified_backup_count,
+            failed_backup_count,
+            backup_paths,
+            latest_verified_backup_path: latest_verified_backup_path.clone(),
+            verified_backup_path: latest_verified_backup_path.clone(),
+            verified_backup_sha256,
+            verified_backup_restore_status,
+            latest_verified_backup_age,
+            process_kill_proofs_status,
+            disk_fault_proofs_status,
+            destructive_race_proofs_status,
+            full_test_suite_green,
+            blockers,
+            warnings,
+            errors,
+            decision: decision.clone(),
+            safe_to_open_for_writing,
+        })
+    }
+
     pub fn inspect_project(&self, project_path: &Path) -> Result<ProjectInspectReport, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         let workflow_snapshot = workflow_engine::evaluate_workflow(&project);
         let mut computed_project = project;
         computed_project.workflow = workflow_snapshot;
@@ -787,7 +1931,7 @@ impl DiagnosticsContext {
         &self,
         project_path: &Path,
     ) -> Result<Vec<DocumentInspectRecord>, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         Ok(document_reports(&project, project_path))
     }
 
@@ -881,20 +2025,13 @@ impl DiagnosticsContext {
         project: &Project,
     ) -> SecurityDoctorSummary {
         let audit = self.audit_service.counters(project_path);
-        let gc_report = crate::platform::project_paths::TrustedProjectRoot::from_canonical_root(
-            std::path::PathBuf::from(&project.root_path),
-            false,
+        let gc_report = crate::services::generation_gc_service::run_generation_gc_transaction(
+            &self.project_store,
+            &project.id,
+            true,
+            &crate::services::generation_gc_service::GenerationGcPolicy::default(),
         )
-        .ok()
-        .and_then(|trusted_root| {
-            crate::services::generation_gc_service::run_generation_gc(
-                &trusted_root,
-                project,
-                true,
-                &crate::services::generation_gc_service::GenerationGcPolicy::default(),
-            )
-            .ok()
-        });
+        .ok();
 
         let active_speaking = project
             .speaking_exams
@@ -985,12 +2122,12 @@ impl DiagnosticsContext {
         &self,
         project_path: &Path,
     ) -> Result<QuestionTextSummary, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         Ok(question_text_summary(&project))
     }
 
     pub fn inspect_rubric(&self, project_path: &Path) -> Result<RubricSummary, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         Ok(rubric_summary(&project))
     }
 
@@ -998,7 +2135,7 @@ impl DiagnosticsContext {
         &self,
         project_path: &Path,
     ) -> Result<ModelInputInspectReport, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         let manifests = ModelInputImageService::load_manifests(Path::new(&project.root_path))?;
         let mut warnings = Vec::new();
         let batches = manifests
@@ -1042,6 +2179,8 @@ impl DiagnosticsContext {
         if !project_file_exists {
             return Ok(DoctorReport {
                 project_path: project_path.to_string_lossy().to_string(),
+                read_only: true,
+                writes_performed: false,
                 project_file_exists: false,
                 project_readable: false,
                 project: None,
@@ -1153,9 +2292,8 @@ impl DiagnosticsContext {
             });
         }
 
-        let (project, load_warnings) = self
-            .project_store
-            .open_project_with_warnings(project_path.to_string_lossy().to_string())?;
+        let project = self.open_project_read_only(project_path)?;
+        let load_warnings = Vec::new();
         let workflow_snapshot = workflow_engine::evaluate_workflow(&project);
         let preview_metadata_exists = project.documents.iter().any(|document| {
             preview_metadata_path(&project, &document.id).is_some_and(|path| path.exists())
@@ -1399,6 +2537,8 @@ impl DiagnosticsContext {
 
         Ok(DoctorReport {
             project_path: project_path.to_string_lossy().to_string(),
+            read_only: true,
+            writes_performed: false,
             project_file_exists: true,
             project_readable: true,
             project: Some({
@@ -1480,7 +2620,7 @@ impl DiagnosticsContext {
         &self,
         project_path: &Path,
     ) -> Result<ReplayReport, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         let mut warnings = Vec::new();
         let rubric_doc = project.documents.iter().find(|document| {
             matches!(
@@ -1630,7 +2770,7 @@ impl DiagnosticsContext {
         &self,
         project_path: &Path,
     ) -> Result<ReplayReport, AppError> {
-        let project = self.open_project(project_path)?;
+        let project = self.open_project_read_only(project_path)?;
         let warnings = Vec::new();
         let exam_source = project
             .documents
@@ -4244,6 +5384,254 @@ BAŞARILAR...";
             .any(|warning| warning.contains("legacy or unreadable document content metadata")));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn data_loss_preflight_is_read_only_for_legacy_project_shape() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project("Preflight".to_string(), root.to_string_lossy().to_string())
+            .expect("create project");
+        let mut raw = serde_json::to_value(project).expect("serialize project");
+        let object = raw.as_object_mut().expect("project object");
+        object.remove("schoolClasses");
+        object.remove("studentScanBatches");
+        let project_file = root.join("project.json");
+        std::fs::write(
+            &project_file,
+            serde_json::to_string_pretty(&raw).expect("serialize legacy project"),
+        )
+        .expect("write legacy project");
+        let before = std::fs::read(&project_file).expect("read before preflight");
+
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+
+        assert!(report.read_only);
+        assert!(report.project_parse_ok);
+        assert_eq!(
+            std::fs::read(&project_file).expect("read after preflight"),
+            before
+        );
+        assert_eq!(
+            std::fs::read_dir(&root)
+                .expect("read root")
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("project.json.migration.")
+                })
+                .count(),
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn data_loss_preflight_does_not_report_current_process_as_second_writer() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Current process lease".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        assert!(is_pristine_project_for_initialization(&project));
+        let mut populated = project.clone();
+        populated.storage_revision = 1;
+        assert!(!is_pristine_project_for_initialization(&populated));
+
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+
+        assert!(!report.second_writer_detected);
+        assert!(!report
+            .blockers
+            .iter()
+            .any(|reason| reason == "ikinci writer aktif"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn data_loss_preflight_detects_missing_referenced_artifact() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let mut project = store
+            .create_project(
+                "Preflight pointer".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        project.latest_scoring_run_id = Some("missing-run".to_string());
+        store.save_project(&project).expect("save pointer");
+        let before = std::fs::read(root.join("project.json")).expect("read before preflight");
+
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+
+        assert!(report.read_only);
+        assert_eq!(report.missing_active_pointer_count, 1);
+        assert_eq!(report.decision, "DO_NOT_OPEN_FOR_WRITING");
+        assert_eq!(
+            std::fs::read(root.join("project.json")).expect("read after preflight"),
+            before
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proof_32_reference_project_is_never_modified_by_audit() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store
+            .create_project(
+                "Read-only audit".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        let before = preflight_inventory(&root).expect("inventory before");
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("read-only preflight");
+        let after = preflight_inventory(&root).expect("inventory after");
+        assert!(report.read_only);
+        assert_eq!(before.inventory_sha256, after.inventory_sha256);
+        assert_eq!(before.file_count, after.file_count);
+        assert_eq!(before.byte_count, after.byte_count);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proof_46_preflight_detects_missing_referenced_artifact() {
+        data_loss_preflight_detects_missing_referenced_artifact();
+    }
+
+    #[test]
+    fn proof_47_audit_and_project_revision_cannot_silently_diverge() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Revision divergence".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        store
+            .mutate(
+                &project.id,
+                crate::services::project_store::MutationOptions::new("unpaired_project_change"),
+                |current, _| {
+                    current.expected_question_count = Some(1);
+                    Ok(())
+                },
+            )
+            .expect("project mutation");
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+        assert!(report.audit_project_divergence_count > 0);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|reason| reason == "audit/project revision divergence var"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proof_49_read_only_project_open_changes_zero_bytes() {
+        proof_32_reference_project_is_never_modified_by_audit();
+    }
+
+    #[test]
+    fn proof_50_migration_requires_verified_backup() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Legacy migration".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        let mut value = serde_json::to_value(project).expect("project json");
+        value
+            .as_object_mut()
+            .expect("project object")
+            .remove("storageRevision");
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::to_string_pretty(&value).expect("legacy json"),
+        )
+        .expect("write legacy shape");
+        let error = ProjectStore::new()
+            .open_project(root.to_string_lossy().to_string())
+            .expect_err("normal open must not migrate");
+        assert_eq!(error.code, AppErrorCode::ProjectMigrationRequired);
+        assert!(!root.join("project.json.migration.bak").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proof_57_unknown_orphan_blocks_safe_to_open() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store
+            .create_project(
+                "Unknown orphan".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        std::fs::create_dir_all(root.join("outputs/ocr_generations/unclaimed-generation"))
+            .expect("orphan directory");
+        std::fs::write(
+            root.join("outputs/ocr_generations/unclaimed-generation/result.json"),
+            b"unclaimed",
+        )
+        .expect("orphan payload");
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+        assert!(report.unknown_orphan_count > 0);
+        assert_eq!(report.decision, "DO_NOT_OPEN_FOR_WRITING");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proof_58_incomplete_audit_transaction_blocks_safe_to_open() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Incomplete transaction".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("create project");
+        crate::services::transaction_journal::begin(
+            &root,
+            &project.id,
+            "proof_incomplete",
+            "corr-proof-58",
+            Some(0),
+            Some(1),
+        )
+        .expect("journal intent");
+        let report = DiagnosticsContext::new()
+            .data_loss_preflight(&root)
+            .expect("preflight");
+        assert_eq!(report.incomplete_transaction_count, 1);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|reason| reason == "incomplete transaction var"));
+        assert_eq!(report.decision, "DO_NOT_OPEN_FOR_WRITING");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

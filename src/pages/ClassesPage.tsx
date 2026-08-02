@@ -11,6 +11,7 @@ import { LoadingButton } from '../components/common/LoadingButton';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { useProjectContext } from '../state/useProjectContext';
 import { ClassStudentRosterPage } from './ClassStudentRosterPage';
+import { getClassesSetupTargetId } from './classesUi';
 
 type ClassDraft = {
   academicYear: string;
@@ -45,6 +46,7 @@ export function ClassesPage() {
   const [error, setError] = useState<AppError | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'classes' | 'roster'>('classes');
+  const setupParam = searchParams.get('setup');
 
   const classesQuery = useQuery({
     queryKey: ['school-classes', projectId, 'all'],
@@ -93,18 +95,14 @@ export function ClassesPage() {
 
   // Auto scroll effect for ?setup=course | classes | assignments
   useEffect(() => {
-    const setupParam = searchParams.get('setup');
-    if (!setupParam) return;
+    const targetId = getClassesSetupTargetId(setupParam);
+    if (!targetId) return;
     setActiveTab('classes');
-    const targetId = setupParam === 'course'
-      ? 'setup-step-course'
-      : setupParam === 'classes'
-        ? 'setup-step-classes'
-        : 'setup-step-assignments';
-    setTimeout(() => {
+    const timeoutId = window.setTimeout(() => {
       document.getElementById(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 150);
-  }, [searchParams]);
+    return () => window.clearTimeout(timeoutId);
+  }, [setupParam]);
 
   const refresh = async () => {
     await Promise.all([
@@ -113,6 +111,7 @@ export function ClassesPage() {
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] }),
       queryClient.invalidateQueries({ queryKey: ['teaching-assignments', projectId] }),
       queryClient.invalidateQueries({ queryKey: ['assessment-activities', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['data-loss-preflight', projectPath] }),
     ]);
   };
 

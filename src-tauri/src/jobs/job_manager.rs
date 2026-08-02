@@ -210,6 +210,7 @@ impl JobManager {
         };
 
         jobs.insert(job_id.clone(), snapshot.clone());
+        let idempotency_key = key.clone();
         idempotency_map.insert(key, job_id.clone());
         drop(idempotency_map);
         drop(jobs);
@@ -217,10 +218,30 @@ impl JobManager {
         let token = CancellationToken::new();
         self.task_tokens
             .lock()
-            .unwrap()
+            .map_err(|error| AppError {
+                code: AppErrorCode::UnknownError,
+                message: "Job cancellation state could not be initialized.".to_string(),
+                recoverable: false,
+                suggested_action: None,
+                technical_details: Some(error.to_string()),
+                correlation_id: snapshot.correlation_id.clone(),
+            })?
             .insert(job_id.clone(), token.clone());
 
-        self.persist_snapshot(&snapshot)?;
+        if let Err(error) = self.persist_snapshot(&snapshot) {
+            if let Ok(mut jobs) = self.jobs.lock() {
+                jobs.remove(&job_id);
+            }
+            if let Ok(mut idempotency_map) = self.idempotency_map.lock() {
+                if idempotency_map.get(&idempotency_key) == Some(&job_id) {
+                    idempotency_map.remove(&idempotency_key);
+                }
+            }
+            if let Ok(mut tokens) = self.task_tokens.lock() {
+                tokens.remove(&job_id);
+            }
+            return Err(error);
+        }
 
         let _ = app.emit(
             "job_queued",
@@ -377,14 +398,19 @@ impl JobManager {
             return Ok(job.clone());
         }
 
+        let previous = job.clone();
         let now = chrono::Utc::now().to_rfc3339();
         job.cancellation_requested = true;
         job.cancellation_requested_at = Some(now.clone());
         job.updated_at = now;
         let snapshot = job.clone();
+        if let Err(error) = self.persist_snapshot(&snapshot) {
+            if let Some(job) = jobs.get_mut(job_id) {
+                *job = previous;
+            }
+            return Err(error);
+        }
         drop(jobs);
-
-        self.persist_snapshot(&snapshot)?;
 
         if let Some(token) = self.get_cancellation_token(job_id) {
             token.cancel();
@@ -576,7 +602,14 @@ impl JobManager {
             correlation_id: Uuid::new_v4().to_string(),
         })?;
 
-        let task_tokens = self.task_tokens.lock().unwrap();
+        let task_tokens = self.task_tokens.lock().map_err(|error| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Job cancellation state could not be read.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(error.to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
         let mut updated_snapshots = Vec::new();
 
         for mut snapshot in persisted {
@@ -591,6 +624,7 @@ impl JobManager {
                 snapshot.last_message =
                     Some("Uygulama yeniden başlatıldığı için işlem yarıda kaldı.".to_string());
                 snapshot.updated_at = now.clone();
+                self.persist_snapshot(&snapshot)?;
                 updated_snapshots.push(snapshot.clone());
             }
 
@@ -598,7 +632,14 @@ impl JobManager {
                 if snapshot.status.is_active() {
                     self.idempotency_map
                         .lock()
-                        .unwrap()
+                        .map_err(|error| AppError {
+                            code: AppErrorCode::UnknownError,
+                            message: "Job idempotency state could not be updated.".to_string(),
+                            recoverable: false,
+                            suggested_action: None,
+                            technical_details: Some(error.to_string()),
+                            correlation_id: snapshot.correlation_id.clone(),
+                        })?
                         .insert(key.clone(), job_id.clone());
                 }
             }
@@ -608,10 +649,6 @@ impl JobManager {
 
         drop(task_tokens);
         drop(jobs);
-
-        for snapshot in &updated_snapshots {
-            let _ = self.persist_snapshot(snapshot);
-        }
 
         Ok(updated_snapshots)
     }
@@ -792,12 +829,17 @@ impl JobManager {
             correlation_id: Uuid::new_v4().to_string(),
         })?;
 
+        let previous = job.clone();
         updater(job);
         job.updated_at = chrono::Utc::now().to_rfc3339();
         let snapshot = job.clone();
-        drop(jobs);
-
-        self.persist_snapshot(&snapshot)
+        if let Err(error) = self.persist_snapshot(&snapshot) {
+            if let Some(job) = jobs.get_mut(job_id) {
+                *job = previous;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn cleanup_task_handle(&self, job_id: &str) {

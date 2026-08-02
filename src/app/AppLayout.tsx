@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { BarChart3, Bell, BriefcaseBusiness, ChevronDown, ClipboardList, FolderOpen, Home, Menu, Settings, Users, X } from 'lucide-react';
@@ -8,9 +8,17 @@ import { useProjectContext } from '../state/useProjectContext';
 import { getActiveJobs, getFailedJobs, getPartialJobs, getJobCenterButtonLabel, getJobLabel, getJobProgressPercent } from './globalJobs';
 import { getProjectArea, getProjectIdFromPathname, projectNavigation } from './projectRoutes';
 import { shouldShowProjectNavigation } from './assessmentMode';
-import type { JobSnapshot, ProjectListItem } from '../api/types';
+import type { AssessmentActivity, DataLossPreflightReport, JobSnapshot, ProjectListItem } from '../api/types';
 import { setActiveProject } from '../state/projectSession';
 import { projectOverviewPath } from './projectRoutes';
+import { isProjectWriteBlocked } from './projectSafety';
+import { formatDateTime } from '../utils/formatting';
+import {
+  formatAssessmentOption,
+  getAssessmentActivityIdFromLocation,
+  getProjectSwitcherContextLabel,
+  projectActivityPath,
+} from './projectSwitcher';
 
 const navIcons: Record<string, ReactNode> = {
   overview: <Home size={18} aria-hidden="true" />,
@@ -20,9 +28,23 @@ const navIcons: Record<string, ReactNode> = {
   settings: <Settings size={18} aria-hidden="true" />,
 };
 
-function ProjectSwitcher({ projectId }: { projectId: string }) {
+function ProjectSwitcher({
+  projectId,
+  projectName,
+  activities,
+  activitiesLoading,
+}: {
+  projectId: string;
+  projectName?: string;
+  activities: AssessmentActivity[];
+  activitiesLoading: boolean;
+}) {
+  const switcherRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false);
+  const location = useLocation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const activeActivityId = getAssessmentActivityIdFromLocation(location.pathname, location.search);
   const projectsQuery = useQuery({
     queryKey: ['projects'],
     queryFn: commands.listProjects,
@@ -39,23 +61,121 @@ function ProjectSwitcher({ projectId }: { projectId: string }) {
     },
   });
 
+  useEffect(() => {
+    if (!open) return undefined;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !switcherRef.current?.contains(event.target)) setOpen(false);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [open]);
+
+  const selectedProjectName = projectName ?? projectsQuery.data?.projects.find((project) => project.id === projectId)?.name ?? 'Ders alanı';
+  const contextLabel = getProjectSwitcherContextLabel(activities, activeActivityId, activitiesLoading);
+
+  const selectActivity = (activity: AssessmentActivity) => {
+    setOpen(false);
+    navigate(projectActivityPath(projectId, activity));
+  };
+
   return (
-    <label className="project-switcher" title="Ders alanını değiştir">
-      <FolderOpen size={16} aria-hidden="true" />
-      <span className="sr-only">Ders alanı seç</span>
-      <select
-        value={projectId}
+    <div ref={switcherRef} className="project-switcher">
+      <button
+        type="button"
+        className="project-switcher__trigger"
+        onClick={() => setOpen((current) => !current)}
         disabled={openMutation.isPending}
-        onChange={(event) => {
-          const project = projectsQuery.data?.projects.find((item) => item.id === event.target.value);
-          if (project && project.id !== projectId) openMutation.mutate(project);
-        }}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-controls="project-switcher-panel"
+        title={`${selectedProjectName} · ${contextLabel}`}
       >
-        {projectsQuery.data?.projects.map((project) => (
-          <option key={project.id} value={project.id}>{project.name}</option>
-        ))}
-      </select>
-    </label>
+        <FolderOpen size={16} aria-hidden="true" />
+        <span className="project-switcher__trigger-text">
+          <strong>{selectedProjectName}</strong>
+          <small>{contextLabel}</small>
+        </span>
+        <ChevronDown size={15} aria-hidden="true" />
+      </button>
+      {open && (
+        <section id="project-switcher-panel" className="project-switcher__panel" role="dialog" aria-label="Ders alanı ve sınav seçimi">
+          <div className="project-switcher__heading">
+            <div>
+              <strong>Ders alanı ve sınav seç</strong>
+              <span>Dönem ve sınav sırası burada açıkça görünür.</span>
+            </div>
+            <button type="button" className="icon-button" onClick={() => setOpen(false)} aria-label="Seçiciyi kapat">
+              <X size={18} />
+            </button>
+          </div>
+
+          <div className="project-switcher__section">
+            <span className="project-switcher__section-label">Ders alanları</span>
+            <div className="project-switcher__list">
+              {(projectsQuery.data?.projects ?? []).map((project) => (
+                <button
+                  key={project.id}
+                  type="button"
+                  className={`project-switcher__item ${project.id === projectId ? 'is-selected' : ''}`}
+                  onClick={() => {
+                    if (project.id === projectId) {
+                      setOpen(false);
+                      return;
+                    }
+                    openMutation.mutate(project);
+                  }}
+                  disabled={openMutation.isPending}
+                >
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.id === projectId ? 'Açık ders alanı' : 'Ders alanını aç'}</small>
+                  </span>
+                  {project.id === projectId && <span className="project-switcher__check" aria-label="Seçili">✓</span>}
+                </button>
+              ))}
+              {projectsQuery.isLoading && <p className="project-switcher__empty">Ders alanları yükleniyor…</p>}
+              {!projectsQuery.isLoading && (projectsQuery.data?.projects.length ?? 0) === 0 && (
+                <p className="project-switcher__empty">Açılabilir başka ders alanı yok.</p>
+              )}
+            </div>
+          </div>
+
+          <div className="project-switcher__section">
+            <span className="project-switcher__section-label">Bu ders alanındaki sınavlar</span>
+            <div className="project-switcher__list">
+              {activitiesLoading && <p className="project-switcher__empty">Sınavlar yükleniyor…</p>}
+              {!activitiesLoading && activities.map((activity) => (
+                <button
+                  key={activity.id}
+                  type="button"
+                  className={`project-switcher__item ${activity.id === activeActivityId ? 'is-selected' : ''}`}
+                  onClick={() => selectActivity(activity)}
+                >
+                  <span>
+                    <strong>{formatAssessmentOption(activity)}</strong>
+                    <small>{activity.courseName || activity.title || 'Sınav'}</small>
+                  </span>
+                  {activity.id === activeActivityId && <span className="project-switcher__check" aria-label="Seçili">✓</span>}
+                </button>
+              ))}
+              {!activitiesLoading && activities.length === 0 && (
+                <p className="project-switcher__empty">Bu ders alanında henüz sınav oluşturulmadı.</p>
+              )}
+            </div>
+          </div>
+
+          {openMutation.isError && <p className="project-switcher__error" role="alert">Ders alanı açılamadı. Lütfen tekrar deneyin.</p>}
+        </section>
+      )}
+    </div>
   );
 }
 
@@ -212,9 +332,83 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
   );
 }
 
+function preflightReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    'verified backup yok': 'Bağımsız doğrulanmış yedek bulunamadı.',
+    'failed/unverified backup var': 'Doğrulanamayan bir yedek bulundu.',
+    'unknown orphan var': 'Ne olduğu doğrulanamayan artık dosyalar bulundu.',
+    'missing referenced artifact var': 'Kayıtlı bir dosya başvurusu eksik.',
+    'pending migration var': 'Proje için açıkça onaylanmış göç gerekiyor.',
+    'incomplete transaction var': 'Tamamlanmamış bir kayıt işlemi bulundu.',
+    'ambiguous transaction var': 'Son kayıt işleminin sonucu kesinleştirilemedi.',
+    'audit chain geçersiz': 'İşlem geçmişi doğrulanamadı.',
+    'audit/project revision divergence var': 'Proje ve işlem geçmişi aynı revision’da değil.',
+    'active audit/project revision divergence var': 'Aktif işlem geçmişi mevcut proje durumu ile eşleşmiyor.',
+    'active audit chain invalid': 'Aktif işlem geçmişi güvenli yazma için doğrulanamadı.',
+    'verified backup restore doğrulanmadı': 'Yedek alındı; restore eşitliği henüz doğrulanmadı.',
+    'process-kill proof failure': 'Ani işlem sonlandırma dayanıklılık kanıtı tamamlanmadı.',
+    'disk fault proof failure': 'Disk/izin arızası dayanıklılık kanıtı tamamlanmadı.',
+    'destructive race proof failure': 'Eşzamanlı işlem yarış kanıtı tamamlanmadı.',
+    'source byte manifest changed': 'Kaynak dosya bütünü doğrulama sırasında değişti.',
+    'Kaynak byte manifesti işlem boyunca değişti.': 'Kaynak dosya bütünü doğrulama sırasında değişti.',
+    'speaking metadata/audio mismatch var': 'Ses kaydı ile konuşma kaydı eşleşmiyor.',
+    'read-only hash guarantee doğrulanmadı': 'Okuma ön kontrolü sırasında dosya bütünü doğrulanamadı.',
+    'full validation marker yok': 'Tam doğrulama süiti henüz yeşil olarak işaretlenmedi.',
+    'symlink bulundu': 'Proje içinde güvenli olmayan sembolik bağ bulundu.',
+    'unsafe import staging var': 'Yarım kalmış içe aktarma bulundu.',
+    'unsafe restore staging var': 'Yarım kalmış geri yükleme bulundu.',
+    'ikinci writer aktif': 'Proje başka bir yazıcı işlem tarafından kullanılıyor.',
+  };
+  return labels[reason] ?? 'Veri güvenliği ön koşulu sağlanmadı.';
+}
+
+function ProjectSafetyBanner({ report, loading, failed }: {
+  report?: DataLossPreflightReport;
+  loading: boolean;
+  failed: boolean;
+}) {
+  if (loading) {
+    return <div className="project-safety-banner project-safety-banner--pending" role="status">Veri güvenliği ön kontrolü yapılıyor…</div>;
+  }
+  if (failed || !report) {
+    return <div className="project-safety-banner project-safety-banner--blocked" role="alert">
+      <strong>Yazma işlemleri koruma amacıyla bekletiliyor.</strong>
+      <span>Veri güvenliği ön kontrolü alınamadı. Taslaklarınız korunur; doğrulama tamamlanmadan kaydetme işlemi yapılmaz.</span>
+    </div>;
+  }
+  if (report.initializationWriteAllowed) {
+    return <div className="project-safety-banner project-safety-banner--warning" role="status">
+      <strong>Yeni ders alanı ilk kuruluma hazır.</strong>
+      <span>Bu alan henüz sınav, belge veya öğrenci verisi içermiyor; temel kurulum işlemlerine izin verildi. İlk veri eklendikten sonra normal veri güvenliği kontrolleri uygulanır.</span>
+    </div>;
+  }
+  if (report.decision === 'DO_NOT_OPEN_FOR_WRITING') {
+    return <div className="project-safety-banner project-safety-banner--blocked" role="alert">
+      <strong>Bu ders alanı yazmaya güvenli açılmadı.</strong>
+      <span>Önce doğrulanmış bağımsız yedek alın ve aşağıdaki koşulları giderin. Açık form taslakları silinmez.</span>
+      <span>
+        {report.verifiedBackupRestoreStatus === 'PASS'
+          ? 'Doğrulanmış yedek restore eşitliği: hazır.'
+          : 'Doğrulanmış yedek restore eşitliği: doğrulama bekliyor.'}
+        {report.verifiedBackupPath ? ' Yedek: ' + report.verifiedBackupPath : ''}
+      </span>
+      <ul>
+        {report.blockers.slice(0, 4).map((reason) => <li key={reason}>{preflightReasonLabel(reason)}</li>)}
+      </ul>
+    </div>;
+  }
+  if (report.decision === 'SAFE_TO_OPEN_WITH_BACKUP') {
+    return <div className="project-safety-banner project-safety-banner--warning" role="status">
+      <strong>Yazma öncesi yedek öneriliyor.</strong>
+      <span>Ön kontrol tamamlandı; güvenli çalışma için doğrulanmış yedeği güncel tutun.</span>
+    </div>;
+  }
+  return <div className="project-safety-banner project-safety-banner--safe" role="status"><strong>Veri güvenliği ön kontrolü başarılı.</strong></div>;
+}
+
 export function AppLayout({ children }: { children: ReactNode }) {
   const location = useLocation();
-  const { projectId: contextProjectId } = useProjectContext();
+  const { projectId: contextProjectId, projectPath } = useProjectContext();
   const routeProjectId = getProjectIdFromPathname(location.pathname);
   const projectId = routeProjectId || contextProjectId;
   const [navigationOpen, setNavigationOpen] = useState(false);
@@ -223,19 +417,24 @@ export function AppLayout({ children }: { children: ReactNode }) {
     || location.pathname === '/project-create'
     || location.pathname === '/projects/new';
 
-  const { data: project } = useQuery({
+  const { data: project, isLoading: projectLoading } = useQuery({
     queryKey: ['project-snapshot', projectId],
     queryFn: () => commands.getProjectSnapshot(projectId),
     enabled: !isGlobalPage && !!projectId,
+  });
+
+  const preflightQuery = useQuery({
+    queryKey: ['data-loss-preflight', projectPath],
+    queryFn: () => commands.getDataLossPreflight(projectPath),
+    enabled: !isGlobalPage && !!projectPath,
+    staleTime: 5_000,
   });
 
   if (isGlobalPage) return <>{children}</>;
 
   const activeArea = getProjectArea(location.pathname);
   const showProjectNavigation = shouldShowProjectNavigation(location.pathname);
-  const updatedAt = project?.updatedAt
-    ? new Intl.DateTimeFormat('tr-TR', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(project.updatedAt))
-    : null;
+  const updatedAt = formatDateTime(project?.updatedAt);
 
   return (
     <div className="app-shell">
@@ -288,14 +487,41 @@ export function AppLayout({ children }: { children: ReactNode }) {
             </div>
           </div>
           <div className="project-header__actions">
-            {projectId && <ProjectSwitcher projectId={projectId} />}
+            {projectId && (
+              <ProjectSwitcher
+                projectId={projectId}
+                projectName={project?.name}
+                activities={project?.assessmentActivities ?? []}
+                activitiesLoading={projectLoading}
+              />
+            )}
             {projectId && <GlobalJobCenter projectId={projectId} />}
             <button type="button" className="icon-button" aria-label="Bildirimler" title="Bildirimler">
               <Bell size={19} />
             </button>
                       </div>
         </header>
-        <main className="project-content">{children}</main>
+        <main
+          className="project-content"
+          onClickCapture={(event) => {
+            const target = event.target;
+            if (!(target instanceof Element)) return;
+            const button = target.closest('button');
+            const blocked = isProjectWriteBlocked(preflightQuery.data, {
+              isLoading: preflightQuery.isLoading,
+              isError: preflightQuery.isError,
+            });
+            const isProjectWrite = button
+              && button.getAttribute('data-project-write') !== 'false';
+            if (isProjectWrite && blocked) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+          }}
+        >
+          {showProjectNavigation && <ProjectSafetyBanner report={preflightQuery.data} loading={preflightQuery.isLoading} failed={preflightQuery.isError} />}
+          {children}
+        </main>
       </div>
     </div>
   );

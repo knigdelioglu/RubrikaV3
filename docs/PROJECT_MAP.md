@@ -216,6 +216,24 @@ Ayrıntılı job envanteri, iptal noktaları ve UI event sözleşmesi için [`do
 
 ## Faz 6 — final security, privacy, audit, backup/restore ve GC
 
+## Integrity recovery map (2026-08-02)
+
+- integrity_recovery_service.rs: read-only source manifest, archive
+  verification, audit/orphan forensics, recovery anchor and explained diff.
+- backup_service.rs: complete external verified regular-file archive,
+  per-entry hash verification, atomic staging/restore.
+- transaction_journal.rs: incomplete/ambiguous transaction classification;
+  ambiguous state blocks writing.
+- bin/rubrika.rs: backup-create, backup-verify, restore-copy, verify-restore,
+  audit-forensics, classify-orphans, recover-copy, recovery-diff and
+  read-only preflight.
+- tests/final_data_loss_proofs.rs: real SIGKILL child fixtures, filesystem
+  fault fixtures and two-process lease/restore races.
+
+Recovery writes are permitted only below a new destination created from a
+verified external backup. The source project is never opened in writable mode
+by these flows.
+
 - `platform/project_write_lease.rs`: OS `flock` tabanlı `ProjectWriteLease` +
   process içi paylaşım (`acquire_or_share`); ikinci OS process
   `ProjectAlreadyOpen` alır. `platform/single_instance.rs`: app-level flock
@@ -243,3 +261,23 @@ Detaylar: [`docs/PRIVACY_LOGGING_AND_PUBLIC_ERRORS.md`](PRIVACY_LOGGING_AND_PUBL
 [`docs/PROJECT_LOCK_AND_PORTABLE_ASSETS.md`](PROJECT_LOCK_AND_PORTABLE_ASSETS.md),
 [`docs/AUDIT_BACKUP_RESTORE_AND_RETENTION.md`](AUDIT_BACKUP_RESTORE_AND_RETENTION.md),
 [`docs/FINAL_SECURITY_RELEASE_AUDIT.md`](FINAL_SECURITY_RELEASE_AUDIT.md).
+
+## Final pre-use data-loss audit delta (2026-08-02)
+
+`docs/FINAL_PRE_USE_DATA_LOSS_AUDIT.md` canonical pre-use karar kaynağıdır.
+`rubrika preflight <project_path> [--json]` yalnız recursive inventory,
+project parse/revision, active pointer, orphan artifact, audit-chain ve backup
+doğrulaması yapar; migration/repair yazmaz. Backup ve document import yolları
+project OS lease’i paylaşır; document import staging+hash+rename kullanır.
+Generation GC command’ı metadata commit’inden sonra fiziksel cleanup yapar.
+Exact-name proof suite’i, quality checks, smoke ve release build yeşildir;
+proxy niteliğindeki process-kill/disk-full/race proof’ları raporda ayrıca
+belirtilmiştir. Gerçek `11_46` projesinin preflight’ı unknown orphan, verified
+backup yokluğu, invalid audit chain ve audit/project revision divergence
+bulduğu için karar kesin olarak `DO_NOT_OPEN_FOR_WRITING` kalır.
+
+Superseding 11_46 closure: verified backup and restore equality are PASS, but
+the real source still has the UNKNOWN orphan and unrecovered historical audit.
+The final source byte manifest is unchanged. Full Cargo/check:all is
+NOT_VERIFIED because six model-runtime fixtures cannot bind loopback in this
+environment; the repaired candidate remains `RECOVERED_COPY_NOT_SAFE`.

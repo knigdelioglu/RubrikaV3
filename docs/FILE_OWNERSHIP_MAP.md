@@ -45,6 +45,9 @@ Bu doküman, spesifik bir işi yaparken hangi dosyaları değiştirmeniz gerekti
 
 ## Genel Kurallar
 
+| **Source-preserving integrity recovery** | services/integrity_recovery_service.rs, backup_service.rs, transaction_journal.rs, bin/rubrika.rs | External verified backup, recursive byte manifest, forensic audit/orphan reports, append-only RecoveryAnchor and isolated repaired candidate | Real source path; source project lock/audit/project.json/metadata/GC/repair writes | final_data_loss_proofs, preflight, backup-verify, verify-restore |
+| **Recovery-copy UI/API boundary** | backup_commands.rs, commands.ts, types.ts, AppLayout.tsx | Job-based dry-run/recovery-copy request and teacher-facing write blocker | Direct source repair, source migration, silent success | npm run typecheck, Rust command contract |
+
 1. **İş (Domain) Mantığı UI'da Olmaz:** Eğer bir butonun "ne zaman aktif olacağına" dair bir kural ekliyorsanız, bunu `WorkflowPanel.tsx` gibi React dosyalarında yazmayın. Kuralı `workflow_engine.rs` dosyasına ekleyin, UI sadece `workflowSnapshot`'ı okusun.
 2. **Kırılgan Hatalar (Panic/Unwrap) Yok:** Rust tarafında asla `.unwrap()` veya `panic!()` kullanmayın. Her zaman `Result<T, AppError>` döndürün ve `?` operatörünü kullanın.
 3. **Model JSON'ına Güvenmeyin:** Modelden (Gemma) dönen cevaba asla tam bir JSON'mış gibi %100 güvenmeyin. Parse işlemleri (örneğin `llama_server_gateway.rs` içindeki `extract_assistant_content` ve string temizleme) hata tolere edebilir yapıda olmalıdır. Her ihtimalde raw output'u saklayın.
@@ -61,6 +64,21 @@ Model status UI modernizasyonu: ModelStatusPage.tsx, commands.ts, types.ts, mode
 Student identity verification UI/backend persistence: StudentIdentityPage.tsx, AppLayout.tsx, commands.ts, types.ts, student.rs, workflow_engine.rs
 
 Student identity crop/OCR/persistence: StudentIdentityPage.tsx, CropTemplatePage.tsx, PdfPageViewer.tsx, commands.ts, types.ts, student.rs, project.rs, student_answer_crop_service.rs, llama_server_gateway.rs, workflow_engine.rs
+
+## Final pre-use audit ownership delta (2026-08-02)
+
+| Alan | Güncel sahibi | Denetim sınırı |
+| --- | --- | --- |
+| Salt-okunur veri kaybı preflight | `src-tauri/src/diagnostics.rs` + `src-tauri/src/bin/rubrika.rs` | `DataLossPreflightReport`; migration/recovery/repair yok; gerçek proje üzerinde yalnız read-only çalışır |
+| Document import activation | `src-tauri/src/services/document_service.rs` | `.importing` staging, kaynak/kopya hash eşitliği, trusted-root rename, metadata commit sonrası orphan cleanup |
+| Generation GC ordering | `src-tauri/src/commands/generation_gc_commands.rs` + `generation_gc_service.rs` | Production command metadata-first; service-level direct caller metadata orderingini garanti etmez |
+| Audit append serialization | `src-tauri/src/services/audit_service.rs` | Project OS lease + append/sync hash chain; tüm legacy command caller’larında audit error coupling ayrıca gözden geçirilmeli |
+| Final release decision | `docs/FINAL_PRE_USE_DATA_LOSS_AUDIT.md` | Kalite/proof suite yeşil olsa da gerçek project preflight blocker’ları (unknown orphan, verified backup yok, invalid audit chain, audit/revision divergence) nedeniyle `DO_NOT_OPEN_FOR_WRITING` |
+
+Superseding 11_46 result: the verified external backup and restore equality
+are PASS; source bytes are unchanged; the source remains blocked by UNKNOWN
+orphan plus invalid historical audit. Full Cargo/check:all is NOT_VERIFIED in
+this environment, so the recovered copy is not promoted to safe-to-open.
 ## Faz 2 persistence ownership
 
 | Sorumluluk | Tek sahibi | Yazma sınırı |

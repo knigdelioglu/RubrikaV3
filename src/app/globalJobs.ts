@@ -13,6 +13,7 @@ const jobLabels: Record<JobKind, string> = {
   assessment_analysis: 'Sınav analizi hazırlanıyor',
   project_backup: 'Proje yedeği hazırlanıyor',
   project_restore: 'Proje yedeği geri yükleniyor',
+  project_recovery: 'Recovery kopyası hazırlanıyor',
 };
 
 export function getJobLabel(kind: JobKind): string {

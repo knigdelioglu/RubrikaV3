@@ -1,5 +1,5 @@
 use crate::domain::errors::AppError;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 pub fn app_log_dir() -> PathBuf {
@@ -16,34 +16,53 @@ pub fn model_server_log_path(profile_id: &str) -> PathBuf {
 pub fn generate_default_project_path(
     app: &tauri::AppHandle,
     project_name: &str,
+    academic_year_id: Option<&str>,
 ) -> Result<String, AppError> {
-    let safe_name = sanitize_project_name(project_name);
-    if safe_name.is_empty() {
+    let Some(directory_name) = project_directory_name(project_name, academic_year_id) else {
         return Ok(String::new());
-    }
+    };
 
     let mut base_dir = app
         .path()
         .document_dir()
         .unwrap_or_else(|_| app.path().home_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    // Wait, the requirements state:
-    // macOS: ~/Documents/RubrikaV3/Projects/<safe_project_name>
-    // fallback: ~/RubrikaV3/Projects/<safe_project_name>
-
-    // In both cases, we just append RubrikaV3/Projects
+    // macOS: ~/Documents/RubrikaV3/Projects/<project_name>_<academic_year>
+    // fallback: ~/RubrikaV3/Projects/<project_name>_<academic_year>
     base_dir.push("RubrikaV3");
     base_dir.push("Projects");
 
-    let mut target_dir = base_dir.join(&safe_name);
-
-    let mut counter = 2;
-    while target_dir.exists() {
-        target_dir = base_dir.join(format!("{}_{}", safe_name, counter));
-        counter += 1;
-    }
+    let target_dir = unique_project_path(&base_dir, &directory_name);
 
     Ok(target_dir.to_string_lossy().to_string())
+}
+
+fn project_directory_name(project_name: &str, academic_year_id: Option<&str>) -> Option<String> {
+    let safe_name = sanitize_project_name(project_name);
+    if safe_name.is_empty() {
+        return None;
+    }
+
+    let safe_year = academic_year_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(sanitize_project_name)
+        .filter(|value| !value.is_empty());
+
+    Some(match safe_year {
+        Some(year) => format!("{safe_name}_{year}"),
+        None => safe_name,
+    })
+}
+
+fn unique_project_path(base_dir: &Path, directory_name: &str) -> PathBuf {
+    let mut target_dir = base_dir.join(directory_name);
+    let mut counter = 2;
+    while target_dir.exists() {
+        target_dir = base_dir.join(format!("{directory_name}_{counter}"));
+        counter += 1;
+    }
+    target_dir
 }
 
 pub fn sanitize_project_name(name: &str) -> String {
@@ -101,5 +120,38 @@ mod tests {
             "My_Project_Test"
         );
         assert_eq!(sanitize_project_name("Test   Space"), "Test_Space");
+    }
+
+    #[test]
+    fn default_project_directory_name_includes_academic_year() {
+        assert_eq!(
+            project_directory_name("11. edebiyat 1. Yazılı", Some("2026-2027")),
+            Some("11_edebiyat_1_Yazılı_2026-2027".to_string())
+        );
+        assert_ne!(
+            project_directory_name("11. edebiyat 1. Yazılı", Some("2026-2027")),
+            project_directory_name("11. edebiyat 1. Yazılı", Some("2027-2028"))
+        );
+        assert_eq!(
+            project_directory_name("11. edebiyat 1. Yazılı", Some("2027-2028")),
+            Some("11_edebiyat_1_Yazılı_2027-2028".to_string())
+        );
+    }
+
+    #[test]
+    fn same_name_and_year_gets_a_collision_suffix() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "rubrika-default-project-path-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(base_dir.join("11_edebiyat_1_Yazılı_2026-2027")).unwrap();
+
+        let path = unique_project_path(&base_dir, "11_edebiyat_1_Yazılı_2026-2027");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("11_edebiyat_1_Yazılı_2026-2027_2")
+        );
+        std::fs::remove_dir_all(base_dir).unwrap();
     }
 }

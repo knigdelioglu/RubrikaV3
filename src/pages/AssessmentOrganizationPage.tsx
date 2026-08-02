@@ -197,6 +197,7 @@ export function AssessmentOrganizationPage() {
       queryClient.invalidateQueries({ queryKey: ['teaching-assignments', projectId] }),
       queryClient.invalidateQueries({ queryKey: ['school-classes', projectId] }),
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] }),
+      queryClient.invalidateQueries({ queryKey: ['data-loss-preflight', projectPath] }),
     ]);
   };
 

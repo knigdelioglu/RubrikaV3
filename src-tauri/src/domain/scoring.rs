@@ -859,6 +859,50 @@ mod tests {
     }
 
     #[test]
+    fn proof_38_scoring_rerun_preserves_teacher_override() {
+        let project = base_project();
+        let mut record = ScoringRecord {
+            id: Uuid::new_v4().to_string(),
+            run_id: "run-1".into(),
+            submission_id: "submission-1".into(),
+            student_id: "student-1".into(),
+            student_display_name: Some("Ali".into()),
+            student_number: Some("1".into()),
+            student_class_name: Some("A".into()),
+            question_id: "q-1".into(),
+            question_number: 1,
+            max_score: 10.0,
+            awarded_score: Some(8.0),
+            scoring_applied: true,
+            criterion_scores: vec![],
+            rationale: "İyi".into(),
+            confidence: 0.8,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            raw_model_output: "{}".into(),
+            parse_diagnostics: None,
+            reconciliation_diagnostics: None,
+            source_hash: scoring_source_hash(&project),
+            package_hash: scoring_package_hash(&project),
+            ocr_record_hash: scoring_record_hash(&project.student_answer_ocr_records[0]),
+            question_text_hash: scoring_question_text_hash(&project),
+            rubric_hash: scoring_rubric_hash(&project),
+            teacher_review_status: ScoringReviewStatus::Edited,
+            teacher_manual_score: Some(6.0),
+            teacher_reviewed_at: Some(chrono::Utc::now()),
+            teacher_notes: Some("Öğretmen düzeltmesi".into()),
+            invalidated_at: None,
+            invalidation_reason: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert_eq!(scoring_record_effective_score(&record), Some(6.0));
+        record.awarded_score = Some(1.0);
+        assert_eq!(scoring_record_effective_score(&record), Some(6.0));
+    }
+
+    #[test]
     fn scoring_active_records_prefers_latest_run_and_dedupes_duplicates() {
         let mut project = base_project();
         project.latest_scoring_run_id = Some("run-new".into());

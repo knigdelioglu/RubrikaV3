@@ -8,22 +8,29 @@ import { ErrorBanner } from '../components/common/ErrorBanner';
 import { LoadingButton } from '../components/common/LoadingButton';
 import { setActiveProject } from '../state/projectSession';
 import { projectOverviewPath } from '../app/projectRoutes';
+import {
+  DEFAULT_COURSE_ID,
+  DEFAULT_COURSE_NAME,
+  getDefaultAcademicYear,
+  getDefaultProjectPathQueryConfig,
+} from './projectCreateUi';
 
 export function ProjectCreatePage() {
   const [name, setName] = useState('');
   const [rootPath, setRootPath] = useState('');
-  const [academicYearId, setAcademicYearId] = useState('');
-  const [courseId, setCourseId] = useState('');
-  const [courseName, setCourseName] = useState('');
+  const [academicYearId, setAcademicYearId] = useState(() => getDefaultAcademicYear());
+  const [courseId, setCourseId] = useState(DEFAULT_COURSE_ID);
+  const [courseName, setCourseName] = useState(DEFAULT_COURSE_NAME);
   const [pathTouchedByUser, setPathTouchedByUser] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
   const navigate = useNavigate();
+  const defaultProjectPathQuery = getDefaultProjectPathQueryConfig(name, academicYearId);
 
-  const { data: defaultPath } = useQuery({
-    queryKey: ['default-project-path', name],
-    queryFn: () => commands.getDefaultProjectPath(name),
-    enabled: name.trim().length > 0,
+  const { data: defaultPath, isFetching: isDefaultPathFetching } = useQuery({
+    queryKey: defaultProjectPathQuery.queryKey,
+    queryFn: () => commands.getDefaultProjectPath(name, academicYearId),
+    enabled: defaultProjectPathQuery.enabled,
   });
 
   useEffect(() => {
@@ -34,7 +41,14 @@ export function ProjectCreatePage() {
 
   const handleNameChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setName(e.target.value);
-    if (!e.target.value.trim() && !pathTouchedByUser) {
+    if (!pathTouchedByUser) {
+      setRootPath('');
+    }
+  };
+
+  const handleAcademicYearChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setAcademicYearId(e.target.value);
+    if (!pathTouchedByUser) {
       setRootPath('');
     }
   };
@@ -80,6 +94,7 @@ export function ProjectCreatePage() {
   if (!name.trim()) disabledReason = 'Proje adı boş olamaz';
   else if (!rootPath.trim()) disabledReason = 'Proje klasörü seçilmedi';
   else if (!academicYearId.trim() || !courseId.trim() || !courseName.trim()) disabledReason = 'Eğitim yılı ve ders bilgileri zorunludur';
+  else if (!pathTouchedByUser && isDefaultPathFetching) disabledReason = 'Varsayılan proje klasörü hazırlanıyor';
 
   return (
     <div style={{ padding: '2rem', fontFamily: 'system-ui, -apple-system, sans-serif', maxWidth: '800px', margin: '2rem auto' }}>
@@ -119,7 +134,7 @@ export function ProjectCreatePage() {
           </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '0.75rem' }}>
-            <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Eğitim yılı<input value={academicYearId} onChange={(event) => setAcademicYearId(event.target.value)} placeholder="2026-2027" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
+            <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Eğitim yılı<input value={academicYearId} onChange={handleAcademicYearChange} placeholder="2026-2027" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
             <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Ders kodu<input value={courseId} onChange={(event) => setCourseId(event.target.value)} placeholder="tde" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
             <label style={{ display: 'grid', gap: '0.4rem', fontSize: '0.8rem', fontWeight: 600, color: '#334155' }}>Ders adı<input value={courseName} onChange={(event) => setCourseName(event.target.value)} placeholder="Türk Dili ve Edebiyatı" disabled={isLoading} style={{ padding: '0.5rem', border: '1px solid #cbd5e1', borderRadius: '0.6rem' }} /></label>
           </div>
@@ -150,7 +165,7 @@ export function ProjectCreatePage() {
               </button>
             </div>
             <p style={{ fontSize: '0.75rem', color: '#64748b', margin: 0 }}>
-              Varsayılan olarak projeler Belgeler klasöründe saklanır.
+              Varsayılan klasör adı eğitim yılıyla birlikte oluşturulur; örneğin <code>11_edebiyat_1_Yazili_2026-2027</code>.
             </p>
           </div>
 

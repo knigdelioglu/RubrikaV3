@@ -299,6 +299,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               <button
                 type="button"
                 className="button button--primary"
+                data-project-write="false"
                 onClick={() => backupMutation.mutate()}
                 disabled={backupMutation.isPending || !activeProjectId}
                 style={{ fontSize: '0.85rem' }}
@@ -308,6 +309,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               <button
                 type="button"
                 className="button button--secondary"
+                data-project-write="true"
                 onClick={() => gcMutation.mutate()}
                 disabled={gcMutation.isPending || !activeProjectId}
                 style={{ fontSize: '0.85rem' }}

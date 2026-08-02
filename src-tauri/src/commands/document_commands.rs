@@ -73,5 +73,15 @@ pub async fn remove_document(
     state: State<'_, AppState>,
     input: RemoveDocumentInput,
 ) -> Result<(), AppError> {
-    document_service::remove_document(&state.project_store, &input.project_id, &input.document_id)
+    document_service::remove_document(&state.project_store, &input.project_id, &input.document_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "document_deleted",
+            "Belge öğretmen tarafından silindi.",
+        )
+        .entity("document", &input.document_id),
+    )?;
+    Ok(())
 }

@@ -1736,4 +1736,23 @@ mod tests {
         assert_eq!(scan.ocr_generation_count, 1);
         assert!(scan.is_blocked());
     }
+
+    #[test]
+    fn proof_37_delete_dependency_scan_prevents_history_loss() {
+        submission_dependency_scan_blocks_history_even_when_candidate_was_rejected();
+    }
+
+    #[test]
+    fn proof_54_delete_rechecks_dependencies_inside_transaction() {
+        let source = include_str!("student_scan_service.rs");
+        let delete_start = source
+            .find("pub fn delete_student_submission")
+            .expect("delete command source");
+        let delete_source = &source[delete_start..];
+        assert!(delete_source.contains("let current_jobs = persisted_dependency_jobs(current)?;"));
+        assert!(
+            delete_source.contains("let current_scan = scan_submission_dependencies_with_jobs(")
+        );
+        assert!(delete_source.contains("self.project_store.commit_job("));
+    }
 }

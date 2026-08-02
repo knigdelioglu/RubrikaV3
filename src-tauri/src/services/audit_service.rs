@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domain::errors::{AppError, AppErrorCode};
+use crate::platform::project_write_lease::acquire_or_share;
+use crate::services::transaction_journal;
 
 pub const AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_FILE_NAME: &str = "audit.jsonl";
@@ -21,6 +23,12 @@ pub struct AuditRecord {
     pub event_id: String,
     pub timestamp: String,
     pub correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    /// Structured recovery/diagnostic context. It is intentionally optional
+    /// so historical records remain readable without being rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
     pub operation: String,
     pub actor_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +56,8 @@ impl AuditRecord {
             "event_id": self.event_id,
             "timestamp": self.timestamp,
             "correlation_id": self.correlation_id,
+            "transaction_id": self.transaction_id,
+            "metadata": self.metadata,
             "operation": self.operation,
             "actor_kind": self.actor_kind,
             "project_id": self.project_id,
@@ -68,7 +78,7 @@ impl AuditRecord {
         })
     }
 
-    fn compute_hash(&self) -> Result<String, AppError> {
+    pub fn compute_hash(&self) -> Result<String, AppError> {
         let body = self.canonical_body_bytes()?;
         let mut hasher = Sha256::new();
         hasher.update(&body);
@@ -83,6 +93,47 @@ pub struct AuditChainReport {
     pub chain_valid: bool,
     pub tamper_count: u64,
     pub reasons: Vec<String>,
+    pub project_revision_divergence_count: u64,
+    pub active_revision_divergence_count: u64,
+    pub first_invalid_line: Option<u64>,
+    pub first_invalid_record_id: Option<String>,
+    pub first_invalid_previous_hash: Option<String>,
+    pub first_invalid_computed_hash: Option<String>,
+    pub first_invalid_recorded_hash: Option<String>,
+    pub last_valid_record_hash: String,
+    pub last_audit_revision: Option<u64>,
+    pub duplicate_revision_count: u64,
+    pub missing_revision_count: u64,
+    pub original_audit_status: String,
+    pub active_audit_status: String,
+    pub historical_recovery_anchor_status: String,
+    pub classifications: Vec<String>,
+}
+
+impl Default for AuditChainReport {
+    fn default() -> Self {
+        Self {
+            record_count: 0,
+            chain_valid: false,
+            tamper_count: 0,
+            reasons: Vec::new(),
+            project_revision_divergence_count: 0,
+            active_revision_divergence_count: 0,
+            first_invalid_line: None,
+            first_invalid_record_id: None,
+            first_invalid_previous_hash: None,
+            first_invalid_computed_hash: None,
+            first_invalid_recorded_hash: None,
+            last_valid_record_hash: GENESIS_HASH.to_string(),
+            last_audit_revision: None,
+            duplicate_revision_count: 0,
+            missing_revision_count: 0,
+            original_audit_status: "INVALID_UNRECOVERED".to_string(),
+            active_audit_status: "INVALID_UNRECOVERED".to_string(),
+            historical_recovery_anchor_status: "NOT_PRESENT".to_string(),
+            classifications: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -155,6 +206,27 @@ impl AuditService {
             technical_details: Some("audit state lock failed".to_string()),
             correlation_id: Uuid::new_v4().to_string(),
         })?;
+        // Audit is a persistent project mutation too. The per-root state
+        // mutex is acquired first so concurrent threads in one process
+        // serialize the short OS-lease acquisition instead of racing and
+        // reporting ProjectAlreadyOpen to one another.
+        let _project_lease = acquire_or_share(project_root)?;
+        let canonical_root = project_root.canonicalize().map_err(|error| AppError {
+            code: AppErrorCode::AuditWriteFailed,
+            message: "Proje denetim klasörü çözümlenemedi.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Proje klasörü izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!("audit root canonicalize failed: {error}")),
+            correlation_id: input.correlation_id.clone(),
+        })?;
+        std::fs::create_dir_all(canonical_root.join("logs")).map_err(|error| AppError {
+            code: AppErrorCode::AuditWriteFailed,
+            message: "Denetim klasörü oluşturulamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Disk alanını ve klasör izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!("audit directory create failed: {error}")),
+            correlation_id: input.correlation_id.clone(),
+        })?;
 
         let previous_hash = state.last_hash.clone();
         let record = AuditRecord {
@@ -162,6 +234,8 @@ impl AuditService {
             event_id: Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             correlation_id: input.correlation_id,
+            transaction_id: input.transaction_id,
+            metadata: input.metadata,
             operation: input.operation,
             actor_kind: input.actor_kind,
             project_id: input.project_id,
@@ -231,7 +305,13 @@ impl AuditService {
         let mut expected_prev = GENESIS_HASH.to_string();
         let mut tamper_count = 0u64;
         let mut reasons = Vec::new();
-        for record in &mut records {
+        let mut first_invalid_line = None;
+        let mut first_invalid_record_id = None;
+        let mut first_invalid_previous_hash = None;
+        let mut first_invalid_computed_hash = None;
+        let mut first_invalid_recorded_hash = None;
+        let mut last_valid_record_hash = GENESIS_HASH.to_string();
+        for (index, record) in records.iter_mut().enumerate() {
             let computed = record.compute_hash()?;
             let recorded = record.record_hash.clone().unwrap_or_default();
             let hash_mismatch = computed != recorded;
@@ -244,14 +324,226 @@ impl AuditService {
                 tamper_count += 1;
                 reasons.push(format!("record {} broken chain link", record.event_id));
             }
+            if (hash_mismatch || link_mismatch) && first_invalid_line.is_none() {
+                first_invalid_line = Some((index + 1) as u64);
+                first_invalid_record_id = Some(record.event_id.clone());
+                first_invalid_previous_hash = Some(record.previous_record_hash.clone());
+                first_invalid_computed_hash = Some(computed.clone());
+                first_invalid_recorded_hash = Some(recorded.clone());
+            }
+            if !hash_mismatch && !link_mismatch {
+                last_valid_record_hash = recorded.clone();
+            }
             expected_prev = recorded;
         }
+        let legacy_format = records.iter().any(|record| {
+            record.transaction_id.is_none()
+                && record.metadata.is_none()
+                && record.previous_revision.is_none()
+                && record.next_revision.is_none()
+        });
+        let mut classifications = Vec::new();
+        if legacy_format {
+            classifications.push("legacy_audit_format".to_string());
+        }
+        if first_invalid_line.is_some() {
+            classifications.push("audit_hash_or_link_invalid".to_string());
+        }
+        let chain_valid = tamper_count == 0;
         Ok(AuditChainReport {
             record_count: records.len() as u64,
-            chain_valid: tamper_count == 0,
+            chain_valid,
             tamper_count,
             reasons,
+            project_revision_divergence_count: 0,
+            active_revision_divergence_count: 0,
+            first_invalid_line,
+            first_invalid_record_id,
+            first_invalid_previous_hash,
+            first_invalid_computed_hash,
+            first_invalid_recorded_hash,
+            last_valid_record_hash,
+            last_audit_revision: None,
+            duplicate_revision_count: 0,
+            missing_revision_count: 0,
+            original_audit_status: if chain_valid {
+                "VALID".to_string()
+            } else {
+                "INVALID_UNRECOVERED".to_string()
+            },
+            active_audit_status: if chain_valid {
+                "VALID".to_string()
+            } else {
+                "INVALID_UNRECOVERED".to_string()
+            },
+            historical_recovery_anchor_status: "NOT_PRESENT".to_string(),
+            classifications,
         })
+    }
+
+    /// Verifies the hash chain and the revision transitions recorded for one
+    /// canonical project. Legacy audit records without revision metadata are
+    /// retained but never counted as proof of a current project revision.
+    pub fn verify_chain_against_project(
+        &self,
+        project_root: &Path,
+        project: &crate::domain::project::Project,
+    ) -> Result<AuditChainReport, AppError> {
+        let mut report = self.verify_chain(project_root)?;
+        let records = self.read_records(project_root)?;
+        let anchor = records.iter().find(|record| {
+            record.operation == "recovery_anchor"
+                && record
+                    .metadata
+                    .as_ref()
+                    .and_then(|value| value.get("kind"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("RecoveryAnchor")
+        });
+        let anchor_valid = anchor
+            .map(|record| verify_recovery_anchor(project_root, record, project))
+            .unwrap_or(false);
+        if anchor.is_some() {
+            if anchor_valid {
+                report.historical_recovery_anchor_status = "VALID".to_string();
+                report.original_audit_status = "HISTORICAL_INVALID_RECOVERY_ANCHORED".to_string();
+                report
+                    .classifications
+                    .push("historical_invalid_recovery_anchored".to_string());
+            } else {
+                report.historical_recovery_anchor_status = "INVALID".to_string();
+                report.active_audit_status = "ACTIVE_CHAIN_INVALID".to_string();
+                report
+                    .reasons
+                    .push("recovery anchor could not be verified".to_string());
+                report.tamper_count = report.tamper_count.saturating_add(1);
+                report.chain_valid = false;
+            }
+        }
+
+        let anchor_revision = anchor
+            .and_then(|record| record.metadata.as_ref())
+            .and_then(|metadata| metadata.get("projectRevision"))
+            .and_then(serde_json::Value::as_u64);
+        let mut previous: Option<u64> = anchor_revision;
+        let mut seen_revisions = std::collections::BTreeSet::new();
+        for record in records
+            .iter()
+            .filter(|record| record.project_id.as_deref() == Some(project.id.as_str()))
+            .filter(|record| record.operation != "recovery_anchor")
+        {
+            if is_critical_operation(&record.operation) && record.transaction_id.is_none() {
+                report.project_revision_divergence_count += 1;
+                report.reasons.push(format!(
+                    "critical audit record has no transaction id: {}",
+                    record.operation
+                ));
+            }
+            let (Some(record_previous), Some(record_next)) =
+                (record.previous_revision, record.next_revision)
+            else {
+                continue;
+            };
+            if !seen_revisions.insert(record_next) {
+                report.duplicate_revision_count += 1;
+                report
+                    .reasons
+                    .push(format!("duplicate audit revision: {record_next}"));
+            }
+            if previous.is_some_and(|value| value != record_previous)
+                || record_next != record_previous.saturating_add(1)
+            {
+                report.project_revision_divergence_count += 1;
+                report.reasons.push(format!(
+                    "audit revision transition mismatch: {} {} -> {}",
+                    record.operation, record_previous, record_next
+                ));
+            }
+            if let Some(last) = previous {
+                if record_previous > last.saturating_add(1) {
+                    report.missing_revision_count = report
+                        .missing_revision_count
+                        .saturating_add(record_previous - last - 1);
+                }
+            }
+            previous = Some(record_next);
+        }
+        if let Some(last) = previous {
+            if last != project.storage_revision {
+                report.project_revision_divergence_count += 1;
+                report.reasons.push(format!(
+                    "audit/project revision divergence: audit={last}; project={}",
+                    project.storage_revision
+                ));
+            }
+        } else if project.storage_revision > 0 && anchor_revision.is_none() {
+            report.project_revision_divergence_count += 1;
+            report.reasons.push(format!(
+                "project has revision {} but no matching audit revision",
+                project.storage_revision
+            ));
+        }
+        report.active_revision_divergence_count = report.project_revision_divergence_count;
+        report.chain_valid = report.chain_valid
+            && report.project_revision_divergence_count == 0
+            && report.duplicate_revision_count == 0
+            && report.missing_revision_count == 0;
+        if report.chain_valid {
+            report.active_audit_status = "VALID".to_string();
+        } else if anchor.is_some() && anchor_valid {
+            report.active_audit_status = "ACTIVE_CHAIN_INVALID".to_string();
+        }
+        report.last_audit_revision = previous;
+        Ok(report)
+    }
+
+    /// Wraps the post-commit audit boundary in a durable journal. If the
+    /// audit append or completion marker fails, the caller receives an
+    /// explicit incomplete result and preflight can block future writing.
+    pub fn append_transactionally(
+        &self,
+        project_root: &Path,
+        mut input: AuditEntryInput,
+        expected_revision: Option<u64>,
+        target_revision: Option<u64>,
+    ) -> Result<AuditRecord, AppError> {
+        let project_id = input.project_id.clone().ok_or_else(|| AppError {
+            code: AppErrorCode::AuditCommitIncomplete,
+            message: "Denetim işlemi proje kimliği olmadan başlatılamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("İşlemi yeniden deneyin.".to_string()),
+            technical_details: None,
+            correlation_id: input.correlation_id.clone(),
+        })?;
+        let transaction = transaction_journal::begin(
+            project_root,
+            &project_id,
+            &input.operation,
+            &input.correlation_id,
+            expected_revision,
+            target_revision,
+        )
+        .map_err(|error| incomplete_audit_error(&input.correlation_id, error))?;
+        input.transaction_id = Some(transaction.transaction_id.clone());
+        input.previous_revision = expected_revision;
+        input.next_revision = target_revision;
+        let record = match self.append(project_root, input) {
+            Ok(record) => record,
+            Err(error) => {
+                let _ = transaction_journal::update(
+                    project_root,
+                    &transaction.transaction_id,
+                    "audit_missing",
+                );
+                return Err(incomplete_audit_error(&transaction.correlation_id, error));
+            }
+        };
+        if let Err(error) =
+            transaction_journal::update(project_root, &transaction.transaction_id, "complete")
+        {
+            return Err(incomplete_audit_error(&transaction.correlation_id, error));
+        }
+        Ok(record)
     }
 
     pub fn read_records(&self, project_root: &Path) -> Result<Vec<AuditRecord>, AppError> {
@@ -297,6 +589,8 @@ impl AuditService {
 #[derive(Debug, Clone)]
 pub struct AuditEntryInput {
     pub correlation_id: String,
+    pub transaction_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
     pub operation: String,
     pub actor_kind: String,
     pub project_id: Option<String>,
@@ -311,6 +605,8 @@ impl AuditEntryInput {
     pub fn new(operation: &str, safe_summary: &str) -> Self {
         Self {
             correlation_id: Uuid::new_v4().to_string(),
+            transaction_id: None,
+            metadata: None,
             operation: operation.to_string(),
             actor_kind: "teacher".to_string(),
             project_id: None,
@@ -343,6 +639,137 @@ impl AuditEntryInput {
         self.correlation_id = correlation_id.to_string();
         self
     }
+
+    pub fn transaction(mut self, transaction_id: &str) -> Self {
+        self.transaction_id = Some(transaction_id.to_string());
+        self
+    }
+
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+fn verify_recovery_anchor(
+    project_root: &Path,
+    record: &AuditRecord,
+    project: &crate::domain::project::Project,
+) -> bool {
+    let Some(metadata) = record.metadata.as_ref() else {
+        return false;
+    };
+    let historical_path = project_root
+        .join("logs")
+        .join("recovery")
+        .join("historical")
+        .join("audit.jsonl");
+    let manifest_path = project_root
+        .join("logs")
+        .join("recovery")
+        .join("recovery-manifest.json");
+    let original_hash = metadata
+        .get("originalAuditSha256")
+        .and_then(serde_json::Value::as_str);
+    let original_size = metadata
+        .get("originalAuditSize")
+        .and_then(serde_json::Value::as_u64);
+    let expected_project_fingerprint = metadata
+        .get("projectFingerprint")
+        .and_then(serde_json::Value::as_str);
+    let expected_manifest_hash = metadata
+        .get("recoveryManifestSha256")
+        .and_then(serde_json::Value::as_str);
+    let Some(original_hash) = original_hash else {
+        return false;
+    };
+    let Some(original_size) = original_size else {
+        return false;
+    };
+    let Ok(historical_metadata) = std::fs::metadata(&historical_path) else {
+        return false;
+    };
+    if historical_metadata.len() != original_size {
+        return false;
+    }
+    let Ok(historical_hash) = sha256_file(&historical_path) else {
+        return false;
+    };
+    if historical_hash != original_hash {
+        return false;
+    }
+    if let Some(expected_manifest_hash) = expected_manifest_hash {
+        let Ok(manifest_hash) = sha256_file(&manifest_path) else {
+            return false;
+        };
+        if manifest_hash != expected_manifest_hash {
+            return false;
+        }
+    }
+    if let Some(expected_project_fingerprint) = expected_project_fingerprint {
+        let Ok(project_hash) = sha256_file(&project_root.join("project.json")) else {
+            return false;
+        };
+        if project_hash != expected_project_fingerprint {
+            return false;
+        }
+    }
+    metadata
+        .get("projectRevision")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|revision| revision == project.storage_revision)
+}
+
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn incomplete_audit_error(correlation_id: &str, error: AppError) -> AppError {
+    AppError {
+        code: AppErrorCode::AuditCommitIncomplete,
+        message:
+            "Değişiklik kaydedildi ancak denetim işlemi tamamlanamadı; başarı bildirimi verilmedi."
+                .to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Proje yazmaya kapatılıp preflight ile kontrol edilmeli.".to_string(),
+        ),
+        technical_details: Some(format!("audit transaction incomplete: {error}")),
+        correlation_id: correlation_id.to_string(),
+    }
+}
+
+fn is_critical_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "migration"
+            | "teacher_ocr_approval"
+            | "ocr_generation_accepted"
+            | "ocr_generation_rejected"
+            | "rubric_confirmed"
+            | "rubric_confirmed_all"
+            | "question_text_confirmed"
+            | "question_text_confirmed_all"
+            | "exam_package_frozen"
+            | "exam_package_invalidated"
+            | "scoring_record_updated"
+            | "scoring_override_approved"
+            | "document_deleted"
+            | "submission_deleted"
+            | "speaking_attempt_approved"
+            | "generation_gc"
+            | "project_restored"
+    )
 }
 
 fn read_last_hash(path: &Path) -> String {

@@ -141,20 +141,28 @@ impl ScoringService {
         )?;
 
         let mut running_project = project.clone();
-        running_project.latest_scoring_run_id = Some(run_id.clone());
+        // Keep the previous active run visible until the replacement has
+        // produced a durable result. A queued/running rerun is not an active
+        // result pointer and must never hide teacher-approved scores.
         running_project.workflow.current_stage =
             crate::domain::workflow::WorkflowStage::ScoringRunning;
         running_project.workflow.current_stage_label = "Notlandırma Çalışıyor".to_string();
         running_project.workflow.summary.text = Some("Notlandırma çalışıyor.".to_string());
-        self.project_store
+        if let Err(error) = self
+            .project_store
             .commit_snapshot_cas(&running_project)
-            .map(|_| ())?;
+            .map(|_| ())
+        {
+            let _ = self.job_manager.fail(&app, &job.id, error.clone());
+            return Err(error);
+        }
 
         let service = self.clone();
         let app_handle = app.clone();
         let job_id = job.id.clone();
         let project_id_for_run = project_id.clone();
         tauri::async_runtime::spawn(async move {
+            let recovery_project_id = project_id_for_run.clone();
             let run_result = service
                 .run(
                     app_handle.clone(),
@@ -166,6 +174,7 @@ impl ScoringService {
                 .await;
             if let Err(error) = run_result {
                 let _ = service.job_manager.fail(&app_handle, &job_id, error);
+                service.restore_workflow_after_run_stop(&recovery_project_id);
             }
         });
 
@@ -258,6 +267,28 @@ impl ScoringService {
         Ok(updated)
     }
 
+    fn restore_workflow_after_run_stop(&self, project_id: &str) {
+        let result = self.project_store.mutate(
+            project_id,
+            crate::services::project_store::MutationOptions::new(
+                "scoring_run_interrupted_workflow",
+            ),
+            |project, _| {
+                if project.workflow.current_stage
+                    == crate::domain::workflow::WorkflowStage::ScoringRunning
+                {
+                    project.workflow = workflow_engine::evaluate_workflow(project);
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = result {
+            log::warn!(
+                "Notlandırma durduktan sonra workflow geri yüklenemedi: project_id={project_id}; error={error}"
+            );
+        }
+    }
+
     async fn run<R: tauri::Runtime>(
         &self,
         app: tauri::AppHandle<R>,
@@ -327,6 +358,7 @@ impl ScoringService {
                 if let Some(ref t) = cancel_token {
                     if t.is_cancelled() {
                         let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                        self.restore_workflow_after_run_stop(&project_id);
                         return Ok(());
                     }
                 }
@@ -564,6 +596,7 @@ impl ScoringService {
         if let Some(ref t) = cancel_token {
             if t.is_cancelled() {
                 let _ = self.job_manager.mark_cancelled(&app, &job_id);
+                self.restore_workflow_after_run_stop(&project_id);
                 return Ok(());
             }
         }

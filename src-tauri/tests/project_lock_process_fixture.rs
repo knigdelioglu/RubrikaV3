@@ -59,6 +59,11 @@ fn second_process_cannot_write_locked_project() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn proof_44_second_process_cannot_run_destructive_operation() {
+    second_process_cannot_write_locked_project();
+}
+
 fn wait_for_locked(stdout: impl std::io::Read) {
     let mut lines = BufReader::new(stdout).lines();
     let line = lines.next().expect("process A must emit a lock line");

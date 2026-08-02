@@ -57,11 +57,18 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Job-based**: No
 
 ### `create_project`
-- **Input**: `CreateProjectInput { name: String, root_path: Option<String> }`
-- **Output**: `ProjectSnapshot`
+- **Input**: `CreateProjectInput { name: String, root_path: String, academic_year_id: Option<String>, course_id: Option<String>, course_name: Option<String> }`
+- **Output**: `CreateProjectOutput { project: ProjectSnapshot, project_path: String, warnings: String[] }`
 - **Errors**: `PERMISSION_DENIED`, `PROJECT_SAVE_FAILED`, `PROJECT_ALREADY_EXISTS`, `PROJECT_DIRECTORY_NOT_EMPTY`
 - **Job-based**: No
 - **Path rule**: Hedef klasör yoksa oluşturulur; mevcut klasör boş değilse veya `project.json` içeriyorsa backend reddeder ve sessiz overwrite yapmaz.
+
+### `get_default_project_path`
+- **Input**: `{ project_name: String, academic_year_id: Option<String> }`
+- **Output**: `{ path: String }`
+- **Errors**: `PROJECT_SAVE_FAILED` when the platform path cannot be resolved
+- **Job-based**: No
+- **Path rule**: Eğitim yılı varsa güvenli varsayılan klasör adı `<project_name>_<academic_year_id>` olur. Aynı yıl ve ad zaten kullanılıyorsa `_2`, `_3` gibi çakışma eki eklenir. Yıl bilgisi olmayan eski çağrılar mevcut adlandırma kuralını korur.
 
 ### `open_project`
 - **Input**: `OpenProjectInput { path: String }`
@@ -451,6 +458,15 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - `rubrika inspect model-inputs <project_path>`
 - `rubrika replay rubric-import <project_path> --dry-run`
 - `rubrika replay question-text <project_path> --dry-run`
+- `rubrika preflight <project_path>`
+- `rubrika --json preflight <project_path>`
+
+`preflight` returns `DataLossPreflightReport` and is strictly read-only. It does
+not run migration, recovery, repair, audit append, import, delete, GC or
+restore. `decision` is one of `SAFE_TO_OPEN`, `SAFE_TO_OPEN_WITH_BACKUP`, or
+`DO_NOT_OPEN_FOR_WRITING`; the last value is the only valid result when
+project parsing, symlink, active-pointer, audit-chain, or backup verification
+fails.
 
 ## Model Input Pipeline
 - PDF preview cache remains under `cache/page_previews`
@@ -480,7 +496,51 @@ Yeni kodlar: `MODEL_RESPONSE_TOO_LARGE`, `MODEL_RESPONSE_TRUNCATED`,
 `AUDIT_CHAIN_INVALID`, `BACKUP_FAILED`, `BACKUP_ARCHIVE_INVALID`,
 `BACKUP_CANCELLED`, `RESTORE_FAILED`, `RESTORE_DESTINATION_CONFLICT`,
 `RESTORE_CANCELLED`, `GENERATION_GC_FAILED`, `APP_ALREADY_RUNNING`.
+
+## Final pre-use data-loss contract
+
+`DataLossPreflightReport` includes `readOnly`, `projectParseOk`, recursive
+inventory SHA-256, symlink paths, missing active-pointer count, orphan/staging
+counts, audit-chain report, verified/failed backups, warnings/errors and the
+write decision. The report is diagnostic evidence, not a write authorization
+override. Full proof and release status are maintained in
+[`FINAL_PRE_USE_DATA_LOSS_AUDIT.md`](FINAL_PRE_USE_DATA_LOSS_AUDIT.md).
 ## Faz 2 — ProjectStore concurrency contract
+
+## Integrity recovery commands
+
+rubrika backup-create project_path [--destination external_dir]
+rubrika backup-verify archive_path [--source-project project_path]
+rubrika restore-copy archive_path new_destination
+rubrika verify-restore archive source_project restored_path [--proof-path path]
+rubrika audit-forensics project_path
+rubrika classify-orphans project_path
+rubrika recover-copy archive new_destination [--source-project path] [--dry-run]
+rubrika recovery-diff source_project candidate_path
+rubrika preflight project_path
+
+recover-copy rejects the source path, existing destinations, traversal,
+symlinks and unverified archives. dry-run performs no recovery writes. The
+Tauri start_recovery_copy_job command carries the same sourceProjectPath,
+backupPath, destinationPath and dryRun contract and uses the project_recovery
+job kind.
+
+DataLossPreflightReport includes source byte changes, original/active audit
+status, recovery-anchor status, active revision divergence, ambiguous
+transactions, verified backup path/hash/restore status, and the three real
+destructive-proof statuses. The frontend displays these as teacher-facing
+labels and never turns a failed preflight into general write authorization.
+
+`initializationWriteAllowed` is a narrow exception for a pristine project at
+storage revision zero with no documents, questions, classes, students,
+activities, submissions, OCR/scoring data, orphan/staging artifacts, or audit
+problems. It permits only the first setup writes; the normal `DO_NOT_OPEN_FOR_WRITING`
+decision and full backup/validation gates remain in force once real project
+data exists.
+
+For the 11_46 closure, `verifiedBackupRestoreStatus=PASS` while
+`fullTestSuiteGreen=false`; the backend decision remains
+`DO_NOT_OPEN_FOR_WRITING` and the frontend must keep project writes disabled.
 
 `Project` JSON'unda backend-authoritative `storageRevision` alanı bulunur. Alanı olmayan legacy projeler `0` revision ile yüklenir; salt açılış rewrite yapmaz. Başarılı canonical mutation revision'ı tam bir kez artırır.
 

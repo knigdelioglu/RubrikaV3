@@ -3,10 +3,14 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use app_lib::diagnostics::{
-    DiagnosticsContext, DoctorReport, DocumentContentInspectRecord, DocumentContentRepairReport,
-    DocumentInspectRecord, JobSummary, ModelInputInspectReport, ModelInspectReport,
-    ProjectInspectReport, QuestionTextRepairReport, QuestionTextSummary, ReplayReport,
-    RubricSummary, StaleJobsRepairReport,
+    DataLossPreflightReport, DiagnosticsContext, DoctorReport, DocumentContentInspectRecord,
+    DocumentContentRepairReport, DocumentInspectRecord, JobSummary, ModelInputInspectReport,
+    ModelInspectReport, ProjectInspectReport, QuestionTextRepairReport, QuestionTextSummary,
+    ReplayReport, RubricSummary, StaleJobsRepairReport,
+};
+use app_lib::services::integrity_recovery_service::{
+    self as integrity, AudioForensicReport, AuditForensicsReport, BackupVerificationReport,
+    RecoveryCopyReport, RecoveryDiffReport, RestoreVerificationReport,
 };
 
 #[derive(Parser)]
@@ -22,6 +26,57 @@ struct Cli {
 enum Command {
     Doctor {
         project_path: PathBuf,
+    },
+    /// Read-only final data-loss and destructive-operation preflight.
+    Preflight {
+        project_path: PathBuf,
+    },
+    /// Verifies an external backup archive, receipt and every archive entry.
+    BackupVerify {
+        archive_path: PathBuf,
+        #[arg(long)]
+        source_project: Option<PathBuf>,
+    },
+    /// Creates a complete external verified backup without mutating source.
+    BackupCreate {
+        project_path: PathBuf,
+        #[arg(long)]
+        destination: Option<PathBuf>,
+    },
+    /// Restores a verified archive into a new destination without recovery mutations.
+    RestoreCopy {
+        archive_path: PathBuf,
+        destination_path: PathBuf,
+    },
+    /// Verifies archive, restore, domain equality and byte-bearing artifact equality.
+    VerifyRestore {
+        archive_path: PathBuf,
+        source_project: PathBuf,
+        restored_path: PathBuf,
+        #[arg(long)]
+        proof_path: Option<PathBuf>,
+    },
+    /// Performs read-only line-by-line audit chain forensics.
+    AuditForensics {
+        project_path: PathBuf,
+    },
+    /// Classifies speaking audio that has no canonical project pointer.
+    ClassifyOrphans {
+        project_path: PathBuf,
+    },
+    /// Creates a recovery copy from a verified backup; never repairs source.
+    RecoverCopy {
+        backup_path: PathBuf,
+        destination_path: PathBuf,
+        #[arg(long)]
+        source_project: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Produces an explained source/candidate manifest and domain diff.
+    RecoveryDiff {
+        source_project: PathBuf,
+        candidate_path: PathBuf,
     },
     /// Acquires the project write lease and holds it for `hold_seconds`
     /// (0 means hold until stdin closes). Used by process-fixture tests.
@@ -106,6 +161,158 @@ async fn main() {
             }
             Err(error) => {
                 eprintln!("{error}");
+                2
+            }
+        },
+        Command::Preflight { project_path } => match ctx.data_loss_preflight(&project_path) {
+            Ok(report) => {
+                print_json_or_human(&report, cli.json, print_preflight);
+                if report.safe_to_open_for_writing {
+                    0
+                } else {
+                    3
+                }
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                2
+            }
+        },
+        Command::BackupVerify {
+            archive_path,
+            source_project,
+        } => match integrity::verify_backup(&archive_path, source_project.as_deref()) {
+            Ok(report) => {
+                print_json_or_human(&report, cli.json, print_backup_verification);
+                0
+            }
+            Err(error) => {
+                eprintln!("{}", error.message);
+                2
+            }
+        },
+        Command::BackupCreate {
+            project_path,
+            destination,
+        } => match app_lib::services::backup_service::create_verified_backup(
+            &project_path,
+            destination.as_deref(),
+            &tokio_util::sync::CancellationToken::new(),
+        ) {
+            Ok(summary) => {
+                print_json_or_human(&summary, cli.json, |summary| {
+                    println!("archive_path={}", summary.archive_path);
+                    println!("verification_path={}", summary.verification_path);
+                    println!("manifest_path={}", summary.manifest_path);
+                    println!("entry_count={}", summary.entry_count);
+                    println!("total_size={}", summary.total_size);
+                    println!("sha256={}", summary.sha256);
+                });
+                0
+            }
+            Err(error) => {
+                eprintln!("{}", error.message);
+                2
+            }
+        },
+        Command::RestoreCopy {
+            archive_path,
+            destination_path,
+        } => {
+            let result = app_lib::services::backup_service::restore_backup(
+                &archive_path,
+                &destination_path,
+                &tokio_util::sync::CancellationToken::new(),
+            );
+            match result {
+                Ok(summary) => {
+                    print_json_or_human(&summary, cli.json, |summary| {
+                        println!("destination={}", summary.destination);
+                        println!("entry_count={}", summary.entry_count);
+                        println!("restored_project_id={}", summary.restored_project_id);
+                    });
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{}", error.message);
+                    2
+                }
+            }
+        }
+        Command::VerifyRestore {
+            archive_path,
+            source_project,
+            restored_path,
+            proof_path,
+        } => match integrity::verify_restored_copy(
+            &archive_path,
+            &source_project,
+            &restored_path,
+            proof_path.as_deref(),
+        ) {
+            Ok(report) => {
+                print_json_or_human(&report, cli.json, print_restore_verification);
+                0
+            }
+            Err(error) => {
+                eprintln!("{}", error.message);
+                2
+            }
+        },
+        Command::AuditForensics { project_path } => {
+            match integrity::audit_forensics(&project_path) {
+                Ok(report) => {
+                    print_json_or_human(&report, cli.json, print_audit_forensics);
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{}", error.message);
+                    2
+                }
+            }
+        }
+        Command::ClassifyOrphans { project_path } => {
+            match integrity::classify_audio_orphans(&project_path) {
+                Ok(report) => {
+                    print_json_or_human(&report, cli.json, print_audio_forensics);
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{}", error.message);
+                    2
+                }
+            }
+        }
+        Command::RecoverCopy {
+            backup_path,
+            destination_path,
+            source_project,
+            dry_run,
+        } => match integrity::recover_copy(
+            &backup_path,
+            &destination_path,
+            source_project.as_deref(),
+            dry_run,
+        ) {
+            Ok(report) => {
+                print_json_or_human(&report, cli.json, print_recovery_copy);
+                0
+            }
+            Err(error) => {
+                eprintln!("{}", error.message);
+                2
+            }
+        },
+        Command::RecoveryDiff {
+            source_project,
+            candidate_path,
+        } => match integrity::recovery_diff(&source_project, &candidate_path) {
+            Ok(report) => {
+                print_json_or_human(&report, cli.json, print_recovery_diff);
+                0
+            }
+            Err(error) => {
+                eprintln!("{}", error.message);
                 2
             }
         },
@@ -342,6 +549,8 @@ fn print_doctor(report: &DoctorReport, json: bool) {
         return;
     }
     println!("project_path={}", report.project_path);
+    println!("read_only={}", report.read_only);
+    println!("writes_performed={}", report.writes_performed);
     println!("project_file_exists={}", report.project_file_exists);
     println!("project_readable={}", report.project_readable);
     println!(
@@ -624,6 +833,116 @@ fn print_doctor(report: &DoctorReport, json: bool) {
     }
     if !report.warnings.is_empty() {
         println!("warnings={:?}", report.warnings);
+    }
+}
+
+fn print_preflight(report: &DataLossPreflightReport) {
+    println!("project_path={}", report.project_path);
+    println!("read_only={}", report.read_only);
+    println!(
+        "read_only_guarantee_verified={}",
+        report.read_only_guarantee_verified
+    );
+    println!("project_file_exists={}", report.project_file_exists);
+    println!("project_parse_ok={}", report.project_parse_ok);
+    println!("project_id={:?}", report.project_id);
+    println!("storage_revision={:?}", report.storage_revision);
+    println!("project_revision={:?}", report.project_revision);
+    println!("project_fingerprint={:?}", report.project_fingerprint);
+    println!("source_manifest_hash={}", report.source_manifest_hash);
+    println!("source_byte_changes={}", report.source_byte_changes);
+    println!("pending_migration={}", report.pending_migration);
+    println!("migration_backup_status={}", report.migration_backup_status);
+    println!("recursive_file_count={}", report.recursive_file_count);
+    println!("recursive_byte_count={}", report.recursive_byte_count);
+    println!(
+        "recursive_inventory_sha256={}",
+        report.recursive_inventory_sha256
+    );
+    println!("symlink_count={}", report.symlink_count);
+    println!(
+        "missing_active_pointer_count={}",
+        report.missing_active_pointer_count
+    );
+    println!(
+        "missing_referenced_artifact_count={}",
+        report.missing_referenced_artifact_count
+    );
+    println!("orphan_artifact_count={}", report.orphan_artifact_count);
+    println!("unknown_orphan_count={}", report.unknown_orphan_count);
+    println!(
+        "recoverable_audio_orphan_count={}",
+        report.recoverable_audio_orphan_count
+    );
+    println!(
+        "orphan_restore_staging_count={}",
+        report.orphan_restore_staging_count
+    );
+    println!("audit_chain_valid={}", report.audit.chain_valid);
+    println!("audit_tamper_count={}", report.audit.tamper_count);
+    println!("verified_backup_count={}", report.verified_backup_count);
+    println!("failed_backup_count={}", report.failed_backup_count);
+    println!(
+        "latest_verified_backup_path={:?}",
+        report.latest_verified_backup_path
+    );
+    println!(
+        "latest_verified_backup_age={:?}",
+        report.latest_verified_backup_age
+    );
+    println!(
+        "incomplete_transaction_count={}",
+        report.incomplete_transaction_count
+    );
+    println!(
+        "audit_project_divergence_count={}",
+        report.audit_project_divergence_count
+    );
+    println!(
+        "active_revision_divergence_count={}",
+        report.active_revision_divergence_count
+    );
+    println!("original_audit_status={}", report.original_audit_status);
+    println!("active_audit_status={}", report.active_audit_status);
+    println!(
+        "historical_recovery_anchor_status={}",
+        report.historical_recovery_anchor_status
+    );
+    println!("verified_backup_path={:?}", report.verified_backup_path);
+    println!("verified_backup_sha256={:?}", report.verified_backup_sha256);
+    println!(
+        "verified_backup_restore_status={}",
+        report.verified_backup_restore_status
+    );
+    println!(
+        "process_kill_proofs_status={}",
+        report.process_kill_proofs_status
+    );
+    println!(
+        "disk_fault_proofs_status={}",
+        report.disk_fault_proofs_status
+    );
+    println!(
+        "destructive_race_proofs_status={}",
+        report.destructive_race_proofs_status
+    );
+    println!("full_test_suite_green={}", report.full_test_suite_green);
+    println!("second_writer_detected={}", report.second_writer_detected);
+    println!(
+        "initialization_write_allowed={}",
+        report.initialization_write_allowed
+    );
+    println!("blockers={:?}", report.blockers);
+    println!("decision={}", report.decision);
+    println!(
+        "safe_to_open_for_writing={}",
+        report.safe_to_open_for_writing
+    );
+    if !report.warnings.is_empty() {
+        println!("warnings={:?}", report.warnings);
+    }
+    if !report.errors.is_empty() {
+        println!("errors={:?}", report.errors);
     }
 }
 
@@ -986,6 +1305,136 @@ fn print_question_text_repair(report: &QuestionTextRepairReport) {
     println!("after_available={:?}", report.after_available);
     println!("after_missing={:?}", report.after_missing);
     println!("coverage_ok={}", report.coverage_ok);
+}
+
+fn print_backup_verification(report: &BackupVerificationReport) {
+    println!("archive_path={}", report.archive_path);
+    println!("receipt_path={}", report.receipt_path);
+    println!("archive_sha256={}", report.archive_sha256);
+    println!("project_id={}", report.project_id);
+    println!("entry_count={}", report.entry_count);
+    println!("total_size={}", report.total_size);
+    println!("source_project_path={}", report.source_project_path);
+    println!("source_manifest_sha256={:?}", report.source_manifest_sha256);
+    println!("archive_verified={}", report.archive_verified);
+    println!("traversal_checks={}", report.traversal_checks);
+}
+
+fn print_audit_forensics(report: &AuditForensicsReport) {
+    println!("audit_path={}", report.audit_path);
+    println!("audit_sha256={}", report.audit_sha256);
+    println!("audit_size={}", report.audit_size);
+    println!("record_count={}", report.record_count);
+    println!("first_invalid_line={:?}", report.first_invalid_line);
+    println!(
+        "first_invalid_record_id={:?}",
+        report.first_invalid_record_id
+    );
+    println!(
+        "first_invalid_previous_hash={:?}",
+        report.first_invalid_previous_hash
+    );
+    println!(
+        "first_invalid_computed_hash={:?}",
+        report.first_invalid_computed_hash
+    );
+    println!(
+        "first_invalid_recorded_hash={:?}",
+        report.first_invalid_recorded_hash
+    );
+    println!("last_valid_record_hash={}", report.last_valid_record_hash);
+    println!("last_valid_revision={:?}", report.last_valid_revision);
+    println!(
+        "duplicate_revision_count={}",
+        report.duplicate_revision_count
+    );
+    println!("missing_revision_count={}", report.missing_revision_count);
+    println!("project_revision={:?}", report.project_revision);
+    println!(
+        "project_revision_divergence={:?}",
+        report.project_revision_divergence
+    );
+    println!(
+        "active_revision_divergence_count={}",
+        report.active_revision_divergence_count
+    );
+    println!("original_audit_status={}", report.original_audit_status);
+    println!("active_audit_status={}", report.active_audit_status);
+    println!(
+        "historical_recovery_anchor_status={}",
+        report.historical_recovery_anchor_status
+    );
+    println!("classifications={:?}", report.classifications);
+}
+
+fn print_audio_forensics(reports: &Vec<AudioForensicReport>) {
+    for report in reports {
+        println!(
+            "path={} size={} sha256={} wav_valid={} duration={:?} sample_rate={:?} channels={:?} classification={} recommended_action={}",
+            report.relative_path,
+            report.byte_size,
+            report.sha256,
+            report.wav_valid,
+            report.duration_seconds,
+            report.sample_rate,
+            report.channels,
+            report.classification,
+            report.recommended_action
+        );
+    }
+}
+
+fn print_recovery_copy(report: &RecoveryCopyReport) {
+    println!("dry_run={}", report.dry_run);
+    println!("destination={}", report.destination);
+    println!("backup_archive={}", report.backup.archive_path);
+    println!("backup_sha256={}", report.backup.archive_sha256);
+    println!("source_manifest_sha256={}", report.source_manifest_sha256);
+    println!("original_audit_sha256={}", report.original_audit_sha256);
+    println!("original_audit_size={}", report.original_audit_size);
+    println!("first_invalid_line={:?}", report.first_invalid_line);
+    println!("project_revision={}", report.project_revision);
+    println!("project_fingerprint={}", report.project_fingerprint);
+    println!("active_audit_status={}", report.active_audit_status);
+    println!(
+        "historical_recovery_anchor_status={}",
+        report.historical_recovery_anchor_status
+    );
+    println!(
+        "quarantined_artifacts={}",
+        report.quarantined_artifacts.len()
+    );
+}
+
+fn print_recovery_diff(report: &RecoveryDiffReport) {
+    println!("source_path={}", report.source_path);
+    println!("candidate_path={}", report.candidate_path);
+    println!("domain_equality={}", report.domain_equality);
+    println!("artifact_hash_equality={}", report.artifact_hash_equality);
+    println!("byte_identity={}", report.byte_identity);
+    println!("changes={}", report.changes.len());
+    println!("unexplained_changes={:?}", report.unexplained_changes);
+}
+
+fn print_restore_verification(report: &RestoreVerificationReport) {
+    println!("status={}", report.status);
+    println!("archive_path={}", report.archive_path);
+    println!("source_project_path={}", report.source_project_path);
+    println!("restored_project_path={}", report.restored_project_path);
+    println!("archive_verified={}", report.archive_verified);
+    println!("byte_identity={}", report.byte_identity);
+    println!("domain_equality={}", report.domain_equality);
+    println!("artifact_hash_equality={}", report.artifact_hash_equality);
+    println!("unexplained_changes={:?}", report.unexplained_changes);
+    println!(
+        "source_byte_manifest_sha256={}",
+        report.source_byte_manifest_sha256
+    );
+    println!(
+        "restored_byte_manifest_sha256={}",
+        report.restored_byte_manifest_sha256
+    );
+    println!("restored_project_id={}", report.restored_project_id);
 }
 
 fn exit_code_doctor(report: &DoctorReport) -> i32 {

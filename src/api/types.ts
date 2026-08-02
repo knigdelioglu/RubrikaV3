@@ -19,7 +19,8 @@ export type JobKind =
   | 'speaking_evaluation'
   | 'assessment_analysis'
   | 'project_backup'
-  | 'project_restore';
+  | 'project_restore'
+  | 'project_recovery';
 
 export type JobStatus =
   | 'queued'
@@ -1219,15 +1220,114 @@ export type CreateProjectOutput = {
   warnings: string[];
 };
 
+export type ProjectOpenMode = 'inspectReadOnly' | 'openWithoutMigration' | 'migrateWithVerifiedBackup';
+
 export type OpenProjectInput = {
   projectPath?: string;
   rootPath?: string;
+  mode?: ProjectOpenMode;
 };
 
 export type OpenProjectOutput = {
   project: ProjectSnapshot;
   projectPath: string;
   warnings: string[];
+};
+
+export type OrphanArtifactReport = {
+  relativePath: string;
+  size: number;
+  sha256?: string | null;
+  fileType: string;
+  probableSubsystem: string;
+  probableEntityOrGeneration?: string | null;
+  reason: string;
+  indirectReferencePossible: boolean;
+  teacherContentPossible: boolean;
+  classification: string;
+  recommendedAction: string;
+};
+
+export type DataLossPreflightReport = {
+  projectPath: string;
+  readOnly: boolean;
+  readOnlyGuaranteeVerified: boolean;
+  projectFileExists: boolean;
+  projectParseOk: boolean;
+  projectId?: string | null;
+  storageRevision?: number | null;
+  projectRevision?: number | null;
+  projectFingerprint?: string | null;
+  sourceManifestHash: string;
+  sourceByteChanges: number;
+  pendingMigration: boolean;
+  migrationBackupStatus: string;
+  recursiveFileCount: number;
+  recursiveByteCount: number;
+  recursiveInventorySha256: string;
+  symlinkCount: number;
+  symlinkPaths: string[];
+  missingActivePointerCount: number;
+  missingReferencedArtifactCount: number;
+  brokenActivePointerCount: number;
+  orphanArtifactCount: number;
+  unknownOrphanCount: number;
+  orphanArtifacts: OrphanArtifactReport[];
+  orphanRestoreStagingCount: number;
+  unsafeRestoreStagingCount: number;
+  unsafeImportStagingCount: number;
+  speakingAudioWithoutMetadataCount: number;
+  speakingMetadataWithoutAudioCount: number;
+  recoverableAudioOrphanCount: number;
+  staleGcPlanCount: number;
+  incompleteTransactionCount: number;
+  ambiguousTransactionCount: number;
+  auditProjectDivergenceCount: number;
+  activeRevisionDivergenceCount: number;
+  originalAuditStatus: string;
+  activeAuditStatus: string;
+  historicalRecoveryAnchorStatus: string;
+  durabilityUncertainCount: number;
+  secondWriterDetected: boolean;
+  initializationWriteAllowed: boolean;
+  audit: {
+    recordCount: number;
+    chainValid: boolean;
+    tamperCount: number;
+    reasons: string[];
+    projectRevisionDivergenceCount: number;
+    activeRevisionDivergenceCount: number;
+    firstInvalidLine?: number | null;
+    firstInvalidRecordId?: string | null;
+    firstInvalidPreviousHash?: string | null;
+    firstInvalidComputedHash?: string | null;
+    firstInvalidRecordedHash?: string | null;
+    lastValidRecordHash: string;
+    lastAuditRevision?: number | null;
+    duplicateRevisionCount: number;
+    missingRevisionCount: number;
+    originalAuditStatus: string;
+    activeAuditStatus: string;
+    historicalRecoveryAnchorStatus: string;
+    classifications: string[];
+  };
+  verifiedBackupCount: number;
+  failedBackupCount: number;
+  backupPaths: string[];
+  latestVerifiedBackupPath?: string | null;
+  verifiedBackupPath?: string | null;
+  verifiedBackupSha256?: string | null;
+  verifiedBackupRestoreStatus: string;
+  latestVerifiedBackupAge?: string | null;
+  processKillProofsStatus: string;
+  diskFaultProofsStatus: string;
+  destructiveRaceProofsStatus: string;
+  fullTestSuiteGreen: boolean;
+  blockers: string[];
+  warnings: string[];
+  errors: string[];
+  decision: 'SAFE_TO_OPEN' | 'SAFE_TO_OPEN_WITH_BACKUP' | 'DO_NOT_OPEN_FOR_WRITING' | string;
+  safeToOpenForWriting: boolean;
 };
 
 export type ModelSuggestedAction = {
@@ -1629,6 +1729,8 @@ export type GcReport = {
 
 export type BackupSummary = {
   archivePath: string;
+  verificationPath?: string;
+  sourceProjectPath?: string;
   entryCount: number;
   totalSize: number;
   sha256: string;
@@ -1647,6 +1749,11 @@ export type StartBackupJobOutput = {
 };
 
 export type StartRestoreJobOutput = {
+  jobId: string;
+  status: string;
+};
+
+export type StartRecoveryCopyJobOutput = {
   jobId: string;
   status: string;
 };

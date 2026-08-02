@@ -190,13 +190,11 @@ fn speaking_start_is_backend_persisted_and_duplicate_safe() {
     let final_state = store.get_project_snapshot(project_id).unwrap();
     assert_eq!(final_state.speaking_exams.len(), 1);
 
-    // The OS lease releases when the store drops; a fresh store can open.
+    // The OS lease releases when the store drops; a read-only reload can
+    // inspect the canonical bytes without silently running migration.
     drop(service);
     drop(store);
-    let store_after_drop = ProjectStore::new();
-    let reopened = store_after_drop
-        .open_project(root.to_string_lossy().to_string())
-        .expect("reopen after lease release");
+    let reopened = ProjectStore::open_project_at_path(&root).expect("read-only reload");
     assert_eq!(reopened.speaking_exams.len(), 1);
 
     let _ = std::fs::remove_dir_all(&base);

@@ -1683,15 +1683,7 @@ fn persist_raw_response(
     let file_relative = trusted_root.managed(&format!(
         "cache/model_raw/question_text_{job_id}_page_{page_index}.json"
     ))?;
-    let file_path = trusted_root.root().join(file_relative.as_path());
-    std::fs::write(&file_path, raw_response).map_err(|e| AppError {
-        code: AppErrorCode::ProjectSaveFailed,
-        message: "Failed to write raw model response.".to_string(),
-        recoverable: false,
-        suggested_action: Some("Check project cache permissions.".to_string()),
-        technical_details: Some(e.to_string()),
-        correlation_id: Uuid::new_v4().to_string(),
-    })?;
+    trusted_root.atomic_write(&file_relative, raw_response)?;
     Ok(())
 }
 

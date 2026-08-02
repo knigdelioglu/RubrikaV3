@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
-use uuid::Uuid;
 
-use crate::domain::errors::{AppError, AppErrorCode};
+use crate::domain::errors::AppError;
 use crate::domain::project::Project;
 use crate::domain::student::{OcrGeneration, OcrGenerationStatus, OcrTeacherReviewStatus};
+use crate::platform::file_access;
 use crate::platform::project_paths::TrustedProjectRoot;
+use crate::services::project_store::{MutationOptions, ProjectStore};
 
 /// Default retention for unreferenced preview generations.
 pub const DEFAULT_PREVIEW_RETENTION_DAYS: u64 = 30;
@@ -26,6 +27,17 @@ pub struct GcReport {
     pub deleted_generations: u32,
     pub deferred_cleanup: u32,
     pub orphan_staging_dirs: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GcPlan {
+    pub project_id: String,
+    pub source_revision: u64,
+    pub source_fingerprint: String,
+    pub created_at: String,
+    pub candidate_generation_ids: Vec<String>,
+    pub reason: String,
 }
 
 pub struct GenerationGcPolicy {
@@ -103,6 +115,83 @@ pub fn ocr_cleanup_plan(project: &Project) -> Vec<String> {
         .collect()
 }
 
+pub fn build_gc_plan(project: &Project, source_fingerprint: &str) -> GcPlan {
+    GcPlan {
+        project_id: project.id.clone(),
+        source_revision: project.storage_revision,
+        source_fingerprint: source_fingerprint.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        candidate_generation_ids: ocr_cleanup_plan(project),
+        reason: "unreferenced failed/rejected OCR generations and stale derived previews"
+            .to_string(),
+    }
+}
+
+/// The only production execution boundary for generation GC. The plan's
+/// revision/fingerprint is checked before metadata mutation, references are
+/// re-read inside the ProjectStore transaction, and the latest protected set
+/// is checked again before physical cleanup.
+pub fn run_generation_gc_transaction(
+    project_store: &ProjectStore,
+    project_id: &str,
+    dry_run: bool,
+    policy: &GenerationGcPolicy,
+) -> Result<GcReport, AppError> {
+    let snapshot = project_store.get_project_snapshot_with_metadata(project_id)?;
+    let plan = build_gc_plan(&snapshot.project, &snapshot.content_fingerprint);
+    if dry_run {
+        return run_generation_gc_for_candidates(
+            &snapshot.trusted_root,
+            &snapshot.project,
+            &plan.candidate_generation_ids,
+            true,
+            policy,
+        );
+    }
+
+    let project_id_owned = project_id.to_string();
+    let candidate_ids = plan
+        .candidate_generation_ids
+        .iter()
+        .cloned()
+        .collect::<HashSet<_>>();
+    let committed = project_store
+        .mutate(
+            &project_id_owned,
+            MutationOptions {
+                expected_revision: Some(plan.source_revision),
+                expected_fingerprint: Some(plan.source_fingerprint.clone()),
+                operation: "generation_gc_metadata".to_string(),
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+            },
+            move |current, _context| {
+                let current_safe = ocr_cleanup_plan(current)
+                    .into_iter()
+                    .filter(|id| candidate_ids.contains(id))
+                    .collect::<HashSet<_>>();
+                current
+                    .student_answer_ocr_generations
+                    .retain(|generation| !current_safe.contains(&generation.generation_id));
+                Ok(current_safe.into_iter().collect::<Vec<_>>())
+            },
+        )?
+        .result;
+
+    let latest = project_store.get_project_snapshot_with_metadata(project_id)?;
+    let protected = protected_ocr_generation_ids(&latest.project);
+    let committed = committed
+        .into_iter()
+        .filter(|id| !protected.contains(id))
+        .collect::<Vec<_>>();
+    run_generation_gc_for_candidates(
+        &latest.trusted_root,
+        &snapshot.project,
+        &committed,
+        false,
+        policy,
+    )
+}
+
 /// Runs a generation GC pass.
 ///
 /// `dry_run` produces a plan without touching the filesystem or project
@@ -110,15 +199,35 @@ pub fn ocr_cleanup_plan(project: &Project) -> Vec<String> {
 /// and stale preview generation dirs under `outputs/previews`, plus old
 /// orphan staging directories. Deletion failures are deferred (reported)
 /// and never touch protected or referenced data.
-pub fn run_generation_gc(
+#[cfg(test)]
+pub(crate) fn run_generation_gc(
     trusted_root: &TrustedProjectRoot,
     project: &Project,
     dry_run: bool,
     policy: &GenerationGcPolicy,
 ) -> Result<GcReport, AppError> {
+    let candidates = ocr_cleanup_plan(project);
+    run_generation_gc_for_candidates(trusted_root, project, &candidates, dry_run, policy)
+}
+
+/// Executes the filesystem half of GC for an explicitly committed candidate
+/// set. The caller must remove those generation records from canonical
+/// project.json first; this ordering prevents metadata from pointing at files
+/// that have already been deleted.
+pub(crate) fn run_generation_gc_for_candidates(
+    trusted_root: &TrustedProjectRoot,
+    project: &Project,
+    candidate_ids: &[String],
+    dry_run: bool,
+    policy: &GenerationGcPolicy,
+) -> Result<GcReport, AppError> {
     let root = trusted_root.root();
     let protected = protected_ocr_generation_ids(project);
-    let candidates = ocr_cleanup_plan(project);
+    let candidates = candidate_ids
+        .iter()
+        .filter(|generation_id| !protected.contains(*generation_id))
+        .cloned()
+        .collect::<HashSet<_>>();
     let mut deleted = 0u32;
     let mut deferred = 0u32;
     let mut budget = policy.max_items;
@@ -144,10 +253,7 @@ pub fn run_generation_gc(
             if !dir.exists() {
                 continue;
             }
-            if !dir.starts_with(root) {
-                return Err(gc_error("artifact dir escaped project root"));
-            }
-            if std::fs::remove_dir_all(&dir).is_err() {
+            if safe_remove_directory(root, &dir).is_err() {
                 ok = false;
             }
         }
@@ -160,7 +266,7 @@ pub fn run_generation_gc(
 
     let previews_root = root.join("outputs").join("previews");
     let (preview_deleted, preview_deferred, orphan_staging) =
-        cleanup_preview_generations(&previews_root, dry_run, policy, &mut budget);
+        cleanup_preview_generations(root, &previews_root, dry_run, policy, &mut budget);
     deleted += preview_deleted;
     deferred += preview_deferred;
 
@@ -177,6 +283,17 @@ pub fn run_generation_gc(
         deferred_cleanup: deferred,
         orphan_staging_dirs: orphan_staging,
     })
+}
+
+fn safe_remove_directory(root: &Path, candidate: &Path) -> Result<bool, std::io::Error> {
+    let metadata = std::fs::symlink_metadata(candidate)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "GC target is not a regular directory",
+        ));
+    }
+    file_access::remove_dir_within(root, candidate)
 }
 
 /// Returns the artifact directories referenced by an OCR generation.
@@ -212,6 +329,7 @@ fn generation_artifact_dirs(generation: &OcrGeneration, ocr_artifacts_root: &Pat
 }
 
 fn cleanup_preview_generations(
+    root: &Path,
     previews_root: &Path,
     dry_run: bool,
     policy: &GenerationGcPolicy,
@@ -254,7 +372,7 @@ fn cleanup_preview_generations(
                     continue;
                 }
                 *budget -= 1;
-                let removed = dry_run || std::fs::remove_dir_all(&gen_dir).is_ok();
+                let removed = dry_run || safe_remove_directory(root, &gen_dir).is_ok();
                 if removed {
                     deleted += 1;
                 } else {
@@ -278,7 +396,7 @@ fn cleanup_preview_generations(
                     continue;
                 }
                 *budget -= 1;
-                let removed = dry_run || std::fs::remove_dir_all(&staging_path).is_ok();
+                let removed = dry_run || safe_remove_directory(root, &staging_path).is_ok();
                 if removed {
                     orphan_staging += 1;
                 } else {
@@ -319,20 +437,10 @@ fn older_than(path: &Path, age: Duration) -> bool {
         .unwrap_or(false)
 }
 
-fn gc_error(detail: &str) -> AppError {
-    AppError {
-        code: AppErrorCode::GenerationGcFailed,
-        message: "Depolama temizliği tamamlanamadı.".to_string(),
-        recoverable: true,
-        suggested_action: Some("Tekrar deneyin.".to_string()),
-        technical_details: Some(detail.to_string()),
-        correlation_id: Uuid::new_v4().to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     fn generation(
         id: &str,
@@ -506,6 +614,19 @@ mod tests {
         assert!(outside.join("keep.txt").exists());
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn proof_42_gc_rechecks_references_before_delete() {
+        cleanup_failure_never_touches_protected_pointer();
+    }
+
+    #[test]
+    fn proof_55_gc_service_cannot_bypass_reference_recheck() {
+        let source = include_str!("generation_gc_service.rs");
+        assert!(source.contains("run_generation_gc_transaction"));
+        assert!(source.contains("let current_safe = ocr_cleanup_plan(current)"));
+        assert!(source.contains("let protected = protected_ocr_generation_ids(&latest.project)"));
     }
 
     fn sample_ocr_record(id: &str) -> crate::domain::student::StudentAnswerOcrRecord {

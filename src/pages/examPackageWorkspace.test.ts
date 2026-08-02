@@ -160,7 +160,7 @@ test('closing a confirmation without invoking the guarded action performs zero m
   assert.equal(calls, 0);
 });
 
-test('failed rubric saves keep the teacher draft instead of restoring stale backend data', () => {
+test('proof_45_frontend_failed_save_preserves_teacher_draft', () => {
   const current = { q1: 'Öğretmenin yeni rubriği' };
   const afterRefetch = mergePersistedDrafts(current, [['q1', 'Eski rubrik']], new Set(['q1']));
   assert.equal(afterRefetch.q1, 'Öğretmenin yeni rubriği');

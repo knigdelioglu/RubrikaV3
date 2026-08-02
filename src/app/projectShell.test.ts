@@ -23,6 +23,7 @@ import {
   resolveLegacyProjectDestination,
   resolveLegacyProjectPath,
 } from './projectRoutes.ts';
+import { isProjectWriteBlocked } from './projectSafety.ts';
 
 const job = (overrides: Partial<JobSnapshot> = {}): JobSnapshot => ({
   id: 'internal-job-id',
@@ -157,4 +158,21 @@ test('global job center keeps showing an active job while the project route chan
   assert.equal(getJobCenterButtonLabel(jobs), 'Öğrenci cevapları okunuyor');
   assert.equal(getProjectArea('/project/project-1/ocr/review'), 'activities');
   assert.equal(getJobCenterButtonLabel(jobs), 'Öğrenci cevapları okunuyor');
+});
+
+test('project writes stay blocked until backend preflight explicitly allows them', () => {
+  assert.equal(isProjectWriteBlocked(undefined, { isLoading: true, isError: false }), true);
+  assert.equal(isProjectWriteBlocked(undefined, { isLoading: false, isError: true }), true);
+  assert.equal(
+    isProjectWriteBlocked({ decision: 'DO_NOT_OPEN_FOR_WRITING', initializationWriteAllowed: false }, { isLoading: false, isError: false }),
+    true,
+  );
+  assert.equal(
+    isProjectWriteBlocked({ decision: 'DO_NOT_OPEN_FOR_WRITING', initializationWriteAllowed: true }, { isLoading: false, isError: false }),
+    false,
+  );
+  assert.equal(
+    isProjectWriteBlocked({ decision: 'SAFE_TO_OPEN_WITH_BACKUP', initializationWriteAllowed: false }, { isLoading: false, isError: false }),
+    false,
+  );
 });

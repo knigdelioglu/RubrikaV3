@@ -98,9 +98,19 @@ pub async fn confirm_question_text(
     state: State<'_, AppState>,
     input: ConfirmQuestionTextInput,
 ) -> Result<Question, AppError> {
-    state
+    let question = state
         .question_text_service
-        .confirm_question_text(&input.project_id, &input.question_id)
+        .confirm_question_text(&input.project_id, &input.question_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "question_text_confirmed",
+            "Soru metni öğretmen tarafından onaylandı.",
+        )
+        .entity("question", &input.question_id),
+    )?;
+    Ok(question)
 }
 
 #[tauri::command]
@@ -108,9 +118,18 @@ pub async fn confirm_all_question_texts(
     state: State<'_, AppState>,
     input: ConfirmAllQuestionTextsInput,
 ) -> Result<Project, AppError> {
-    state
+    let project = state
         .question_text_service
-        .confirm_all_question_texts(&input.project_id)
+        .confirm_all_question_texts(&input.project_id)?;
+    super::audit_critical(
+        &state,
+        &input.project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "question_text_confirmed_all",
+            "Soru metinleri öğretmen tarafından onaylandı.",
+        ),
+    )?;
+    Ok(project)
 }
 
 #[tauri::command]

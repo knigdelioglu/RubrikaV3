@@ -16,6 +16,7 @@ use crate::domain::school_class::normalize_school_class_name;
 use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
 use crate::platform::project_paths::TrustedProjectRoot;
 use crate::platform::project_write_lease::{acquire_or_share, ProjectWriteLease};
+use crate::services::transaction_journal;
 use crate::services::workflow_engine;
 use serde_json::{Map, Value};
 
@@ -56,6 +57,18 @@ pub struct ListProjectsOutput {
     pub projects: Vec<ProjectListItem>,
     pub warnings: Vec<String>,
     pub skipped_projects: Vec<SkippedProject>,
+}
+
+/// Opening a project is explicit because inspection, normal writing and
+/// migration have different durability contracts. In particular, neither
+/// inspection nor a normal open may silently persist a migration or recovery.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectOpenMode {
+    InspectReadOnly,
+    #[default]
+    OpenWithoutMigration,
+    MigrateWithVerifiedBackup,
 }
 
 /// The canonical read result used by persistence-aware services. The
@@ -357,7 +370,20 @@ impl ProjectStore {
         })?;
         self.ensure_write_lease(&trusted_root)?;
         let project_path = trusted_root.managed("project.json")?;
-        if let Err(error) = trusted_root.create_new_file(&project_path, &content) {
+        if trusted_root.resolve_existing_file(&project_path).is_ok() {
+            if root_was_created {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            return Err(AppError {
+                code: AppErrorCode::ProjectAlreadyExists,
+                message: "Bu klasörde zaten bir Rubrika projesi bulunuyor.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Yeni proje için boş bir klasör seçin.".to_string()),
+                technical_details: Some(root.display().to_string()),
+                correlation_id: Uuid::new_v4().to_string(),
+            });
+        }
+        if let Err(error) = trusted_root.atomic_write(&project_path, &content) {
             if root_was_created {
                 let _ = std::fs::remove_dir_all(&root);
             }
@@ -371,8 +397,65 @@ impl ProjectStore {
     }
 
     pub fn open_project(&self, root_path: String) -> Result<Project, AppError> {
-        self.open_project_with_warnings(root_path)
+        self.open_project_with_mode(root_path, ProjectOpenMode::OpenWithoutMigration)
             .map(|(project, _)| project)
+    }
+
+    /// Opens a project under an explicit durability contract.
+    pub fn open_project_with_mode(
+        &self,
+        root_path: String,
+        mode: ProjectOpenMode,
+    ) -> Result<(Project, Vec<String>), AppError> {
+        let trusted_root = TrustedProjectRoot::open_selected(Path::new(&root_path))?;
+        if mode != ProjectOpenMode::InspectReadOnly {
+            self.ensure_write_lease(&trusted_root)?;
+        }
+        let mut loaded = Self::load_project_file_with_root(&trusted_root, true)?;
+        let migration_required = loaded.migration_changed || loaded.legacy_revision_missing;
+
+        if mode == ProjectOpenMode::OpenWithoutMigration && migration_required {
+            return Err(project_migration_required_error(&trusted_root, &loaded));
+        }
+
+        if mode == ProjectOpenMode::MigrateWithVerifiedBackup && migration_required {
+            let backup = crate::services::backup_service::create_verified_backup(
+                trusted_root.root(),
+                None,
+                &tokio_util::sync::CancellationToken::new(),
+            )?;
+            canonicalize_speaking_attempts(&mut loaded.project);
+            Self::persist_migrated_project(&trusted_root, &loaded.project)?;
+            loaded.warnings.push(format!(
+                "Migration verified backup created at {} before canonical commit.",
+                backup.archive_path
+            ));
+        }
+
+        if mode == ProjectOpenMode::InspectReadOnly {
+            if migration_required {
+                loaded.warnings.push(
+                    "Bu proje yeni veri biçimine geçirilmelidir; salt-okunur inceleme hiçbir değişiklik yapmadı."
+                        .to_string(),
+                );
+            }
+            return Ok((loaded.project, loaded.warnings));
+        }
+
+        self.legacy_project_without_revision
+            .store(loaded.legacy_revision_missing, Ordering::Relaxed);
+        let project_path =
+            trusted_root.resolve_existing_file(&trusted_root.managed("project.json")?)?;
+        let content = std::fs::read_to_string(&project_path).map_err(|error| {
+            project_error(
+                AppErrorCode::ProjectLoadFailed,
+                "Proje dosyası okunamadı.",
+                Some(error.to_string()),
+            )
+        })?;
+        self.set_trusted_root(trusted_root)?;
+        self.set_session_project(loaded.project.clone(), fingerprint(&content))?;
+        Ok((loaded.project, loaded.warnings))
     }
 
     /// Ensures this store holds the OS-level write lease for `root`.
@@ -717,6 +800,22 @@ impl ProjectStore {
             }
         }
 
+        let next_revision = current.revision.checked_add(1).ok_or_else(|| {
+            project_error(
+                AppErrorCode::ProjectMutationRejected,
+                "Proje revision sınırına ulaştı; değişiklik kaydedilmedi.",
+                None,
+            )
+        })?;
+        let transaction = transaction_journal::begin(
+            trusted_root.root(),
+            project_id,
+            &options.operation,
+            &options.correlation_id,
+            Some(current.revision),
+            Some(next_revision),
+        )?;
+
         let mut project = current.project;
         let context = MutationContext {
             project_id: project_id.to_string(),
@@ -726,18 +825,22 @@ impl ProjectStore {
             operation: options.operation,
             correlation_id: options.correlation_id.clone(),
         };
-        let result = mutation(&mut project, &context)?;
+        let result = match mutation(&mut project, &context) {
+            Ok(result) => result,
+            Err(error) => {
+                transaction_journal::update(
+                    trusted_root.root(),
+                    &transaction.transaction_id,
+                    "aborted",
+                )?;
+                return Err(error);
+            }
+        };
         canonicalize_speaking_attempts(&mut project);
         normalize_document_paths_for_save(&trusted_root, &mut project);
         project.root_path = trusted_root.root_string();
         project.updated_at = chrono::Utc::now().to_rfc3339();
-        project.storage_revision = current.revision.checked_add(1).ok_or_else(|| {
-            project_error(
-                AppErrorCode::ProjectMutationRejected,
-                "Proje revision sınırına ulaştı; değişiklik kaydedilmedi.",
-                None,
-            )
-        })?;
+        project.storage_revision = next_revision;
         project.workflow = workflow_engine::evaluate_workflow(&project);
         let content = serde_json::to_string_pretty(&project).map_err(|error| {
             project_error(
@@ -747,6 +850,7 @@ impl ProjectStore {
             )
         })?;
         trusted_root.atomic_write(&trusted_root.managed("project.json")?, &content)?;
+        transaction_journal::update(trusted_root.root(), &transaction.transaction_id, "complete")?;
         let new_fingerprint = fingerprint(&content);
         self.set_session_project(project.clone(), new_fingerprint.clone())?;
         Ok(MutationOutput {
@@ -817,8 +921,17 @@ impl ProjectStore {
                     .ok()
                     .and_then(|value| value.clone())
                     .filter(|value| value.storage_revision == candidate.storage_revision)
-            })
-            .unwrap_or_else(|| candidate.clone());
+            });
+        let Some(base) = base else {
+            return Err(project_error(
+                AppErrorCode::ProjectEntityStale,
+                "Proje değişikliği artık geçerli bir snapshot'a dayanmıyor; işlem uygulanmadı.",
+                Some(format!(
+                    "missing_base_revision={}; project_id={}",
+                    candidate.storage_revision, candidate.id
+                )),
+            ));
+        };
         let output = self.mutate(
             &project_id,
             MutationOptions::new("legacy_snapshot_merge"),
@@ -917,6 +1030,14 @@ impl ProjectStore {
         Self::load_project_file(&project_file, true).map(|loaded| loaded.project)
     }
 
+    /// Read-only migration inspection. It parses and normalizes in memory but
+    /// never acquires a writer lease or persists the normalized value.
+    pub fn migration_required_at_path(project_path: &Path) -> Result<bool, AppError> {
+        let trusted_root = TrustedProjectRoot::open_selected(project_path)?;
+        let loaded = Self::load_project_file_with_root(&trusted_root, true)?;
+        Ok(loaded.migration_changed || loaded.legacy_revision_missing)
+    }
+
     pub(crate) fn list_projects_in_dir(projects_root: &Path) -> ListProjectsOutput {
         let mut warnings = Vec::new();
         let mut skipped_projects = Vec::new();
@@ -1004,6 +1125,26 @@ fn project_error(code: AppErrorCode, message: &str, technical_details: Option<St
         recoverable: true,
         suggested_action: None,
         technical_details,
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
+fn project_migration_required_error(root: &TrustedProjectRoot, loaded: &LoadedProject) -> AppError {
+    AppError {
+        code: AppErrorCode::ProjectMigrationRequired,
+        message: "Bu proje yeni veri biçimine geçirilmelidir. Önce doğrulanmış yedek oluşturulacaktır."
+            .to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Migration modunda açmayı seçin; migration başlamadan önce bağımsız doğrulanmış yedek alınır."
+                .to_string(),
+        ),
+        technical_details: Some(format!(
+            "root={}; migration_changed={}; legacy_revision_missing={}",
+            root.root().display(),
+            loaded.migration_changed,
+            loaded.legacy_revision_missing
+        )),
         correlation_id: Uuid::new_v4().to_string(),
     }
 }
@@ -2952,7 +3093,11 @@ mod tests {
 
         let reopened_store = ProjectStore::new();
         let reopened = reopened_store
-            .open_project(root.to_string_lossy().to_string())
+            .open_project_with_mode(
+                root.to_string_lossy().to_string(),
+                ProjectOpenMode::InspectReadOnly,
+            )
+            .map(|(project, _)| project)
             .expect("canonical project should reload");
         assert_eq!(reopened.assessment_activities.len(), 1);
         assert_eq!(
@@ -3976,6 +4121,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_without_revision_history_is_rejected_without_a_noop_success() {
+        let root = temp_root();
+        let project = sample_project(&root, "Missing base", "2026-01-01T00:00:00Z");
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+
+        let mut stale = opened.clone();
+        stale.storage_revision = opened.storage_revision + 10_000;
+        let error = store
+            .commit_snapshot_cas(&stale)
+            .expect_err("a snapshot without a known base must not report success");
+
+        assert_eq!(error.code, AppErrorCode::ProjectEntityStale);
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.storage_revision, opened.storage_revision);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn expected_revision_conflict_does_not_use_last_write_wins() {
         let root = temp_root();
         let project = sample_project(&root, "CAS", "2026-01-01T00:00:00Z");
@@ -4443,5 +4611,10 @@ mod tests {
         assert_eq!(report.projects.len(), 1);
         assert_eq!(report.projects[0].name, "Legacy Visible");
         assert!(report.skipped_projects.is_empty());
+    }
+
+    #[test]
+    fn proof_35_stale_job_cannot_overwrite_teacher_change() {
+        job_narrow_commit_preserves_unrelated_mutation_and_stale_source_is_not_applied();
     }
 }

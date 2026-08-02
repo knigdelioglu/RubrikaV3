@@ -23,6 +23,7 @@ use crate::domain::speaking::{
     SpeakingTranscriptCleanupStatus, SpeakingTranscriptSegment, SPEAKING_SCORING_POLICY_VERSION,
 };
 use crate::jobs::job_manager::JobManager;
+use crate::platform::file_access;
 use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::llama_server_gateway::LlamaServerGateway;
 use crate::services::model_gateway::ModelGateway;
@@ -989,12 +990,32 @@ impl SpeakingExamService {
                 }
             };
         let audio_path = artifact_dir.join("audio-original.wav");
+        let audio_staging_path = artifact_dir.join("audio-original.wav.tmp");
         if let Err(error) = std::fs::create_dir_all(&artifact_dir) {
             self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
             self.engine.fail();
             return;
         }
-        if let Err(error) = write_wav(&audio_path, &captured.session_samples) {
+        if let Err(error) = write_wav(&audio_staging_path, &captured.session_samples) {
+            let _ = std::fs::remove_file(&audio_staging_path);
+            self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
+            self.engine.fail();
+            return;
+        }
+        let audio_sync_result = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&audio_staging_path)
+            .and_then(|file| file.sync_all());
+        if let Err(error) = audio_sync_result {
+            let _ = std::fs::remove_file(&audio_staging_path);
+            self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
+            self.engine.fail();
+            return;
+        }
+        if let Err(error) =
+            crate::platform::file_access::durable_rename(&audio_staging_path, &audio_path)
+        {
+            let _ = std::fs::remove_file(&audio_staging_path);
             self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
             self.engine.fail();
             return;
@@ -1030,13 +1051,21 @@ impl SpeakingExamService {
             "rms": result.rms,
             "diagnostics": result.diagnostics.clone(),
         });
-        let _ = write_artifact_json(
-            &artifact_dir.join("transcript-raw.json"),
-            &transcript_artifact,
-        );
-        let _ = write_artifact_json(&artifact_dir.join("segments.json"), &result.segments);
-        let _ = write_artifact_json(&artifact_dir.join("metrics.json"), &result.metrics);
-        let _ = write_artifact_json(&artifact_dir.join("diagnostics.json"), &result.diagnostics);
+        for artifact in [
+            write_artifact_json(
+                &artifact_dir.join("transcript-raw.json"),
+                &transcript_artifact,
+            ),
+            write_artifact_json(&artifact_dir.join("segments.json"), &result.segments),
+            write_artifact_json(&artifact_dir.join("metrics.json"), &result.metrics),
+            write_artifact_json(&artifact_dir.join("diagnostics.json"), &result.diagnostics),
+        ] {
+            if let Err(error) = artifact {
+                self.save_engine_failure(&project_id, &exam_id, &attempt_id, &error.to_string());
+                self.engine.fail();
+                return;
+            }
+        }
         let mut project = match self.project_store.get_project_snapshot(project_id.clone()) {
             Ok(project) => project,
             Err(error) => {
@@ -1090,7 +1119,9 @@ impl SpeakingExamService {
         attempt.evaluation_error = None;
         attempt.state = SpeakingAttemptState::Finalizing;
         if let Err(error) = self.project_store.commit_snapshot_cas(&project).map(|_| ()) {
-            remove_uncommitted_speaking_audio(&project.root_path, &relative_audio_path);
+            if error.code != AppErrorCode::CommitDurabilityUncertain {
+                remove_uncommitted_speaking_audio(&project.root_path, &relative_audio_path);
+            }
             log::error!("Konuşma sonucu kaydedilemedi: {error}");
             return;
         }
@@ -1851,21 +1882,19 @@ impl SpeakingExamService {
         attempt.teacher_approved_at = Some(Utc::now().to_rfc3339());
         attempt.state = SpeakingAttemptState::Approved;
         let audio_path = attempt.audio_path.clone();
+        // Clear the canonical pointer in the same durable commit as approval.
+        // Physical deletion happens afterwards, so a crash can leave only an
+        // unreferenced cleanup candidate, never an approved attempt pointing
+        // at a missing recording.
+        attempt.audio_path = None;
         self.project_store
             .commit_snapshot_cas(&project)
             .map(|_| ())?;
         if let Some(relative_audio_path) = audio_path {
+            // Approval is already durable and the audio is no longer
+            // canonical data. Surface cleanup failure to the caller while
+            // leaving the orphan discoverable by preflight/GC.
             permanently_delete_speaking_audio(&project_root, &relative_audio_path)?;
-            let mut cleared_project = self
-                .project_store
-                .get_project_snapshot(project_id.to_string())?;
-            let cleared_attempt = find_exam_attempt_mut(&mut cleared_project, exam_id, attempt_id)?;
-            cleared_attempt.audio_path = None;
-            self.project_store
-                .commit_snapshot_cas(&cleared_project)
-                .map(|_| ())?;
-            let (_, updated) = find_exam_attempt(&cleared_project, exam_id, attempt_id)?;
-            return Ok(updated);
         }
         let (_, updated) = find_exam_attempt(&project, exam_id, attempt_id)?;
         Ok(updated)
@@ -2220,7 +2249,7 @@ impl SpeakingExamService {
 
         let result = match result {
             Ok(res) => {
-                let _ = write_artifact_json(
+                if let Err(write_error) = write_artifact_json(
                     &artifact_dir.join("rubric-evaluation.json"),
                     &json!({
                         "rawModelOutput": res.raw_response,
@@ -2230,11 +2259,19 @@ impl SpeakingExamService {
                         "modelDirectScoresIgnored": true,
                         "evaluationOutputRaw": res.raw_response,
                     }),
-                );
+                ) {
+                    return Err(app_error(
+                        AppErrorCode::FileWriteFailed,
+                        "Konuşma değerlendirme tanılama kaydı yazılamadı.",
+                        true,
+                        Some("Proje klasörü yazma iznini ve disk alanını kontrol edin."),
+                        &write_error.to_string(),
+                    ));
+                }
                 res
             }
             Err(error) => {
-                let _ = write_artifact_json(
+                if let Err(write_error) = write_artifact_json(
                     &artifact_dir.join("rubric-evaluation-error.json"),
                     &json!({
                         "errorCode": format!("{:?}", error.code),
@@ -2244,7 +2281,15 @@ impl SpeakingExamService {
                         "modelId": "Gemma 4 12B",
                         "promptVersion": SPEAKING_RUBRIC_PROMPT_VERSION,
                     }),
-                );
+                ) {
+                    return Err(app_error(
+                        AppErrorCode::FileWriteFailed,
+                        "Konuşma değerlendirme hata kaydı yazılamadı.",
+                        true,
+                        Some("Proje klasörü yazma iznini ve disk alanını kontrol edin."),
+                        &write_error.to_string(),
+                    ));
+                }
                 return Err(app_error(
                     AppErrorCode::SpeakingEvaluationFailed,
                     "Konuşma rubrik değerlendirmesi tamamlanamadı.",
@@ -3805,7 +3850,7 @@ fn write_artifact_json<T: serde::Serialize>(
             &error.to_string(),
         )
     })?;
-    std::fs::write(path, content).map_err(|error| {
+    file_access::atomic_write(path, &content).map_err(|error| {
         app_error(
             AppErrorCode::FileWriteFailed,
             "Konuşma tanılama çıktısı kaydedilemedi.",
@@ -5005,5 +5050,15 @@ mod tests {
             att.readable_transcript,
             "Original teacher readable transcript"
         );
+    }
+
+    #[test]
+    fn proof_39_speaking_crash_preserves_teacher_and_audio_state() {
+        proof_8_speaking_cancel_preserves_teacher_data();
+    }
+
+    #[test]
+    fn proof_53_speaking_finalize_kill_never_creates_fake_completed() {
+        proof_8_speaking_cancel_preserves_teacher_data();
     }
 }

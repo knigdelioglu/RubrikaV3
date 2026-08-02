@@ -582,17 +582,18 @@ impl PdfPreviewService {
                 .parent()
                 .ok_or_else(|| preview_write_error("Önizleme generation yolu belirlenemedi."))?,
         )?;
-        std::fs::rename(&staging_dir, &generation_dir).map_err(|error| {
-            cleanup_preview_directory(&trusted_root, &staging_dir);
-            AppError {
-                code: AppErrorCode::PreviewGenerationFailed,
-                message: "Yeni PDF önizlemesi etkinleştirilemedi.".to_string(),
-                recoverable: true,
-                suggested_action: Some("Önizlemeyi yeniden oluşturun.".to_string()),
-                technical_details: Some(error.to_string()),
-                correlation_id: Uuid::new_v4().to_string(),
-            }
-        })?;
+        crate::platform::file_access::durable_rename_directory(&staging_dir, &generation_dir)
+            .map_err(|error| {
+                cleanup_preview_directory(&trusted_root, &staging_dir);
+                AppError {
+                    code: AppErrorCode::PreviewGenerationFailed,
+                    message: "Yeni PDF önizlemesi etkinleştirilemedi.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Önizlemeyi yeniden oluşturun.".to_string()),
+                    technical_details: Some(error.to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                }
+            })?;
 
         let commit = self.project_store.commit_job(
             &project_id,

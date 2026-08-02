@@ -3,7 +3,10 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::platform::file_access::{atomic_write, atomic_write_bytes as write_bytes};
+use crate::platform::file_access::{
+    atomic_write, atomic_write_bytes as write_bytes, is_durability_uncertain,
+    is_durability_unsupported,
+};
 
 const PROJECT_FILE_NAME: &str = "project.json";
 
@@ -510,9 +513,22 @@ impl TrustedProjectRoot {
         let temp = target.with_extension("tmp");
         self.ensure_write_candidate(&temp)?;
         atomic_write(&target, content).map_err(|error| {
+            let code = if is_durability_uncertain(&error) {
+                AppErrorCode::CommitDurabilityUncertain
+            } else if is_durability_unsupported(&error) {
+                AppErrorCode::CommitDurabilityUnsupported
+            } else {
+                AppErrorCode::ProjectSaveFailed
+            };
             project_io_error(
-                AppErrorCode::ProjectSaveFailed,
-                "Proje dosyası güvenli biçimde yazılamadı.",
+                code,
+                if is_durability_uncertain(&error) {
+                    "Proje yazıldı ancak dayanıklılık doğrulanamadı; kaydedildi bildirimi gösterilmemeli."
+                } else if is_durability_unsupported(&error) {
+                    "Proje yazıldı ancak platform parent klasör dayanıklılığını doğrulamıyor."
+                } else {
+                    "Proje dosyası güvenli biçimde yazılamadı."
+                },
                 &target,
                 error,
             )
@@ -528,9 +544,22 @@ impl TrustedProjectRoot {
     ) -> Result<(), AppError> {
         let target = self.prepare_write_target(managed)?;
         write_bytes(&target, content).map_err(|error| {
+            let code = if is_durability_uncertain(&error) {
+                AppErrorCode::CommitDurabilityUncertain
+            } else if is_durability_unsupported(&error) {
+                AppErrorCode::CommitDurabilityUnsupported
+            } else {
+                AppErrorCode::ProjectSaveFailed
+            };
             unsafe_path_io_error(
-                AppErrorCode::ProjectSaveFailed,
-                "Proje içi dosya güvenli biçimde yazılamadı.",
+                code,
+                if is_durability_uncertain(&error) {
+                    "Dosya yazıldı ancak dayanıklılık doğrulanamadı."
+                } else if is_durability_unsupported(&error) {
+                    "Dosya yazıldı ancak platform parent klasör dayanıklılığını doğrulamıyor."
+                } else {
+                    "Proje içi dosya güvenli biçimde yazılamadı."
+                },
                 managed.as_str(),
                 error,
             )

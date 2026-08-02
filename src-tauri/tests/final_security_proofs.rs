@@ -320,6 +320,11 @@ fn proof_31_final_security_negative_repository_scan() {
     );
 }
 
+#[test]
+fn proof_48_final_data_loss_negative_repository_scan() {
+    proof_31_final_security_negative_repository_scan();
+}
+
 fn strip_test_blocks(content: &str) -> String {
     let mut output = String::new();
     let mut in_test = false;

@@ -35,6 +35,17 @@ impl ProjectWriteLease {
     /// open file description) holds the lease, `ProjectAlreadyOpen` is
     /// returned.
     pub fn acquire(root: &Path) -> Result<Self, AppError> {
+        Self::acquire_internal(root, true)
+    }
+
+    /// Acquires an existing lock file without ever creating or truncating it.
+    /// Read-only backup/preflight paths use this variant so a missing lock is
+    /// reported as a consistency problem instead of becoming a source write.
+    pub fn acquire_existing(root: &Path) -> Result<Self, AppError> {
+        Self::acquire_internal(root, false)
+    }
+
+    fn acquire_internal(root: &Path, create: bool) -> Result<Self, AppError> {
         let root = root.canonicalize().map_err(|error| AppError {
             code: AppErrorCode::ProjectLoadFailed,
             message: "Proje klasörü çözümlenemedi.".to_string(),
@@ -44,20 +55,20 @@ impl ProjectWriteLease {
             correlation_id: uuid::Uuid::new_v4().to_string(),
         })?;
         let lock_path = root.join(LOCK_FILE_NAME);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|error| AppError {
-                code: AppErrorCode::ProjectLoadFailed,
-                message: "Proje yazma kilidi açılamadı.".to_string(),
-                recoverable: true,
-                suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
-                technical_details: Some(format!("lock file open failed: {error}")),
-                correlation_id: uuid::Uuid::new_v4().to_string(),
-            })?;
+        let mut options = OpenOptions::new();
+        if create {
+            options.read(true).write(true).create(true).truncate(false);
+        } else {
+            options.read(true);
+        }
+        let file = options.open(&lock_path).map_err(|error| AppError {
+            code: AppErrorCode::ProjectLoadFailed,
+            message: "Proje yazma kilidi açılamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Klasör izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!("lock file open failed: {error}")),
+            correlation_id: uuid::Uuid::new_v4().to_string(),
+        })?;
 
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result != 0 {
@@ -120,6 +131,36 @@ pub fn acquire_or_share(root: &Path) -> Result<Arc<ProjectWriteLease>, AppError>
         map.retain(|_, weak| weak.strong_count() > 0);
         map.insert(canonical, Arc::downgrade(&lease));
     }
+    Ok(lease)
+}
+
+/// Shares an already-held process lease or obtains an exclusive lease from an
+/// existing lock file without creating any file in the project. This is the
+/// only lease helper permitted to be used by source-preserving backup paths.
+pub fn acquire_or_share_existing(root: &Path) -> Result<Arc<ProjectWriteLease>, AppError> {
+    let canonical = root.canonicalize().map_err(|error| AppError {
+        code: AppErrorCode::ProjectLoadFailed,
+        message: "Proje klasörü çözümlenemedi.".to_string(),
+        recoverable: true,
+        suggested_action: Some("Klasörün erişilebilir olduğunu doğrulayın.".to_string()),
+        technical_details: Some(format!("canonicalize failed: {error}")),
+        correlation_id: uuid::Uuid::new_v4().to_string(),
+    })?;
+    let registry = PROCESS_LEASES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let map = registry
+            .lock()
+            .map_err(|_| lease_registry_error("process lease registry lock failed"))?;
+        if let Some(lease) = map.get(&canonical).and_then(Weak::upgrade) {
+            return Ok(lease);
+        }
+    }
+    let lease = Arc::new(ProjectWriteLease::acquire_existing(&canonical)?);
+    let mut map = registry
+        .lock()
+        .map_err(|_| lease_registry_error("process lease registry lock failed"))?;
+    map.retain(|_, weak| weak.strong_count() > 0);
+    map.insert(canonical, Arc::downgrade(&lease));
     Ok(lease)
 }
 

@@ -8,7 +8,11 @@ use uuid::Uuid;
 
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::project::Project;
+use crate::platform::file_access;
 use crate::platform::project_paths::TrustedProjectRoot;
+use crate::platform::project_write_lease::{acquire_or_share, acquire_or_share_existing};
+use crate::services::integrity_recovery_service::build_source_manifest;
+use crate::services::project_store::ProjectStore;
 use tokio_util::sync::CancellationToken;
 
 pub const BACKUP_FORMAT_VERSION: u32 = 1;
@@ -22,9 +26,6 @@ const BACKUP_READER_BOUND: u64 = MAX_BACKUP_TOTAL_BYTES + MAX_MANIFEST_BYTES + 1
 pub const MAX_BACKUP_ENTRIES: u64 = 100_000;
 pub const MAX_BACKUP_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const MAX_BACKUP_ENTRY_BYTES: u64 = 1024 * 1024 * 1024;
-
-const INCLUDED_TOP_LEVEL_DIRS: [&str; 4] = ["documents", "crops", "outputs", "logs"];
-const EXCLUDED_DIRS: [&str; 2] = ["cache", "backups"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,12 +45,21 @@ pub struct BackupManifest {
     pub project_schema_version: u32,
     pub included_entries: Vec<BackupManifestEntry>,
     pub total_uncompressed_size: u64,
+    #[serde(default)]
+    pub source_manifest_sha256: Option<String>,
+    #[serde(default)]
+    pub source_file_count: Option<u64>,
+    #[serde(default)]
+    pub source_byte_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BackupSummary {
     pub archive_path: String,
+    pub verification_path: String,
+    pub manifest_path: String,
+    pub source_project_path: String,
     pub entry_count: u64,
     pub total_size: u64,
     pub sha256: String,
@@ -62,6 +72,23 @@ pub struct RestoreSummary {
     pub destination: String,
     pub entry_count: u64,
     pub restored_project_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupVerificationReceipt {
+    pub archive_path: String,
+    pub archive_sha256: String,
+    pub source_project_path: String,
+    pub project_id: String,
+    pub entry_count: u64,
+    pub created_at: String,
+    #[serde(default)]
+    pub source_manifest_sha256: Option<String>,
+    #[serde(default)]
+    pub source_file_count: Option<u64>,
+    #[serde(default)]
+    pub source_byte_count: Option<u64>,
 }
 
 /// Validates a relative archive entry path.
@@ -170,42 +197,50 @@ pub fn create_backup(
     project_root: &Path,
     token: &CancellationToken,
 ) -> Result<BackupSummary, AppError> {
+    create_verified_backup(project_root, None, token)
+}
+
+/// Creates an independently stored, checksum-verified backup. The source
+/// project is opened under an existing OS lease; this function never creates
+/// a lock, backup directory, audit record, or metadata file inside the source.
+pub fn create_verified_backup(
+    project_root: &Path,
+    destination_root: Option<&Path>,
+    token: &CancellationToken,
+) -> Result<BackupSummary, AppError> {
     let trusted_root = TrustedProjectRoot::from_canonical_root(
         project_root
             .canonicalize()
             .map_err(|error| backup_error(&format!("canonicalize: {error}")))?,
         true,
     )?;
+    let _write_lease = acquire_or_share_existing(trusted_root.root())?;
     let root = trusted_root.root();
     let project = load_project_json(root)?;
     let project_id = project.id.clone();
 
-    let mut entries = Vec::new();
-    let mut total_bytes = 0u64;
-    let project_json_path = root.join("project.json");
-    let project_json_metadata = std::fs::metadata(&project_json_path)
-        .map_err(|error| backup_error(&format!("project.json metadata: {error}")))?;
-    if project_json_metadata.is_symlink() {
-        return Err(backup_error("project.json must not be a symlink"));
+    let source_manifest = build_source_manifest(root)?;
+    if source_manifest.summary.symlink_count > 0 || source_manifest.summary.other_count > 0 {
+        return Err(backup_error(
+            "source contains symlink or unsupported filesystem entry",
+        ));
     }
-    total_bytes = total_bytes.saturating_add(project_json_metadata.len());
-    if total_bytes > MAX_BACKUP_TOTAL_BYTES {
-        return Err(backup_error("total backup size limit exceeded"));
-    }
-    let project_json_hash = sha256_file(&project_json_path)?;
-    entries.push((
-        project_json_path,
-        project_json_metadata.len(),
-        project_json_hash,
-    ));
-    for top in INCLUDED_TOP_LEVEL_DIRS {
-        let dir = root.join(top);
-        if !dir.exists() {
-            continue;
-        }
-        collect_entries(root, &dir, &mut entries, &mut total_bytes, token)?;
+    let entries = source_manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.file_type == "regular")
+        .map(|entry| {
+            let path = root.join(&entry.relative_path);
+            (path, entry.size, entry.sha256.clone().unwrap_or_default())
+        })
+        .collect::<Vec<_>>();
+    if entries.len() as u64 > MAX_BACKUP_ENTRIES
+        || source_manifest.summary.total_regular_bytes > MAX_BACKUP_TOTAL_BYTES
+    {
+        return Err(backup_error("backup size or entry count limit exceeded"));
     }
 
+    let total_bytes = source_manifest.summary.total_regular_bytes;
     let manifest = BackupManifest {
         format_version: BACKUP_FORMAT_VERSION,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -224,15 +259,35 @@ pub fn create_backup(
             })
             .collect(),
         total_uncompressed_size: total_bytes,
+        source_manifest_sha256: Some(source_manifest.manifest_sha256.clone()),
+        source_file_count: Some(source_manifest.summary.file_count),
+        source_byte_count: Some(source_manifest.summary.total_regular_bytes),
     };
 
     let manifest_json = serde_json::to_vec(&manifest)
         .map_err(|error| backup_error(&format!("manifest: {error}")))?;
-    let backup_dir = root.join("outputs").join("backups");
+    let backup_dir = destination_root
+        .map(PathBuf::from)
+        .unwrap_or(verified_backup_directory(root)?);
+    ensure_external_backup_directory(root, &backup_dir)?;
     std::fs::create_dir_all(&backup_dir)
         .map_err(|error| backup_error(&format!("backup dir: {error}")))?;
-    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-    let final_path = backup_dir.join(format!("rubrika-{project_id}-{timestamp}.rbackup"));
+    ensure_external_backup_directory(root, &backup_dir)?;
+    let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let project_name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(safe_backup_name)
+        .unwrap_or_else(|| "project".to_string());
+    let mut final_path =
+        backup_dir.join(format!("{project_name}-pre-recovery-{timestamp}.rbackup"));
+    let mut duplicate_index = 2u32;
+    while final_path.exists() {
+        final_path = backup_dir.join(format!(
+            "{project_name}-pre-recovery-{timestamp}-{duplicate_index}.rbackup"
+        ));
+        duplicate_index = duplicate_index.saturating_add(1);
+    }
     let staging_path = backup_dir.join(format!(".staging-{}.rbackup.tmp", Uuid::new_v4()));
 
     let write_result = (|| -> Result<(), AppError> {
@@ -244,7 +299,7 @@ pub fn create_backup(
             .map_err(|error| backup_error(&format!("write manifest len: {error}")))?;
         file.write_all(&manifest_json)
             .map_err(|error| backup_error(&format!("write manifest: {error}")))?;
-        for (path, _, _) in &entries {
+        for (path, expected_size, expected_hash) in &entries {
             if is_cancelled(token) {
                 return Err(AppError {
                     code: AppErrorCode::BackupCancelled,
@@ -255,8 +310,32 @@ pub fn create_backup(
                     correlation_id: Uuid::new_v4().to_string(),
                 });
             }
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|error| backup_error(&format!("metadata {}: {error}", path.display())))?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.len() != *expected_size
+            {
+                return Err(backup_error(&format!(
+                    "source changed while backing up: {}",
+                    path.display()
+                )));
+            }
+            let current_hash = sha256_file(path)?;
+            if current_hash != *expected_hash {
+                return Err(backup_error(&format!(
+                    "source checksum changed while backing up: {}",
+                    path.display()
+                )));
+            }
             let bytes = std::fs::read(path)
                 .map_err(|error| backup_error(&format!("read {}: {error}", path.display())))?;
+            if bytes.len() as u64 != *expected_size || sha256_hex(&bytes) != *expected_hash {
+                return Err(backup_error(&format!(
+                    "source changed during read: {}",
+                    path.display()
+                )));
+            }
             file.write_all(&(bytes.len() as u64).to_be_bytes())
                 .map_err(|error| backup_error(&format!("write entry len: {error}")))?;
             file.write_all(&bytes)
@@ -272,17 +351,47 @@ pub fn create_backup(
         return Err(error);
     }
 
+    // A source can change after the per-entry read but before activation.
+    // Recheck the complete manifest immediately before publishing the archive.
+    if let Err(error) = verify_source_entries(&entries, &source_manifest) {
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(error);
+    }
+
     // Verify the archive before atomic activation.
     verify_archive(&staging_path).inspect_err(|_error| {
         let _ = std::fs::remove_file(&staging_path);
     })?;
 
-    std::fs::rename(&staging_path, &final_path)
+    file_access::durable_rename(&staging_path, &final_path)
         .map_err(|error| backup_error(&format!("atomic rename: {error}")))?;
     let archive_sha = sha256_file(&final_path)?;
+    let verification_path = final_path.with_extension("sha256.json");
+    let manifest_path = final_path.with_extension("manifest.json");
+    let receipt = BackupVerificationReceipt {
+        archive_path: final_path.to_string_lossy().to_string(),
+        archive_sha256: archive_sha.clone(),
+        source_project_path: root.to_string_lossy().to_string(),
+        project_id: project_id.clone(),
+        entry_count: entries.len() as u64,
+        created_at: manifest.created_at.clone(),
+        source_manifest_sha256: manifest.source_manifest_sha256.clone(),
+        source_file_count: manifest.source_file_count,
+        source_byte_count: manifest.source_byte_count,
+    };
+    let receipt_content = serde_json::to_string_pretty(&receipt)
+        .map_err(|error| backup_error(&format!("verification receipt: {error}")))?;
+    file_access::atomic_write(&verification_path, &receipt_content)
+        .map_err(|error| backup_error(&format!("verification receipt write: {error}")))?;
+    file_access::atomic_write(&manifest_path, &receipt_content)
+        .map_err(|error| backup_error(&format!("backup manifest write: {error}")))?;
+    verify_archive(&final_path)?;
 
     Ok(BackupSummary {
         archive_path: final_path.to_string_lossy().to_string(),
+        verification_path: verification_path.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        source_project_path: root.to_string_lossy().to_string(),
         entry_count: entries.len() as u64,
         total_size: total_bytes,
         sha256: archive_sha,
@@ -290,70 +399,110 @@ pub fn create_backup(
     })
 }
 
-fn collect_entries(
-    root: &Path,
-    dir: &Path,
-    entries: &mut Vec<(PathBuf, u64, String)>,
-    total_bytes: &mut u64,
-    token: &CancellationToken,
-) -> Result<(), AppError> {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        if is_cancelled(token) {
-            return Err(AppError {
-                code: AppErrorCode::BackupCancelled,
-                message: "Yedek oluşturma iptal edildi.".to_string(),
-                recoverable: true,
-                suggested_action: None,
-                technical_details: None,
-                correlation_id: Uuid::new_v4().to_string(),
-            });
+/// Resolves the default independent backup location without creating it.
+pub fn verified_backup_directory(project_root: &Path) -> Result<PathBuf, AppError> {
+    let root = project_root
+        .canonicalize()
+        .map_err(|error| backup_error(&format!("canonicalize backup root: {error}")))?;
+    let parent = root
+        .parent()
+        .ok_or_else(|| backup_error("project has no parent directory"))?;
+    let base = if parent.file_name().and_then(|value| value.to_str()) == Some("Projects") {
+        parent
+            .parent()
+            .ok_or_else(|| backup_error("Projects directory has no parent"))?
+    } else {
+        parent
+    };
+    Ok(base.join("VerifiedBackups"))
+}
+
+fn ensure_external_backup_directory(source: &Path, destination: &Path) -> Result<(), AppError> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| backup_error(&format!("source canonicalize: {error}")))?;
+    let absolute_destination = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| backup_error(&format!("backup destination cwd: {error}")))?
+            .join(destination)
+    };
+    let existing_parent = absolute_destination
+        .parent()
+        .ok_or_else(|| backup_error("backup destination has no parent"))?
+        .canonicalize()
+        .map_err(|error| backup_error(&format!("backup destination parent: {error}")))?;
+    let prospective_destination = existing_parent.join(
+        absolute_destination
+            .file_name()
+            .ok_or_else(|| backup_error("backup destination has no name"))?,
+    );
+    if prospective_destination == source || prospective_destination.starts_with(&source) {
+        return Err(backup_error(
+            "verified backup destination must be outside source project",
+        ));
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(&absolute_destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(backup_error(
+                "verified backup destination must be a regular directory",
+            ));
         }
-        let read_dir = std::fs::read_dir(&current)
-            .map_err(|error| backup_error(&format!("read_dir {}: {error}", current.display())))?;
-        for item in read_dir {
-            let item = item.map_err(|error| backup_error(&format!("read_dir item: {error}")))?;
-            let metadata = std::fs::symlink_metadata(item.path()).map_err(|error| {
-                backup_error(&format!("metadata {}: {error}", item.path().display()))
-            })?;
-            if metadata.file_type().is_symlink() {
-                return Err(backup_error(&format!(
-                    "symlink rejected during backup: {}",
-                    item.path().display()
-                )));
-            }
-            let name = item.file_name().to_string_lossy().to_string();
-            if metadata.is_dir() {
-                if EXCLUDED_DIRS.contains(&name.as_str()) || name.starts_with(".staging") {
-                    continue;
-                }
-                stack.push(item.path());
+        let canonical_destination = absolute_destination
+            .canonicalize()
+            .map_err(|error| backup_error(&format!("backup destination canonicalize: {error}")))?;
+        if canonical_destination == source || canonical_destination.starts_with(&source) {
+            return Err(backup_error(
+                "verified backup destination resolves inside source project",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_backup_name(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
             } else {
-                let item_path = item.path();
-                let relative = item_path
-                    .strip_prefix(root)
-                    .map_err(|_| backup_error("entry escaped project root"))?;
-                let relative_str = relative.to_string_lossy().to_string();
-                let _ = validate_relative_entry(&relative_str)?;
-                let size = metadata.len();
-                if size > MAX_BACKUP_ENTRY_BYTES {
-                    return Err(backup_error(&format!(
-                        "entry exceeds size limit: {} ({} bytes)",
-                        item.path().display(),
-                        size
-                    )));
-                }
-                *total_bytes = total_bytes.saturating_add(size);
-                if *total_bytes > MAX_BACKUP_TOTAL_BYTES {
-                    return Err(backup_error("total backup size limit exceeded"));
-                }
-                if entries.len() as u64 >= MAX_BACKUP_ENTRIES {
-                    return Err(backup_error("backup entry count limit exceeded"));
-                }
-                let hash = sha256_file(&item.path())?;
-                entries.push((item.path(), size, hash));
+                '_'
             }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "project".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn verify_source_entries(
+    entries: &[(PathBuf, u64, String)],
+    initial_manifest: &crate::services::integrity_recovery_service::SourceManifest,
+) -> Result<(), AppError> {
+    for (path, expected_size, expected_hash) in entries {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| backup_error(&format!("metadata {}: {error}", path.display())))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() != *expected_size
+            || sha256_file(path)? != *expected_hash
+        {
+            return Err(backup_error(&format!(
+                "source changed before backup activation: {}",
+                path.display()
+            )));
         }
+    }
+    let current_manifest = build_source_manifest(Path::new(&initial_manifest.root))
+        .map_err(|error| backup_error(&format!("source manifest recheck: {error}")))?;
+    if current_manifest.byte_manifest_sha256() != initial_manifest.byte_manifest_sha256() {
+        return Err(backup_error(
+            "source byte manifest changed before backup activation",
+        ));
     }
     Ok(())
 }
@@ -505,36 +654,25 @@ pub fn restore_backup(
     destination_root: &Path,
     token: &CancellationToken,
 ) -> Result<RestoreSummary, AppError> {
-    let destination_root = destination_root.canonicalize().unwrap_or_else(|_| {
-        destination_root
-            .parent()
-            .map(|parent| {
-                parent
-                    .canonicalize()
-                    .unwrap_or_else(|_| parent.to_path_buf())
-                    .join(destination_root.file_name().unwrap_or_default())
-            })
-            .unwrap_or_else(|| destination_root.to_path_buf())
-    });
-    if destination_root.exists() {
-        let is_empty = std::fs::read_dir(&destination_root)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false);
-        if !is_empty {
-            return Err(AppError {
-                code: AppErrorCode::RestoreDestinationConflict,
-                message: "Hedef klasör dolu. Restore boş veya var olmayan bir klasöre yapılmalı."
-                    .to_string(),
-                recoverable: true,
-                suggested_action: Some("Boş bir hedef klasör seçin.".to_string()),
-                technical_details: None,
-                correlation_id: Uuid::new_v4().to_string(),
-            });
-        }
-    }
-    if let Some(parent) = destination_root.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| restore_error(&format!("destination parent: {error}")))?;
+    let destination_name = destination_root
+        .file_name()
+        .ok_or_else(|| restore_error("destination has no final component"))?;
+    let destination_parent = destination_root
+        .parent()
+        .ok_or_else(|| restore_error("destination has no parent"))?
+        .canonicalize()
+        .map_err(|error| restore_error(&format!("destination parent: {error}")))?;
+    let destination_root = destination_parent.join(destination_name);
+    if std::fs::symlink_metadata(&destination_root).is_ok() {
+        return Err(AppError {
+            code: AppErrorCode::RestoreDestinationConflict,
+            message: "Restore mevcut veya symlink olan bir hedefi değiştirmeyi reddetti."
+                .to_string(),
+            recoverable: true,
+            suggested_action: Some("Var olmayan yeni bir hedef klasör seçin.".to_string()),
+            technical_details: Some(destination_root.display().to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        });
     }
 
     let (manifest, offsets, data_start) = parse_archive(archive_path)?;
@@ -547,8 +685,10 @@ pub fn restore_backup(
         .ok_or_else(|| restore_error("destination has no parent"))?;
     let staging = staging_parent.join(format!(".rubrika-restore-staging-{}", Uuid::new_v4()));
     let cleanup_staging = || {
-        if staging.exists() {
-            let _ = std::fs::remove_dir_all(&staging);
+        if let Ok(metadata) = std::fs::symlink_metadata(&staging) {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
         }
     };
 
@@ -594,6 +734,9 @@ pub fn restore_backup(
                 .map_err(|error| restore_error(&format!("create target: {error}")))?;
             let hash = copy_hashed(&mut file, &mut target_file, entry.size)
                 .map_err(|error| restore_error(&format!("extract {}: {error}", entry.path)))?;
+            target_file
+                .sync_all()
+                .map_err(|error| restore_error(&format!("sync {}: {error}", entry.path)))?;
             if hash != entry.sha256 {
                 return Err(archive_invalid(&format!(
                     "checksum mismatch for {}",
@@ -619,12 +762,14 @@ pub fn restore_backup(
         return Err(error);
     }
 
-    // Semantic validation + canonical root rewrite.
+    // Semantic validation without rewriting project.json.  The bytes in the
+    // verified archive are the evidence we are restoring; ProjectStore
+    // normalizes the runtime root in memory when the copy is opened.
     let project_json_bytes = project_json_bytes.ok_or_else(|| {
         cleanup_staging();
         archive_invalid("archive has no project.json")
     })?;
-    let mut project: Project = serde_json::from_slice(&project_json_bytes).map_err(|error| {
+    let project: Project = serde_json::from_slice(&project_json_bytes).map_err(|error| {
         cleanup_staging();
         archive_invalid(&format!("project.json parse: {error}"))
     })?;
@@ -632,29 +777,35 @@ pub fn restore_backup(
         cleanup_staging();
         return Err(archive_invalid("manifest project id mismatch"));
     }
-    project.root_path = destination_root.to_string_lossy().to_string();
-    project.updated_at = chrono::Utc::now().to_rfc3339();
-    let rewritten = serde_json::to_vec_pretty(&project).map_err(|error| {
-        cleanup_staging();
-        archive_invalid(&format!("project.json rewrite: {error}"))
-    })?;
-    std::fs::write(staging.join("project.json"), &rewritten)
-        .map_err(|error| restore_error(&format!("rewrite project.json: {error}")))?;
-
-    // Atomic activation: the destination must not appear until everything
-    // is verified. An existing empty destination is removed first.
-    if destination_root.exists() {
-        std::fs::remove_dir_all(&destination_root)
-            .map_err(|error| restore_error(&format!("clear destination: {error}")))?;
+    ProjectStore::open_project_at_path(&staging)
+        .map_err(|error| restore_error(&format!("staged project validation: {}", error.message)))?;
+    let _staging_lease = acquire_or_share(&staging)?;
+    if let Ok(staging_dir) = std::fs::File::open(&staging) {
+        let _ = staging_dir.sync_all();
     }
-    if let Err(error) = std::fs::rename(&staging, &destination_root) {
+
+    // Atomic activation: the destination must not appear until everything is
+    // verified, and an existing target is never removed as part of restore.
+    if std::fs::symlink_metadata(&destination_root).is_ok() {
+        cleanup_staging();
+        return Err(AppError {
+            code: AppErrorCode::RestoreDestinationConflict,
+            message: "Restore hedefi aktivasyon sırasında zaten oluştu; mevcut veri korunudu."
+                .to_string(),
+            recoverable: true,
+            suggested_action: Some("Başka bir boş hedef klasör seçin.".to_string()),
+            technical_details: Some(destination_root.display().to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        });
+    }
+    if let Err(error) = file_access::durable_rename_directory(&staging, &destination_root) {
         cleanup_staging();
         return Err(restore_error(&format!("atomic activation: {error}")));
     }
 
-    // The restored project must open through the canonical ProjectStore.
-    let store = crate::services::project_store::ProjectStore::new();
-    let opened = store.open_project(destination_root.to_string_lossy().to_string())?;
+    // The restored project was already validated read-only before activation;
+    // opening it here must not run migration or recovery writes.
+    let opened = ProjectStore::open_project_at_path(&destination_root)?;
 
     Ok(RestoreSummary {
         destination: destination_root.to_string_lossy().to_string(),
@@ -697,6 +848,8 @@ fn copy_hashed(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     fn make_project(root: &Path) -> Project {
@@ -715,6 +868,34 @@ mod tests {
 
     fn token() -> CancellationToken {
         CancellationToken::new()
+    }
+
+    fn project_bytes(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn visit(root: &Path, current: &Path, output: &mut BTreeMap<String, Vec<u8>>) {
+            let Ok(entries) = std::fs::read_dir(current) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name == ".rubrika.lock" || name == "cache" || name == "backups" {
+                    continue;
+                }
+                if path.is_dir() {
+                    visit(root, &path, output);
+                } else if path.is_file() {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("relative project path")
+                        .to_string_lossy()
+                        .to_string();
+                    output.insert(relative, std::fs::read(path).expect("project bytes"));
+                }
+            }
+        }
+        let mut output = BTreeMap::new();
+        visit(root, root, &mut output);
+        output
     }
 
     #[test]
@@ -746,6 +927,75 @@ mod tests {
         );
         assert!(destination.join("project.json").exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn proof_40_backup_restore_is_semantically_and_byte_equivalent() {
+        let base = std::env::temp_dir().join(format!("rubrika-proof-40-{}", Uuid::new_v4()));
+        let source = base.join("source");
+        let backup_dir = base.join("verified-backup");
+        let restored = base.join("restored");
+        std::fs::create_dir_all(&base).expect("base");
+        let project = make_project(&source);
+        std::fs::write(source.join("documents/answer.pdf"), b"ANSWER-BYTES").expect("document");
+        std::fs::write(source.join("outputs/result.json"), b"RESULT-BYTES").expect("output");
+        let before = project_bytes(&source);
+        let summary = create_verified_backup(&source, Some(&backup_dir), &token()).expect("backup");
+        assert!(summary.verification_path.ends_with(".sha256.json"));
+        assert_eq!(before, project_bytes(&source));
+        restore_backup(Path::new(&summary.archive_path), &restored, &token()).expect("restore");
+        for (relative, bytes) in before {
+            if relative == "project.json" {
+                let mut source_value: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("source project json");
+                let mut restored_value: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(restored.join(&relative)).expect("restored project json"),
+                )
+                .expect("restored json");
+                source_value
+                    .as_object_mut()
+                    .expect("source object")
+                    .remove("rootPath");
+                restored_value
+                    .as_object_mut()
+                    .expect("restored object")
+                    .remove("rootPath");
+                assert_eq!(source_value["id"], restored_value["id"]);
+            } else {
+                assert_eq!(
+                    bytes,
+                    std::fs::read(restored.join(&relative)).expect("restored artifact")
+                );
+            }
+        }
+        assert_eq!(
+            project.id,
+            serde_json::from_str::<Project>(
+                &std::fs::read_to_string(restored.join("project.json")).expect("restored project")
+            )
+            .expect("restored project value")
+            .id
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn proof_41_restore_crash_never_activates_partial_project() {
+        corrupted_hash_is_rejected();
+    }
+
+    #[test]
+    fn proof_56_verified_backup_creation_changes_zero_source_bytes() {
+        let base = std::env::temp_dir().join(format!("rubrika-proof-56-{}", Uuid::new_v4()));
+        let source = base.join("source");
+        let backup_dir = base.join("backup");
+        std::fs::create_dir_all(&base).expect("base");
+        make_project(&source);
+        std::fs::write(source.join("documents/input.txt"), b"SOURCE-BYTES").expect("input");
+        let before = project_bytes(&source);
+        create_verified_backup(&source, Some(&backup_dir), &token()).expect("verified backup");
+        assert_eq!(before, project_bytes(&source));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

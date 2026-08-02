@@ -1,7 +1,7 @@
 use crate::domain::errors::AppError;
 use crate::domain::project::Project;
 use crate::services::audit_service::AuditEntryInput;
-use crate::services::project_store::ListProjectsOutput;
+use crate::services::project_store::{ListProjectsOutput, ProjectOpenMode};
 use crate::AppState;
 use tauri::State;
 
@@ -23,6 +23,8 @@ pub struct CreateProjectInput {
 pub struct OpenProjectInput {
     pub project_path: Option<String>,
     pub root_path: Option<String>,
+    #[serde(default)]
+    pub mode: Option<ProjectOpenMode>,
 }
 
 #[derive(serde::Deserialize)]
@@ -64,10 +66,12 @@ pub async fn create_project(
         input.course_id,
         input.course_name,
     )?;
-    let _ = state.audit_service.append(
+    state.audit_service.append_transactionally(
         std::path::Path::new(&project.root_path),
         AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.").project(&project.id),
-    );
+        None,
+        Some(project.storage_revision),
+    )?;
     Ok(CreateProjectOutput {
         project_path: project.root_path.clone(),
         project,
@@ -87,14 +91,34 @@ pub async fn open_project(
         .unwrap_or_default();
     let (project, warnings) = state
         .project_store
-        .open_project_with_warnings(project_path.clone())?;
-    let _ = state.audit_service.append(
-        std::path::Path::new(&project.root_path),
-        AuditEntryInput::new("project_opened", "Proje açıldı.").project(&project.id),
-    );
-    let _ = state
-        .job_manager
-        .rehydrate_jobs(std::path::Path::new(&project.root_path));
+        .open_project_with_mode(project_path.clone(), input.mode.unwrap_or_default())?;
+    // Opening is deliberately not an audit mutation. The command is allowed
+    // to read/lock the project, but it must not append to source audit.jsonl
+    // or rehydrate/persist job state as a hidden side effect.
+    Ok(OpenProjectOutput {
+        project_path: project.root_path.clone(),
+        project,
+        warnings,
+    })
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateProjectInput {
+    pub project_path: String,
+}
+
+/// Explicit migration entrypoint. The normal open command returns
+/// PROJECT_MIGRATION_REQUIRED instead of changing a legacy project.
+#[tauri::command]
+pub async fn migrate_project_with_verified_backup(
+    state: State<'_, AppState>,
+    input: MigrateProjectInput,
+) -> Result<OpenProjectOutput, AppError> {
+    let (project, warnings) = state.project_store.open_project_with_mode(
+        input.project_path,
+        ProjectOpenMode::MigrateWithVerifiedBackup,
+    )?;
     Ok(OpenProjectOutput {
         project_path: project.root_path.clone(),
         project,
@@ -114,6 +138,8 @@ pub async fn get_project_snapshot(
 #[serde(rename_all = "camelCase")]
 pub struct GetDefaultProjectPathInput {
     pub project_name: String,
+    #[serde(default)]
+    pub academic_year_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -127,7 +153,11 @@ pub async fn get_default_project_path(
     app: tauri::AppHandle,
     input: GetDefaultProjectPathInput,
 ) -> Result<GetDefaultProjectPathOutput, AppError> {
-    let path = crate::platform::paths::generate_default_project_path(&app, &input.project_name)?;
+    let path = crate::platform::paths::generate_default_project_path(
+        &app,
+        &input.project_name,
+        input.academic_year_id.as_deref(),
+    )?;
     Ok(GetDefaultProjectPathOutput { path })
 }
 

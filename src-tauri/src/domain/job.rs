@@ -24,6 +24,7 @@ pub enum JobKind {
     AssessmentAnalysis,
     ProjectBackup,
     ProjectRestore,
+    ProjectRecovery,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Copy)]

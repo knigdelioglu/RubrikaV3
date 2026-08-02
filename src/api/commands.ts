@@ -83,6 +83,8 @@ import type {
   GcReport,
   StartBackupJobOutput,
   StartRestoreJobOutput,
+  StartRecoveryCopyJobOutput,
+  DataLossPreflightReport,
 } from './types';
 import type { AppError } from './errors';
 
@@ -159,6 +161,24 @@ export const commands = {
   openProject: async (input: OpenProjectInput): Promise<OpenProjectOutput> => {
     try {
       return await invoke<OpenProjectOutput>('open_project', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  migrateProjectWithVerifiedBackup: async (projectPath: string): Promise<OpenProjectOutput> => {
+    try {
+      return await invoke<OpenProjectOutput>('migrate_project_with_verified_backup', {
+        input: { projectPath },
+      });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getDataLossPreflight: async (projectPath: string): Promise<DataLossPreflightReport> => {
+    try {
+      return await invoke<DataLossPreflightReport>('get_data_loss_preflight', {
+        input: { projectPath },
+      });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -320,9 +340,11 @@ export const commands = {
       handleInvokeError(e);
     }
   },
-  getDefaultProjectPath: async (projectName: string): Promise<{ path: string }> => {
+  getDefaultProjectPath: async (projectName: string, academicYearId?: string): Promise<{ path: string }> => {
     try {
-      return await invoke<{ path: string }>('get_default_project_path', { input: { projectName } });
+      return await invoke<{ path: string }>('get_default_project_path', {
+        input: { projectName, academicYearId },
+      });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -1131,6 +1153,18 @@ export const commands = {
       return await invoke<StartRestoreJobOutput>('start_restore_job', {
         input: { archivePath, destinationPath },
       });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  startRecoveryCopyJob: async (input: {
+    sourceProjectPath: string;
+    backupPath: string;
+    destinationPath: string;
+    dryRun?: boolean;
+  }): Promise<StartRecoveryCopyJobOutput> => {
+    try {
+      return await invoke<StartRecoveryCopyJobOutput>('start_recovery_copy_job', { input });
     } catch (e) {
       handleInvokeError(e);
     }

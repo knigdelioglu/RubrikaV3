@@ -65,8 +65,8 @@ Kaynak: `src/app/App.tsx`, `src/app/AppLayout.tsx`, `src/components/common/Error
 ### Yeni Proje Oluştur — `ProjectCreatePage`
 
 - Route: `/project-create`; kaynak `src/pages/ProjectCreatePage.tsx`.
-- Alanlar: `Proje Adı` text input; `Klasör Yolu` text input; `📁` klasör seçici.
-- `Proje adı zorunludur.` uyarısı gösterilir; ad boşsa `Proje Oluştur` disabled olur. Klasör yolu için default path `getDefaultProjectPath` ile alınır.
+- Alanlar: `Proje Adı` text input; eğitim yılı, ders kodu ve ders adı text input’ları; `Klasör Yolu` text input; `📁` klasör seçici. Eğitim yılı 1 Temmuz kuralıyla otomatik gelir; ders kodu `tde`, ders adı `Türk Dili ve Edebiyatı` olarak başlar ve üçü de düzenlenebilir.
+- `Proje adı zorunludur.` uyarısı gösterilir; ad boşsa `Proje Oluştur` disabled olur. Klasör yolu `getDefaultProjectPath(name, academicYearId)` ile alınır ve varsayılan klasör adına eğitim yılı eklenir.
 - `Geri Dön` `/projects`’e gider. `Proje Oluştur` → `create_project`; başarıda active project set edilir ve workflow’a gider. Pending state `LoadingButton` ile gösterilir, hata `ErrorBanner`’dir.
 - Confirmation yoktur. Backend persistence doğrudan project store’dur; job yoktur.
 
