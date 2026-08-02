@@ -4497,6 +4497,7 @@ mod tests {
                 let _ = stream.read(&mut buffer);
                 let mut head = response_head.to_string();
                 if chunked {
+                    head.push_str("\r\n");
                     for chunk in body_chunks.iter() {
                         head.push_str(&format!("{:x}\r\n", chunk.len()));
                         head.push_str(&String::from_utf8_lossy(chunk));
@@ -4513,7 +4514,6 @@ mod tests {
                     }
                     return;
                 }
-                head.push_str("\r\n");
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.flush();
             }
