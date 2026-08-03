@@ -7,6 +7,7 @@ import type { GcReport, ModelServerArgsPreview } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { useProjectContext } from '../state/useProjectContext';
 import { Loader2, RefreshCw } from 'lucide-react';
+import { canConfirmExternalModel, getModelPrivacyWarning } from './settingsUi';
 
 type SettingsTab = 'general' | 'models' | 'storage' | 'diagnostics';
 
@@ -20,6 +21,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
   const [error, setError] = useState<AppError | null>(null);
   const [preview, setPreview] = useState<ModelServerArgsPreview | null>(null);
   const [gcReport, setGcReport] = useState<GcReport | null>(null);
+  const [externalConsent, setExternalConsent] = useState(false);
 
   const projectQuery = useQuery({
     queryKey: ['project-snapshot', activeProjectId],
@@ -100,6 +102,16 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
     onError: (err: AppError) => setError(err),
   });
 
+  const externalModelMutation = useMutation({
+    mutationFn: commands.enableExternalModel,
+    onSuccess: async () => {
+      setExternalConsent(false);
+      setError(null);
+      await refresh();
+    },
+    onError: (err: AppError) => setError(err),
+  });
+
   const previewMutation = useMutation({
     mutationFn: commands.previewModelServerArgs,
     onSuccess: (data) => {
@@ -111,6 +123,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
 
   const project = projectQuery.data;
   const status = modelStatusQuery.data;
+  const privacyWarning = getModelPrivacyWarning(status);
   const assignments = assignmentsQuery.data ?? [];
   const activeAssignments = assignments.filter((a) => a.isActive);
 
@@ -140,6 +153,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
       <div className="exam-package-tabs" role="tablist" style={{ marginBottom: '1.5rem' }}>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'general' ? 'is-active' : ''}
           onClick={() => setActiveTab('general')}
         >
@@ -147,6 +161,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
         </button>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'models' ? 'is-active' : ''}
           onClick={() => setActiveTab('models')}
         >
@@ -154,6 +169,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
         </button>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'storage' ? 'is-active' : ''}
           onClick={() => setActiveTab('storage')}
         >
@@ -161,6 +177,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
         </button>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'diagnostics' ? 'is-active' : ''}
           onClick={() => setActiveTab('diagnostics')}
         >
@@ -230,6 +247,48 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               </div>
             )}
 
+            {privacyWarning.visible && (
+              <div
+                role="alert"
+                style={{
+                  marginBottom: '1.25rem',
+                  padding: '1rem',
+                  background: '#fff1f2',
+                  border: '2px solid #fda4af',
+                  borderRadius: '0.75rem',
+                  color: '#881337',
+                  lineHeight: 1.5,
+                }}
+              >
+                <strong style={{ display: 'block', marginBottom: '0.35rem' }}>
+                  {privacyWarning.title}
+                </strong>
+                {privacyWarning.body}
+                <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', marginTop: '0.75rem' }}>
+                  <input
+                    type="checkbox"
+                    checked={externalConsent}
+                    onChange={(event) => setExternalConsent(event.target.checked)}
+                  />
+                  <span>Harici modelin öğrenci verisi taşıyan işlemlerde kullanılmasını açıkça onaylıyorum.</span>
+                </label>
+                <button
+                  type="button"
+                  data-project-write="false"
+                  className="button button--primary"
+                  style={{ marginTop: '0.75rem', background: '#be123c', borderColor: '#be123c' }}
+                  onClick={() => externalModelMutation.mutate({
+                    profileId: status?.profileId,
+                    projectRootPath: projectPath || project?.rootPath || null,
+                    confirmExternalDataTransfer: externalConsent,
+                  })}
+                  disabled={!canConfirmExternalModel(externalConsent, externalModelMutation.isPending)}
+                >
+                  {externalModelMutation.isPending ? 'Onay kaydediliyor…' : 'Harici kullanımı açıkça onayla'}
+                </button>
+              </div>
+            )}
+
             {genuineWarnings.length > 0 && (
               <div style={{ marginBottom: '1.25rem', padding: '1rem', background: '#fffbeb', border: '1px solid #fef08a', borderRadius: '0.75rem' }}>
                 <strong style={{ color: '#92400e', display: 'block', marginBottom: '0.35rem' }}>Müdahale Gerektiren Uyarılar</strong>
@@ -243,6 +302,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               {!status?.serverRunning ? (
                 <button
                   type="button"
+                  data-project-write="false"
                   className="button button--primary"
                   onClick={() => startMutation.mutate(status?.profileId)}
                   disabled={startMutation.isPending}
@@ -252,6 +312,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               ) : (
                 <button
                   type="button"
+                  data-project-write="false"
                   className="button button--secondary"
                   onClick={() => stopMutation.mutate(status?.profileId)}
                   disabled={stopMutation.isPending}
@@ -263,7 +324,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
                       : 'Durdur'}
                 </button>
               )}
-              <button type="button" className="button button--secondary" onClick={() => void refresh()}>
+              <button type="button" data-project-write="false" className="button button--secondary" onClick={() => void refresh()}>
                 <RefreshCw size={15} /> Durumu Yenile
               </button>
             </div>
@@ -340,6 +401,7 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
               <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: '#0f172a' }}>Teknik Ayrıntılar ve Tanılama</h3>
               <button
                 type="button"
+                data-project-write="false"
                 className="button button--secondary"
                 onClick={() => previewMutation.mutate(status?.profileId)}
                 disabled={previewMutation.isPending}

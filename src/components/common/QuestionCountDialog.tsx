@@ -156,6 +156,7 @@ export function QuestionCountDialog({
         <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'flex-end', marginTop: '1rem' }}>
           <button
             type="button"
+            data-project-write="false"
             onClick={onCancel}
             disabled={loading}
             style={{
@@ -169,6 +170,7 @@ export function QuestionCountDialog({
           </button>
           <LoadingButton
             type="button"
+            projectWrite
             onClick={handleConfirm}
             loading={loading}
             disabledReason={!isValid ? 'Soru sayısı 1 ile 50 arasında olmalıdır.' : undefined}

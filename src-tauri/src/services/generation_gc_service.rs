@@ -463,6 +463,7 @@ mod tests {
             source_document_id: "doc".to_string(),
             source_storage_revision: 1,
             failure_reason: None,
+            job_mode: crate::domain::student::StudentAnswerOcrJobMode::Production,
         }
     }
 
@@ -660,6 +661,8 @@ mod tests {
             needs_review: false,
             review_reasons: vec![],
             warnings: vec![],
+            review_policy: None,
+            model_provenance: None,
             model_name: None,
             prompt_version: "v1".to_string(),
             created_at: chrono::Utc::now(),
@@ -668,6 +671,7 @@ mod tests {
             teacher_reviewed_at: None,
             parse_diagnostics: None,
             render_diagnostics: None,
+            ocr_provenance: None,
         }
     }
 

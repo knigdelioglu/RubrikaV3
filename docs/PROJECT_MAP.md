@@ -157,7 +157,7 @@ UI: `StudentAnswerOcrPage.tsx` üzerindeki "Onayla" butonu
 UI: `WorkflowPanel.tsx` -> "Soru metnini çıkar" butonu tıklanır
 → command: `start_question_text_extraction`
 → service: `QuestionTextService::start_extraction`
-→ ModelRuntimeService: `ensure_ready` çağrılır. Llama sunucusu kapalıysa `model_process_manager` üzerinden çalıştırılır.
+→ ModelRuntimeService: `acquire_ready_runtime_lease(profile, consumer, operation, correlation_id)` çağrılır. Llama sunucusu kapalıysa `model_process_manager` üzerinden çalıştırılır.
 → job: Arka plana görev atılır. Eğer model hazır olmazsa hata JobEvent olarak döner.
 ```
 
@@ -168,7 +168,7 @@ UI: `StudentAnswerOcrIssueReviewPage.tsx` üzerindeki "Gemma ile öneriyi kontro
 → command: `suggest_ocr_issue_correction_with_model`
 → service: `StudentAnswerOcrService::suggest_ocr_issue_correction_with_model`
 → crop service: işaretli bbox varsa daha sıkı issue crop üretir
-→ model runtime: `ensure_ready` ile vision kapasiteli model hazır edilirse çağrı yapılır
+→ model runtime: `acquire_ready_runtime_lease` ile vision kapasiteli model health + identity doğrulamasından sonra çağrılır
 → ModelGateway (`llama_server_gateway.rs`): strict JSON dönen issue correction isteği atanır
 → geri dönen snapshot: öğretmen onayı gerektiren öneri DTO'su (OCR metni otomatik güncellenmez)
 ```
@@ -199,7 +199,7 @@ Ayrıntılı yaşam döngüsü, recovery, retention/GC ve silme sırası için [
 Model process lifecycle'ının tek sahibi `src-tauri/src/services/model_process_manager.rs`'dir.
 `ProcessInspector` (`src-tauri/src/platform/process_inspector.rs`) persisted PID
 recovery ve verified stop için native process identity sağlar. `ModelRuntimeService`
-lease facade'ıdır; model tüketicileri `acquire_runtime` ile aynı runtime instance'a
+lease facade'ıdır; model tüketicileri `acquire_ready_runtime_lease` ile aynı runtime instance'a
 bağlanır ve global iş-sonu stop çağrısı yapmaz.
 
 Detaylı identity, Child handle, restart recovery, profile transition, idle

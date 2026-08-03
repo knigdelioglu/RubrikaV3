@@ -1,4 +1,5 @@
 use crate::domain::errors::AppError;
+use crate::domain::structured_answer::StructuredAnswer;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -8,6 +9,17 @@ use std::path::PathBuf;
 pub enum ModelMode {
     External,
     Managed,
+}
+
+/// Controls whether a model profile may send requests outside the managed
+/// local runtime boundary. Missing values in legacy profile files deserialize
+/// to the safe local-only default.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyMode {
+    #[default]
+    StrictLocal,
+    ExplicitExternal,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -33,6 +45,8 @@ pub struct ModelProfile {
     pub base_url: String,
     #[serde(default)]
     pub runtime_preset: ModelRuntimePreset,
+    #[serde(default)]
+    pub privacy_mode: PrivacyMode,
 }
 
 impl ModelProfile {
@@ -91,6 +105,18 @@ pub struct ModelStatus {
     pub server_running: bool,
     pub health_ok: bool,
     pub completion_probe_ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_verified_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_probe_verified_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub privacy_mode: PrivacyMode,
+    #[serde(default)]
+    pub privacy_blocked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy_block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fingerprint: Option<String>,
     pub managed_process_pid: Option<u32>,
     pub started_by_app: bool,
     #[serde(default)]
@@ -127,6 +153,12 @@ impl Default for ModelStatus {
             server_running: false,
             health_ok: false,
             completion_probe_ok: false,
+            health_verified_at: None,
+            completion_probe_verified_at: None,
+            privacy_mode: PrivacyMode::StrictLocal,
+            privacy_blocked: false,
+            privacy_block_reason: None,
+            model_fingerprint: None,
             managed_process_pid: None,
             started_by_app: false,
             active_lease_count: 0,
@@ -167,7 +199,7 @@ pub enum ModelInputImageKind {
     StudentAnswerOcrIssueCorrection,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInputImage {
     pub kind: ModelInputImageKind,
@@ -185,6 +217,16 @@ pub struct ModelInputImage {
     pub long_edge_max: u32,
     pub jpeg_quality: u8,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_transaction_id: Option<String>,
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -212,7 +254,71 @@ pub enum ModelRequestKind {
     Scoring,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingParameters {
+    pub temperature: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    pub max_tokens: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "type")]
+pub enum ModelResponseFormat {
+    #[serde(rename = "json_object")]
+    JsonObject,
+    #[serde(rename = "json_schema")]
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelInvocationContract {
+    pub use_case: ModelRequestKind,
+    pub prompt_version: String,
+    pub schema_version: String,
+    pub policy_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_fingerprint: Option<String>,
+    pub model_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub sampling_parameters: SamplingParameters,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ModelResponseFormat>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProvenance {
+    #[serde(flatten)]
+    pub invocation: ModelInvocationContract,
+}
+
+impl ModelProvenance {
+    pub fn from_invocation(invocation: &ModelInvocationContract) -> Self {
+        Self {
+            invocation: invocation.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptContract {
+    pub system_policy: String,
+    pub user_data: serde_json::Value,
+    pub invocation: ModelInvocationContract,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDiagnostics {
     pub endpoint: String,
@@ -232,6 +338,8 @@ pub struct ModelDiagnostics {
     pub reasoning_content_length: Option<u32>,
     pub raw_text_stored_path: Option<String>,
     pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ModelProvenance>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -247,6 +355,8 @@ pub struct ExtractedQuestionCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct QuestionTextExtractionRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub image_path: String,
     pub page_index: u32,
     pub page_count: u32,
@@ -259,6 +369,8 @@ pub struct QuestionTextExtractionRequest {
 #[serde(rename_all = "camelCase")]
 pub struct StudentAnswerOcrRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub project_root_path: Option<String>,
     pub job_id: Option<String>,
     pub submission_id: String,
@@ -274,6 +386,12 @@ pub struct StudentAnswerOcrRequest {
     pub model_input_crop_ref: Option<String>,
     #[serde(default)]
     pub source_page_numbers: Vec<u32>,
+    #[serde(default)]
+    pub region_ids: Vec<String>,
+    #[serde(default)]
+    pub region_orders: Vec<u32>,
+    #[serde(default)]
+    pub region_page_offsets: Vec<u32>,
     #[serde(default)]
     pub model_input_images: Vec<ModelInputImage>,
 }
@@ -297,12 +415,13 @@ pub enum StudentAnswerOcrIssueCorrectionScope {
 #[serde(rename_all = "camelCase")]
 pub struct StudentAnswerOcrIssueCorrectionRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub project_root_path: Option<String>,
     pub job_id: Option<String>,
     pub ocr_record_id: String,
     pub issue_id: Option<String>,
     pub observed_text: String,
-    pub suggested_text_from_analyzer: String,
     pub question_number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight_region: Option<crate::domain::student::StudentAnswerOcrCropBBox>,
@@ -312,10 +431,6 @@ pub struct StudentAnswerOcrIssueCorrectionRequest {
     pub model_input_images: Vec<ModelInputImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_image_ref: Option<String>,
-    #[serde(default)]
-    pub nearby_context: String,
-    #[serde(default)]
-    pub context_hints: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -354,7 +469,7 @@ pub struct StudentAnswerOcrIssueCorrectionResult {
 pub struct StudentAnswerOcrOutput {
     pub answer_text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub structured_answer: Option<serde_json::Value>,
+    pub structured_answer: Option<StructuredAnswer>,
     pub confidence: f32,
     #[serde(default)]
     pub uncertain_spans: Vec<crate::domain::student::OcrUncertainSpan>,
@@ -369,6 +484,8 @@ pub struct StudentAnswerOcrOutput {
     pub needs_review: bool,
     pub review_reasons: Vec<String>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_policy: Option<crate::domain::student::OcrReviewPolicy>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -394,6 +511,8 @@ pub struct StudentAnswerOcrResult {
 #[serde(rename_all = "camelCase")]
 pub struct StudentIdentityOcrRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub project_root_path: Option<String>,
     pub job_id: Option<String>,
     pub submission_id: String,
@@ -452,10 +571,29 @@ pub struct ScoringCriterionScore {
     pub evidence_quote: Option<String>,
 }
 
+/// Semantic scoring is a proposal only. The model selects a canonical
+/// criterion level and quotes evidence; Rust maps that level to points.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticCriterionDecision {
+    pub criterion_id: String,
+    pub level_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_evidence: Option<String>,
+    #[serde(default)]
+    pub missing_requirements: Vec<String>,
+    #[serde(default)]
+    pub contradiction: bool,
+    #[serde(default)]
+    pub rationale: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoringRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub project_root_path: Option<String>,
     pub job_id: Option<String>,
     pub submission_id: String,
@@ -490,6 +628,8 @@ pub struct ScoringRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SpeakingTranscriptCleanupRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub raw_transcript: String,
     #[serde(default)]
     pub segments: Vec<SpeakingTranscriptCleanupInputSegment>,
@@ -550,12 +690,16 @@ pub struct SpeakingTranscriptCleanupResult {
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisReportRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisReportResult {
     pub report: String,
+    #[serde(default)]
+    pub claims: Vec<crate::domain::analysis::AnalysisModelClaim>,
     pub raw_response: String,
     pub diagnostics: ModelDiagnostics,
 }
@@ -563,6 +707,8 @@ pub struct AnalysisReportResult {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ScoringOutput {
+    /// Compatibility field for legacy model responses. Semantic scoring never
+    /// trusts this value; Rust derives the score from rubric levels.
     pub awarded_score: f32,
     pub confidence: f32,
     pub needs_review: bool,
@@ -570,6 +716,12 @@ pub struct ScoringOutput {
     pub teacher_visible_explanation: String,
     #[serde(default)]
     pub criterion_scores: Vec<ScoringCriterionScore>,
+    #[serde(default)]
+    pub criterion_decisions: Vec<SemanticCriterionDecision>,
+    #[serde(default)]
+    pub direct_score_fields: Vec<String>,
+    #[serde(default)]
+    pub direct_score_rejected: bool,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -612,6 +764,8 @@ pub struct QuestionTextExtractionResult {
 #[serde(rename_all = "camelCase")]
 pub struct RubricExtractionRequest {
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contract: Option<PromptContract>,
     pub raw_text: Option<String>,
     pub image_path: Option<String>,
     pub target_question_number: u32,
@@ -633,7 +787,15 @@ pub struct ExtractedRubricCandidate {
     pub number: u32,
     pub max_points: Option<f32>,
     pub expected_answer: Option<String>,
+    #[serde(default)]
+    pub key_concepts: Vec<String>,
     pub criteria: Vec<crate::domain::rubric::RubricCriterion>,
+    #[serde(default)]
+    pub partial_credit_hints: Vec<String>,
+    #[serde(default)]
+    pub zero_score_conditions: Vec<String>,
+    #[serde(default)]
+    pub common_mistakes: Vec<String>,
     pub confidence: f32,
     pub warnings: Vec<String>,
 }
@@ -653,7 +815,15 @@ pub struct RubricImportQuestion {
     pub max_points: Option<f32>,
     pub expected_answer: Option<String>,
     #[serde(default)]
+    pub key_concepts: Vec<String>,
+    #[serde(default)]
     pub criteria: Vec<RubricImportCriterion>,
+    #[serde(default)]
+    pub partial_credit_hints: Vec<String>,
+    #[serde(default)]
+    pub zero_score_conditions: Vec<String>,
+    #[serde(default)]
+    pub common_mistakes: Vec<String>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -752,6 +922,7 @@ pub fn default_model_profile() -> ModelProfile {
         port: 8080,
         base_url: "http://127.0.0.1:8080".to_string(),
         runtime_preset: ModelRuntimePreset::Standard,
+        privacy_mode: PrivacyMode::StrictLocal,
     }
 }
 
@@ -780,6 +951,7 @@ pub fn speaking_asr_cleanup_model_profile() -> ModelProfile {
         port: 8080,
         base_url: "http://127.0.0.1:8080".to_string(),
         runtime_preset: ModelRuntimePreset::SpeakingRubricText,
+        privacy_mode: PrivacyMode::StrictLocal,
     }
 }
 
@@ -795,6 +967,7 @@ pub fn speaking_rubric_model_profile() -> ModelProfile {
         port: 8080,
         base_url: "http://127.0.0.1:8080".to_string(),
         runtime_preset: ModelRuntimePreset::SpeakingRubricText,
+        privacy_mode: PrivacyMode::StrictLocal,
     }
 }
 
@@ -1129,6 +1302,30 @@ mod tests {
     }
 
     #[test]
+    fn speaking_rubric_profile_is_text_only_and_has_stable_identity() {
+        let profile = speaking_rubric_model_profile();
+        let flags = SupportFlags {
+            mmproj_offload: false,
+            cache_ram: false,
+            image_min_tokens: false,
+            image_max_tokens: false,
+            reasoning_off: false,
+            cache_type_flags: false,
+            cache_short_flags: true,
+        };
+        let args = build_model_server_args(&profile, &flags).expect("rubric args");
+
+        assert_eq!(profile.id, SPEAKING_RUBRIC_PROFILE_ID);
+        assert_eq!(
+            profile.runtime_preset,
+            ModelRuntimePreset::SpeakingRubricText
+        );
+        assert!(!profile.requires_mmproj());
+        assert!(!args.contains(&"--mmproj".to_string()));
+        assert_eq!(profile.privacy_mode, PrivacyMode::StrictLocal);
+    }
+
+    #[test]
     fn support_flags_detect_supported_switches() {
         let help = "--mmproj-offload\n--cache-ram\n-ctk\n-ctv\n--reasoning\n";
         let flags = SupportFlags::from_help_output(help);
@@ -1136,5 +1333,38 @@ mod tests {
         assert!(flags.cache_ram);
         assert!(flags.cache_short_flags);
         assert!(flags.reasoning_off);
+    }
+
+    #[test]
+    fn model_invocation_contract_round_trips_all_provenance_fields() {
+        let contract = ModelInvocationContract {
+            use_case: ModelRequestKind::Ocr,
+            prompt_version: "ocr_v4".to_string(),
+            schema_version: "ocr_output_v1".to_string(),
+            policy_version: "ocr_review_policy_v1".to_string(),
+            policy_fingerprint: Some("policy-fingerprint".to_string()),
+            model_fingerprint: "model-fingerprint".to_string(),
+            runtime_fingerprint: "runtime-fingerprint".to_string(),
+            sampling_parameters: SamplingParameters {
+                temperature: 0.0,
+                top_k: Some(1),
+                top_p: Some(1.0),
+                seed: Some(42),
+                max_tokens: 256,
+            },
+            response_format: Some(ModelResponseFormat::JsonObject),
+        };
+
+        let json = serde_json::to_value(ModelProvenance::from_invocation(&contract))
+            .expect("serialize provenance");
+        assert_eq!(json["useCase"], "ocr");
+        assert_eq!(json["promptVersion"], "ocr_v4");
+        assert_eq!(json["schemaVersion"], "ocr_output_v1");
+        assert_eq!(json["policyVersion"], "ocr_review_policy_v1");
+        assert_eq!(json["samplingParameters"]["maxTokens"], 256);
+        assert_eq!(json["responseFormat"]["type"], "json_object");
+
+        let restored: ModelProvenance = serde_json::from_value(json).expect("restore provenance");
+        assert_eq!(restored.invocation, contract);
     }
 }

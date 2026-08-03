@@ -343,6 +343,7 @@ impl ProjectStore {
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             student_answer_ocr_records: vec![],
@@ -1570,11 +1571,154 @@ fn normalize_project_json(project_file: &Path, value: &mut Value) -> (Vec<String
     let class_changed = normalize_school_class_storage(project_file, project, &mut warnings);
     let assessment_changed =
         normalize_assessment_organization(project_file, project, &mut warnings);
+    let crop_template_changed =
+        normalize_student_answer_crop_template(project_file, project, &mut warnings);
     normalize_student_answer_ocr_records(project_file, project, &mut warnings);
     normalize_student_identity_records(project_file, project, &mut warnings);
-    normalize_scoring_records(project_file, project, &mut warnings);
+    let scoring_changed = normalize_scoring_records(project_file, project, &mut warnings);
+    let scoring_anchors_changed = normalize_scoring_anchors(project_file, project, &mut warnings);
 
-    (warnings, class_changed || assessment_changed)
+    (
+        warnings,
+        class_changed
+            || assessment_changed
+            || crop_template_changed
+            || scoring_changed
+            || scoring_anchors_changed,
+    )
+}
+
+fn normalize_scoring_anchors(
+    project_file: &Path,
+    project: &mut Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    if project.get("scoringAnchors").is_some() {
+        return false;
+    }
+    project.insert("scoringAnchors".to_string(), Value::Array(Vec::new()));
+    warnings.push(format!(
+        "{}.scoringAnchors alanı boş koleksiyon olarak tek yönlü göç edildi; mevcut scoring kayıtları korunuyor.",
+        project_file.display()
+    ));
+    true
+}
+
+fn normalize_student_answer_crop_template(
+    project_file: &Path,
+    project: &mut Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> bool {
+    let Some(template) = project
+        .get_mut("studentAnswerCropTemplate")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+
+    if template.get("templates").is_some() {
+        return false;
+    }
+    let Some(items) = template
+        .remove("items")
+        .and_then(|value| value.as_array().cloned())
+    else {
+        return false;
+    };
+
+    let mut grouped: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(item_object) = item.as_object() else {
+            warnings.push(format!(
+                "{}.studentAnswerCropTemplate.items[{index}] nesne değildi; migration durduruldu.",
+                project_file.display()
+            ));
+            template.insert("items".to_string(), Value::Array(items));
+            return false;
+        };
+        let Some(question_id) = item_object
+            .get("questionId")
+            .or_else(|| item_object.get("question_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            warnings.push(format!(
+                "{}.studentAnswerCropTemplate.items[{index}] questionId eksikti; migration durduruldu.",
+                project_file.display()
+            ));
+            template.insert("items".to_string(), Value::Array(items));
+            return false;
+        };
+        let Some(bbox) = item_object.get("bbox").and_then(Value::as_object) else {
+            warnings.push(format!(
+                "{}.studentAnswerCropTemplate.items[{index}] bbox eksikti; migration durduruldu.",
+                project_file.display()
+            ));
+            template.insert("items".to_string(), Value::Array(items));
+            return false;
+        };
+        let page_offset = item_object
+            .get("pageIndexWithinSubmission")
+            .or_else(|| item_object.get("page_index_within_submission"))
+            .or_else(|| bbox.get("pageIndex"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let region_index = grouped.get(question_id).map_or(0, Vec::len);
+        let mut region = serde_json::Map::new();
+        region.insert(
+            "regionId".to_string(),
+            Value::String(format!("{question_id}-region-{region_index}")),
+        );
+        region.insert("pageOffset".to_string(), Value::from(page_offset));
+        region.insert("order".to_string(), Value::from(region_index));
+        region.insert(
+            "normalizedBBox".to_string(),
+            serde_json::json!({
+                "x": bbox.get("x").and_then(Value::as_f64).unwrap_or(0.0),
+                "y": bbox.get("y").and_then(Value::as_f64).unwrap_or(0.0),
+                "width": bbox.get("width").and_then(Value::as_f64).unwrap_or(0.0),
+                "height": bbox.get("height").and_then(Value::as_f64).unwrap_or(0.0),
+            }),
+        );
+        region.insert(
+            "regionRole".to_string(),
+            Value::String("primary".to_string()),
+        );
+        region.insert(
+            "continuationPolicy".to_string(),
+            Value::String("independent".to_string()),
+        );
+        if let Some(label) = item_object.get("label") {
+            region.insert("label".to_string(), label.clone());
+        }
+        if let Some(note) = item_object.get("note") {
+            region.insert("note".to_string(), note.clone());
+        }
+        grouped
+            .entry(question_id.to_string())
+            .or_default()
+            .push(Value::Object(region));
+    }
+
+    template.insert(
+        "templates".to_string(),
+        Value::Array(
+            grouped
+                .into_iter()
+                .map(|(question_id, regions)| {
+                    serde_json::json!({
+                        "questionId": question_id,
+                        "regions": regions,
+                    })
+                })
+                .collect(),
+        ),
+    );
+    warnings.push(format!(
+        "{}.studentAnswerCropTemplate eski single-region items alanı QuestionAnswerTemplate.regions biçimine taşındı.",
+        project_file.display()
+    ));
+    true
 }
 
 fn normalize_assessment_organization(
@@ -2508,12 +2652,13 @@ fn normalize_scoring_records(
     project_file: &Path,
     project: &mut Map<String, Value>,
     warnings: &mut Vec<String>,
-) {
+) -> bool {
+    let mut changed = false;
     let Some(records) = project
         .get_mut("scoringRecords")
         .and_then(Value::as_array_mut)
     else {
-        return;
+        return false;
     };
 
     for (index, record) in records.iter_mut().enumerate() {
@@ -2528,7 +2673,60 @@ fn normalize_scoring_records(
                 ));
             }
         }
+
+        let decision_state = record
+            .get("decisionState")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "model_candidate"
+                        | "deterministic_accepted"
+                        | "provisional"
+                        | "auto_accepted"
+                        | "teacher_approved"
+                        | "rejected"
+                        | "failed"
+                )
+            });
+        if decision_state.is_none() {
+            let teacher_review_status = record
+                .get("teacherReviewStatus")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let scoring_applied = record
+                .get("scoringApplied")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let needs_review = record
+                .get("needsReview")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let has_manual_score = record
+                .get("teacherManualScore")
+                .is_some_and(|value| !value.is_null());
+            let derived_state = if teacher_review_status == "invalidated" {
+                "rejected"
+            } else if scoring_applied && needs_review {
+                "provisional"
+            } else if has_manual_score || matches!(teacher_review_status, "approved" | "edited") {
+                "teacher_approved"
+            } else if scoring_applied {
+                "auto_accepted"
+            } else {
+                "failed"
+            };
+            record.insert(
+                "decisionState".to_string(),
+                Value::String(derived_state.to_string()),
+            );
+            changed = true;
+            warnings.push(format!(
+                "{base_path}.decisionState eski notlandırma alanlarından {derived_state} olarak taşındı."
+            ));
+        }
     }
+    changed
 }
 
 fn normalize_ocr_metadata_object(
@@ -2571,6 +2769,46 @@ fn normalize_ocr_metadata_object(
                     warnings,
                 );
             }
+        }
+    }
+
+    if let Some(structured_answer) = record.get("structuredAnswer") {
+        let known_kind = structured_answer
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "multiple_choice"
+                        | "matching"
+                        | "ordered_slots"
+                        | "numeric"
+                        | "table"
+                        | "correction_table"
+                        | "sentence_annotation"
+                        | "grammar_analysis"
+                        | "open_text"
+                        | "text"
+                )
+            });
+        if !known_kind {
+            record.insert("needsReview".to_string(), Value::Bool(true));
+            append_string_array_value(record, "reviewReasons", "structured_answer_legacy_unparsed");
+            append_string_array_value(record, "warnings", "structured_answer_legacy_unparsed");
+            warnings.push(format!(
+                "{base_path}.structuredAnswer eski arbitrary JSON olarak review-only salvage biçiminde korunacak."
+            ));
+        }
+    }
+}
+
+fn append_string_array_value(record: &mut Map<String, Value>, field: &str, value: &str) {
+    let values = record
+        .entry(field.to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    if let Some(values) = values.as_array_mut() {
+        if !values.iter().any(|entry| entry.as_str() == Some(value)) {
+            values.push(Value::String(value.to_string()));
         }
     }
 }
@@ -2747,6 +2985,7 @@ mod tests {
             expected_question_count: Some(2),
             exam_package_freeze: None,
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             student_answer_ocr_records: vec![],
@@ -2804,11 +3043,13 @@ mod tests {
                         source: None,
                         max_score: Some(5.0),
                         expected_answer: Some("Cevap".to_string()),
+                        key_concepts: vec![],
                         criteria: vec![RubricCriterion {
                             id: Uuid::new_v4().to_string(),
                             label: "Kriter".to_string(),
                             description: "Açıklama".to_string(),
                             points: 5.0,
+                            levels: vec![],
                         }],
                         partial_credit_hints: vec![],
                         zero_score_conditions: vec![],
@@ -2842,6 +3083,7 @@ mod tests {
                         source: None,
                         max_score: None,
                         expected_answer: None,
+                        key_concepts: vec![],
                         criteria: vec![],
                         partial_credit_hints: vec![],
                         zero_score_conditions: vec![],
@@ -3565,7 +3807,10 @@ mod tests {
             max_score: 5.0,
             awarded_score: Some(5.0),
             scoring_applied: true,
+            decision_state: crate::domain::scoring::ScoringDecisionState::TeacherApproved,
+            decision_version: "v1".to_string(),
             criterion_scores: vec![],
+            semantic_decisions: vec![],
             rationale: "ok".to_string(),
             confidence: 0.9,
             needs_review: false,
@@ -3574,6 +3819,15 @@ mod tests {
             raw_model_output: "{}".to_string(),
             parse_diagnostics: None,
             reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
             source_hash: "source".to_string(),
             package_hash: "package".to_string(),
             ocr_record_hash: "ocr".to_string(),
@@ -3640,6 +3894,8 @@ mod tests {
             .unwrap();
         legacy_scoring_record.remove("scoringApplied");
         legacy_scoring_record.remove("reviewReasons");
+        legacy_scoring_record.remove("decisionState");
+        legacy_scoring_record.insert("needsReview".to_string(), serde_json::Value::Bool(true));
         value.as_object_mut().unwrap().remove("latestScoringRunId");
         write_project_value(&root, &value);
 
@@ -3655,7 +3911,27 @@ mod tests {
         assert_eq!(reopened.scoring_records[0].run_id, "");
         assert_eq!(reopened.scoring_records[0].awarded_score, Some(5.0));
         assert!(reopened.scoring_records[0].scoring_applied);
+        assert_eq!(
+            reopened.scoring_records[0].decision_state,
+            crate::domain::scoring::ScoringDecisionState::Provisional
+        );
         assert!(reopened.scoring_records[0].review_reasons.is_empty());
+
+        let (migrated, warnings) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap();
+        assert_eq!(
+            migrated.scoring_records[0].decision_state,
+            crate::domain::scoring::ScoringDecisionState::Provisional
+        );
+        assert_eq!(migrated.scoring_records[0].awarded_score, Some(5.0));
+        assert!(warnings.iter().any(|warning| warning.contains("backup")));
+        let persisted = fs::read_to_string(root.join("project.json")).unwrap();
+        let persisted_value: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(
+            persisted_value["scoringRecords"][0]["decisionState"],
+            serde_json::Value::String("provisional".to_string())
+        );
     }
 
     #[test]
@@ -4616,5 +4892,135 @@ mod tests {
     #[test]
     fn proof_35_stale_job_cannot_overwrite_teacher_change() {
         job_narrow_commit_preserves_unrelated_mutation_and_stale_source_is_not_applied();
+    }
+
+    #[test]
+    fn migrates_legacy_single_region_crop_without_losing_region_data() {
+        let mut value = serde_json::json!({
+            "studentAnswerCropTemplate": {
+                "items": [{
+                    "questionId": "q1",
+                    "questionNumber": 1,
+                    "pageIndexWithinSubmission": 2,
+                    "bbox": {"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "pageIndex": 2},
+                    "label": "Soru 1",
+                    "note": "devam ediyor"
+                }]
+            }
+        });
+
+        let (warnings, changed) =
+            normalize_project_json(Path::new("legacy/project.json"), &mut value);
+        let template = value
+            .get("studentAnswerCropTemplate")
+            .and_then(Value::as_object)
+            .expect("canonical crop template");
+        let region = template
+            .get("templates")
+            .and_then(Value::as_array)
+            .and_then(|templates| templates.first())
+            .and_then(|template| template.get("regions"))
+            .and_then(Value::as_array)
+            .and_then(|regions| regions.first())
+            .expect("migrated region");
+
+        assert!(changed);
+        assert!(template.get("items").is_none());
+        assert_eq!(region.get("pageOffset").and_then(Value::as_u64), Some(2));
+        assert_eq!(region.get("order").and_then(Value::as_u64), Some(0));
+        assert_eq!(region.get("label").and_then(Value::as_str), Some("Soru 1"));
+        assert_eq!(
+            region.get("note").and_then(Value::as_str),
+            Some("devam ediyor")
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("regions")));
+    }
+
+    #[test]
+    fn migrates_missing_scoring_anchor_collection_without_losing_scoring_records() {
+        let original_record = serde_json::json!({
+            "id": "record-keep",
+            "opaqueTeacherEvidence": "keep this record"
+        });
+        let mut value = serde_json::json!({
+            "scoringRecords": [original_record.clone()]
+        });
+
+        let (warnings, changed) =
+            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value);
+
+        assert!(changed);
+        assert_eq!(
+            value
+                .get("scoringAnchors")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        let migrated_record = value
+            .get("scoringRecords")
+            .and_then(Value::as_array)
+            .and_then(|records| records.first())
+            .and_then(Value::as_object)
+            .expect("migrated scoring record");
+        assert_eq!(
+            migrated_record.get("id").and_then(Value::as_str),
+            Some("record-keep")
+        );
+        assert_eq!(
+            migrated_record
+                .get("opaqueTeacherEvidence")
+                .and_then(Value::as_str),
+            original_record
+                .get("opaqueTeacherEvidence")
+                .and_then(Value::as_str)
+        );
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("scoringAnchors")));
+
+        let (_warnings, second_changed) =
+            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value);
+        assert!(!second_changed);
+    }
+
+    #[test]
+    fn salvages_legacy_structured_answer_without_deleting_raw_data() {
+        let raw_answer = serde_json::json!({
+            "legacyRows": [{"value": "keep this"}],
+            "legacyMarker": "arbitrary-json"
+        });
+        let mut value = serde_json::json!({
+            "studentAnswerOcrRecords": [{
+                "structuredAnswer": raw_answer,
+                "needsReview": false,
+                "reviewReasons": [],
+                "warnings": []
+            }]
+        });
+
+        let (warnings, _changed) =
+            normalize_project_json(Path::new("legacy/ocr/project.json"), &mut value);
+        let record = value
+            .get("studentAnswerOcrRecords")
+            .and_then(Value::as_array)
+            .and_then(|records| records.first())
+            .and_then(Value::as_object)
+            .expect("legacy OCR record");
+
+        assert_eq!(record.get("structuredAnswer"), Some(&raw_answer));
+        assert_eq!(
+            record.get("needsReview").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(record
+            .get("reviewReasons")
+            .and_then(Value::as_array)
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| { reason.as_str() == Some("structured_answer_legacy_unparsed") })));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.contains("review-only salvage")));
     }
 }

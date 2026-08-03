@@ -1,5 +1,6 @@
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::domain::model::{ModelMode, ModelProfile, ModelStatus};
+use crate::domain::model::{ModelMode, ModelProfile, ModelStatus, PrivacyMode};
+use crate::services::llama_server_gateway::validate_base_url_for_privacy;
 use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_process_manager::{ModelProcessManager, RuntimeLeaseGrant};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ pub enum ModelUseCase {
     StudentAnswerOcr,
     StudentAnswerOcrIssueCorrection,
     Scoring,
+    SpeakingEvaluation,
     GeneralText,
 }
 
@@ -27,8 +29,19 @@ impl ModelUseCase {
             Self::StudentAnswerOcr => "student_answer_ocr",
             Self::StudentAnswerOcrIssueCorrection => "student_answer_ocr_issue_correction",
             Self::Scoring => "scoring",
+            Self::SpeakingEvaluation => "speaking_evaluation",
             Self::GeneralText => "general_text",
         }
+    }
+
+    fn contains_student_data(&self) -> bool {
+        matches!(
+            self,
+            Self::StudentAnswerOcr
+                | Self::StudentAnswerOcrIssueCorrection
+                | Self::Scoring
+                | Self::SpeakingEvaluation
+        )
     }
 }
 
@@ -109,6 +122,18 @@ impl ModelRuntimeLease {
         &self.grant.profile_id
     }
 
+    pub fn profile_fingerprint(&self) -> &str {
+        &self.grant.profile_fingerprint
+    }
+
+    pub fn model_fingerprint(&self) -> Option<&str> {
+        self.grant.model_fingerprint.as_deref()
+    }
+
+    pub fn correlation_id(&self) -> &str {
+        &self.grant.correlation_id
+    }
+
     pub fn active_lease_count(&self) -> usize {
         self.grant.active_lease_count
     }
@@ -153,29 +178,12 @@ impl ModelRuntimeService {
         }
     }
 
-    pub async fn ensure_ready(
+    pub async fn acquire_ready_runtime_lease(
         &self,
         profile_id: Option<&str>,
-        request: ModelRuntimeRequest,
-    ) -> Result<ModelRuntimeStatus, AppError> {
-        let lease = self
-            .acquire_runtime(profile_id, &request, "ensure_ready", None)
-            .await?;
-        let status = self.get_runtime_status(profile_id, &request).await;
-        let release_result = lease.release().await;
-        match (status, release_result) {
-            (Ok(status), Ok(())) => Ok(status),
-            (Ok(status), Err(_)) => Ok(status),
-            (Err(error), _) => Err(error),
-        }
-    }
-
-    pub async fn acquire_runtime(
-        &self,
-        profile_id: Option<&str>,
-        request: &ModelRuntimeRequest,
         consumer_id: &str,
-        job_id: Option<&str>,
+        operation: ModelRuntimeRequest,
+        correlation_id: &str,
     ) -> Result<ModelRuntimeLease, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
         if profile.server_path.trim().is_empty()
@@ -189,28 +197,45 @@ impl ModelRuntimeService {
                 suggested_action: Some("Model profilini yapılandırın.".to_string()),
                 technical_details: Some(format!(
                     "step={}; profile_id={}; server_path_empty=true; model_path_empty=true; mmproj_path_empty=true",
-                    request.use_case.step_name(),
+                    operation.use_case.step_name(),
                     profile.id
                 )),
-                correlation_id: uuid::Uuid::new_v4().to_string(),
+                correlation_id: correlation_id.to_string(),
             });
         }
-        let status = self.process_manager.get_model_status(profile_id).await?;
-        if let Some(error) = model_readiness_error(&profile, &status, request) {
-            return Err(error);
+        validate_base_url_for_privacy(&profile.base_url, profile.privacy_mode)?;
+        if profile.privacy_mode == PrivacyMode::StrictLocal
+            && profile.mode == ModelMode::External
+            && operation.use_case.contains_student_data()
+        {
+            return Err(AppError {
+                code: AppErrorCode::ModelPrivacyBlocked,
+                message: "Öğrenci verisi taşıyan model işlemi yalnızca güvenli yerel profilde çalıştırılabilir.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Yönetilen yerel model profilini seçin veya harici model kullanımını Ayarlar'dan açıkça onaylayın.".to_string()),
+                technical_details: Some(format!(
+                    "strict_local_external_student_data_blocked; profile_id={}; use_case={:?}",
+                    profile.id, operation.use_case
+                )),
+                correlation_id: correlation_id.to_string(),
+            });
         }
         let grant = self
             .process_manager
             .acquire_lease(
                 profile_id,
-                request.requires_mmproj,
-                request.timeout_seconds,
+                operation.requires_mmproj,
+                operation.timeout_seconds,
                 consumer_id,
-                job_id,
-                request.use_case.step_name(),
+                Some(correlation_id),
+                operation.use_case.step_name(),
+                correlation_id,
             )
             .await
-            .map_err(normalize_model_error)?;
+            .map_err(|mut error| {
+                error.correlation_id = correlation_id.to_string();
+                normalize_model_error(error)
+            })?;
         Ok(ModelRuntimeLease {
             manager: self.process_manager.clone(),
             grant,
@@ -265,7 +290,34 @@ impl ModelRuntimeService {
         profile_id: Option<&str>,
         mode: ModelMode,
     ) -> Result<ModelStatus, AppError> {
+        if mode == ModelMode::External {
+            let profile = self.config_service.get_profile(profile_id)?;
+            if profile.privacy_mode != PrivacyMode::ExplicitExternal {
+                return Err(AppError {
+                    code: AppErrorCode::ModelExternalConsentRequired,
+                    message: "Harici model kullanımı için açık kullanıcı onayı gerekiyor."
+                        .to_string(),
+                    recoverable: true,
+                    suggested_action: Some(
+                        "Ayarlar > Modeller bölümünde harici kullanımı açıkça onaylayın."
+                            .to_string(),
+                    ),
+                    technical_details: Some(format!(
+                        "external_mode_requires_explicit_external_privacy; profile_id={}",
+                        profile.id
+                    )),
+                    correlation_id: uuid::Uuid::new_v4().to_string(),
+                });
+            }
+        }
         self.process_manager.set_mode(profile_id, mode).await
+    }
+
+    pub fn enable_external_profile(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<ModelProfile, AppError> {
+        self.config_service.enable_external_profile(profile_id)
     }
 
     pub async fn reset_profile(&self, profile_id: Option<&str>) -> Result<ModelStatus, AppError> {
@@ -315,88 +367,6 @@ impl ModelRuntimeService {
         }
         Ok(runtime)
     }
-}
-
-fn model_readiness_error(
-    profile: &ModelProfile,
-    status: &ModelStatus,
-    request: &ModelRuntimeRequest,
-) -> Option<AppError> {
-    if profile.server_path.trim().is_empty()
-        && profile.model_path.trim().is_empty()
-        && profile.mmproj_path.trim().is_empty()
-    {
-        return Some(AppError {
-            code: AppErrorCode::ModelConfigMissing,
-            message: "Model yapılandırması eksik.".to_string(),
-            recoverable: true,
-            suggested_action: Some("Model profilini yapılandırın.".to_string()),
-            technical_details: Some(format!(
-                "step={}; profile_id={}; server_path_empty=true; model_path_empty=true; mmproj_path_empty=true",
-                request.use_case.step_name(),
-                status.profile_id
-            )),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        });
-    }
-    if !status.server_path_exists {
-        return Some(AppError {
-            code: AppErrorCode::ModelBinaryMissing,
-            message: "llama-server binary bulunamadı.".to_string(),
-            recoverable: true,
-            suggested_action: Some("Llama-server binary yolunu kontrol edin.".to_string()),
-            technical_details: Some(format!(
-                "step={}; profile_id={}; server_path_exists=false",
-                request.use_case.step_name(),
-                status.profile_id
-            )),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        });
-    }
-    if !status.model_path_exists {
-        return Some(AppError {
-            code: AppErrorCode::ModelFileMissing,
-            message: "Model dosyası bulunamadı.".to_string(),
-            recoverable: true,
-            suggested_action: Some("GGUF model yolunu kontrol edin.".to_string()),
-            technical_details: Some(format!(
-                "step={}; profile_id={}; model_path_exists=false",
-                request.use_case.step_name(),
-                status.profile_id
-            )),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        });
-    }
-    if request.requires_mmproj && !status.mmproj_path_exists {
-        return Some(AppError {
-            code: AppErrorCode::ModelMmprojMissing,
-            message: "MMProj dosyası bulunamadı.".to_string(),
-            recoverable: true,
-            suggested_action: Some("MMProj yolunu kontrol edin.".to_string()),
-            technical_details: Some(format!(
-                "step={}; profile_id={}; mmproj_path_exists=false",
-                request.use_case.step_name(),
-                status.profile_id
-            )),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        });
-    }
-    if status.server_running && !status.started_by_app && !status.health_ok {
-        return Some(AppError {
-            code: AppErrorCode::ModelPortBlocked,
-            message: "Model portu başka bir süreç tarafından kullanılıyor.".to_string(),
-            recoverable: true,
-            suggested_action: Some("Mevcut model sürecini kontrol edin.".to_string()),
-            technical_details: Some(format!(
-                "step={}; profile_id={}; port={}; server_running=true; started_by_app=false",
-                request.use_case.step_name(),
-                status.profile_id,
-                profile.port
-            )),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        });
-    }
-    None
 }
 
 fn build_runtime_status(
@@ -528,6 +498,7 @@ mod tests {
             port: 8080,
             base_url: "http://127.0.0.1:8080".to_string(),
             runtime_preset: ModelRuntimePreset::Standard,
+            privacy_mode: PrivacyMode::StrictLocal,
         }
     }
 
@@ -537,6 +508,60 @@ mod tests {
             ModelUseCase::StudentAnswerOcr.step_name(),
             "student_answer_ocr"
         );
+    }
+
+    #[test]
+    fn speaking_evaluation_is_classified_as_student_data() {
+        assert!(ModelUseCase::SpeakingEvaluation.contains_student_data());
+        assert_eq!(
+            ModelUseCase::SpeakingEvaluation.step_name(),
+            "speaking_evaluation"
+        );
+    }
+
+    #[test]
+    fn strict_local_blocks_configured_public_external_student_runtime() {
+        let config_service = ModelConfigService::new_with_path(std::env::temp_dir().join(format!(
+            "rubrika-model-privacy-config-{}.json",
+            uuid::Uuid::new_v4()
+        )));
+        let mut profile = config_service.get_profile(None).unwrap();
+        profile.server_path = "/tmp/llama-server".to_string();
+        profile.model_path = "/tmp/model.gguf".to_string();
+        profile.base_url = "https://model.example.test".to_string();
+        profile.host = "model.example.test".to_string();
+        profile.mode = ModelMode::External;
+        profile.privacy_mode = PrivacyMode::StrictLocal;
+        config_service.update_profile(profile).unwrap();
+        let manager = ModelProcessManager::new_with_state_path(
+            config_service.clone(),
+            Arc::new(crate::services::llama_server_gateway::LlamaServerGateway::default()),
+            std::env::temp_dir().join(format!(
+                "rubrika-model-privacy-state-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        );
+        let runtime = ModelRuntimeService::new(config_service, manager);
+        let request = ModelRuntimeRequest {
+            use_case: ModelUseCase::StudentAnswerOcr,
+            capability: ModelCapability::Vision,
+            requires_mmproj: false,
+            timeout_seconds: 1,
+        };
+        let result =
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(runtime.acquire_ready_runtime_lease(
+                    None,
+                    "privacy_test",
+                    request,
+                    "privacy-correlation",
+                ));
+        let error = match result {
+            Ok(_) => panic!("public strict-local runtime must be blocked"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, AppErrorCode::ModelPrivacyBlocked);
     }
 
     #[test]
@@ -692,7 +717,13 @@ PY
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let err = runtime.ensure_ready(None, request).await.unwrap_err();
+            let result = runtime
+                .acquire_ready_runtime_lease(None, "runtime_test", request, "runtime-test")
+                .await;
+            let err = match result {
+                Ok(_) => panic!("runtime should fail before acquiring a lease"),
+                Err(error) => error,
+            };
             assert!(matches!(
                 err.code,
                 AppErrorCode::ModelStartTimeout

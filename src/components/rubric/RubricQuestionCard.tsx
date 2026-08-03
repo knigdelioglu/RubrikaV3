@@ -1,13 +1,14 @@
 import { LoadingButton } from '../common/LoadingButton';
 import { answerTypeLabels, rubricSourceLabels, rubricStatusLabels, textFieldStatusLabels } from '../../utils/labels';
-import type { AnswerType, RubricQuestionSnapshot } from '../../api/types';
+import type { AnswerType, RubricLevel, RubricQuestionSnapshot } from '../../api/types';
 import { teacherFacingRubricWarnings } from '../../utils/rubricWarnings';
 import { optionalGuidanceEmptyText, optionalGuidanceText } from '../../utils/rubricGuidance';
 import { CheckCircle2, AlertCircle, Trash2, Plus, Edit2, Save, FileText } from 'lucide-react';
 import { useState } from 'react';
 
-export type CriterionDraft = { id: string; label: string; description: string; points: string; };
-export type RubricDraft = { answerType: AnswerType; maxScore: string; expectedAnswer: string; criteria: CriterionDraft[]; partialCreditHints: string; zeroScoreConditions: string; commonMistakes: string; };
+export type RubricLevelDraft = Omit<RubricLevel, 'score'> & { score: string };
+export type CriterionDraft = { id: string; label: string; description: string; points: string; levels?: RubricLevelDraft[] };
+export type RubricDraft = { answerType: AnswerType; maxScore: string; expectedAnswer: string; keyConcepts: string; criteria: CriterionDraft[]; partialCreditHints: string; zeroScoreConditions: string; commonMistakes: string; };
 type RubricQuestionCardProps = { item: RubricQuestionSnapshot; draft: RubricDraft; saving: boolean; disabledReason?: string; onDraftChange: (questionId: string, next: RubricDraft) => void; onSave: (questionId: string) => void | boolean | Promise<void | boolean>; onConfirm: (questionId: string) => void | boolean | Promise<void | boolean>; };
 
 function updateDraft(draft: RubricDraft, patch: Partial<RubricDraft>): RubricDraft { return { ...draft, ...patch }; }
@@ -37,7 +38,7 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
   };
 
   const addCriterion = () => {
-    onDraftChange(item.question.id, updateDraft(draft, { criteria: [...draft.criteria, { id: crypto.randomUUID(), label: '', description: '', points: '' }] }));
+  onDraftChange(item.question.id, updateDraft(draft, { criteria: [...draft.criteria, { id: crypto.randomUUID(), label: '', description: '', points: '', levels: [] }] }));
   };
 
   const removeCriterion = (criterionId: string) => {
@@ -94,6 +95,7 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
           </div>
           {!isEditing && (
             <button
+              data-project-write="false"
               onClick={() => setIsEditing(true)}
               style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1rem', background: 'white', color: '#475569', border: '1px solid #cbd5e1', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: 'pointer', transition: 'all 0.2s' }}
               onMouseOver={(e) => { e.currentTarget.style.color = '#4f46e5'; e.currentTarget.style.borderColor = '#c7d2fe'; e.currentTarget.style.backgroundColor = '#e0e7ff'; }}
@@ -175,6 +177,7 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
                 <h4 style={{ margin: 0, fontSize: '1rem', fontWeight: 600, color: '#0f172a' }}>Değerlendirme Kriterleri · Toplam {criterionPointsTotal} puan</h4>
                 <button
                   type="button"
+                  data-project-write="false"
                   onClick={addCriterion}
                   style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', padding: '0.375rem 0.75rem', background: '#eff6ff', color: '#2563eb', border: 'none', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: 'pointer' }}
                 >
@@ -228,6 +231,7 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
                     <div style={{ display: 'flex', alignItems: 'center', height: '100%', paddingTop: '1.25rem' }}>
                       <button
                         type="button"
+                        data-project-write="false"
                         onClick={() => removeCriterion(criterion.id)}
                         aria-label={`${criterion.label || 'Kriter'} kriterini sil`}
                         style={{ background: 'transparent', border: 'none', color: '#ef4444', padding: '0.5rem', cursor: 'pointer', borderRadius: '0.25rem' }}
@@ -238,6 +242,11 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
                         <Trash2 size={16} />
                       </button>
                     </div>
+                    <div style={{ gridColumn: '1 / -1', color: '#64748b', fontSize: '0.75rem', borderTop: '1px solid #f1f5f9', paddingTop: '0.6rem' }}>
+                      {(criterion.levels?.length ?? 0) > 0
+                        ? `${criterion.levels?.length} kanonik seviye korunuyor; seviye değişiklikleri öğretmen onayı gerektirir.`
+                        : 'Bu eski numeric kriter için seviye migration önerisi oluşturulmadı.'}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -247,6 +256,18 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
 
             {/* Advanced Rich Fields */}
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: '1.5rem' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <label style={{ fontSize: '0.875rem', fontWeight: 600, color: '#334155' }}>Anahtar Kavramlar</label>
+                <textarea
+                  aria-label={`Soru ${item.question.number} anahtar kavramları`}
+                  rows={3}
+                  value={draft.keyConcepts}
+                  onChange={(e) => onDraftChange(item.question.id, updateDraft(draft, { keyConcepts: e.target.value }))}
+                  placeholder="Her kavramı ayrı satıra yazın."
+                  style={{ padding: '0.75rem', borderRadius: '0.5rem', border: '1px solid #cbd5e1', outline: 'none', fontSize: '0.875rem', resize: 'vertical' }}
+                />
+                <span style={{ fontSize: '0.75rem', color: '#64748b' }}>Boş bırakılan alan gerçek rubrik verisi olarak kaydedilmez.</span>
+              </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                 <label style={{ fontSize: '0.875rem', fontWeight: 600, color: '#334155' }}>Kısmi Puan İpuçları (Opsiyonel)</label>
                 <textarea
@@ -293,6 +314,7 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1rem' }}>
               <button
+                data-project-write="false"
                 onClick={() => setIsEditing(false)}
                 style={{ padding: '0.625rem 1rem', background: 'white', color: '#475569', border: '1px solid #cbd5e1', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: 'pointer' }}
               >
@@ -319,6 +341,12 @@ export function RubricQuestionCard({ item, draft, saving, disabledReason, onDraf
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
             {/* View Mode */}
+            {draft.keyConcepts.trim() && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <span style={{ fontSize: '0.875rem', fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Anahtar Kavramlar</span>
+                <div style={{ fontSize: '0.95rem', color: '#0f172a', background: '#f8fafc', padding: '1rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0', whiteSpace: 'pre-wrap' }}>{draft.keyConcepts}</div>
+              </div>
+            )}
             <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
               <span style={{ fontSize: '0.875rem', fontWeight: 600, color: '#475569', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Beklenen Cevap</span>
               <div style={{ fontSize: '0.95rem', color: '#0f172a', background: '#f8fafc', padding: '1rem', borderRadius: '0.5rem', border: '1px solid #e2e8f0', whiteSpace: 'pre-wrap' }}>

@@ -17,6 +17,7 @@ export function AssessmentModeSelector() {
     <div className="assessment-mode-selector" role="radiogroup" aria-label="Sınav türü">
       <button
         type="button"
+        data-project-write="false"
         className={activeMode === 'written' ? 'is-active' : ''}
         role="radio"
         aria-checked={activeMode === 'written'}
@@ -27,6 +28,7 @@ export function AssessmentModeSelector() {
       </button>
       <button
         type="button"
+        data-project-write="false"
         className={activeMode === 'listening' ? 'is-active' : ''}
         role="radio"
         aria-checked={activeMode === 'listening'}
@@ -37,6 +39,7 @@ export function AssessmentModeSelector() {
       </button>
       <button
         type="button"
+        data-project-write="false"
         className={activeMode === 'speaking' ? 'is-active' : ''}
         role="radio"
         aria-checked={activeMode === 'speaking'}

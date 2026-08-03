@@ -15,9 +15,6 @@ use crate::domain::rubric::RubricStatus;
 use crate::domain::workflow::{WorkflowAction, WorkflowSnapshot, WorkflowStage};
 use crate::jobs::job_manager::JobManager;
 use crate::platform::project_paths::TrustedProjectRoot;
-use crate::services::model_runtime_service::{
-    ModelCapability, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
-};
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
 use crate::services::question_text_service::{QuestionTextService, QuestionTextSource};
@@ -32,7 +29,6 @@ const EXAM_PACKAGE_REVIEW_ROUTE: &str = "/exam-package-review";
 pub struct ExamPackageBuildService {
     project_store: ProjectStore,
     pdf_preview_service: Arc<PdfPreviewService>,
-    model_runtime_service: ModelRuntimeService,
     question_text_service: Arc<QuestionTextService>,
     rubric_extraction_service: Arc<RubricExtractionService>,
     job_manager: Arc<JobManager>,
@@ -95,7 +91,6 @@ impl ExamPackageBuildService {
     pub fn new(
         project_store: ProjectStore,
         pdf_preview_service: Arc<PdfPreviewService>,
-        model_runtime_service: ModelRuntimeService,
         question_text_service: Arc<QuestionTextService>,
         rubric_extraction_service: Arc<RubricExtractionService>,
         job_manager: Arc<JobManager>,
@@ -103,7 +98,6 @@ impl ExamPackageBuildService {
         Self {
             project_store,
             pdf_preview_service,
-            model_runtime_service,
             question_text_service,
             rubric_extraction_service,
             job_manager,
@@ -359,7 +353,14 @@ impl ExamPackageBuildService {
             6,
             "Gemma model sunucusu hazırlanıyor...".to_string(),
         )?;
-        let model_result = self.ensure_model_ready().await?;
+        // Model readiness is owned by each extraction job. Keeping a separate
+        // lease here would create a readiness preflight without carrying the
+        // verified runtime context into the worker.
+        let model_result = ExamPackageBuildModelResult {
+            skipped: true,
+            health_ok: false,
+            mode: "delegated_to_domain_job_lease".to_string(),
+        };
 
         if let Some(ref token) = cancel_token {
             if token.is_cancelled() {
@@ -546,26 +547,6 @@ impl ExamPackageBuildService {
         })
     }
 
-    async fn ensure_model_ready(&self) -> Result<ExamPackageBuildModelResult, AppError> {
-        let runtime_status = self
-            .model_runtime_service
-            .ensure_ready(
-                None,
-                ModelRuntimeRequest {
-                    use_case: ModelUseCase::RubricPdfImport,
-                    capability: ModelCapability::Vision,
-                    requires_mmproj: true,
-                    timeout_seconds: 180,
-                },
-            )
-            .await?;
-        Ok(ExamPackageBuildModelResult {
-            skipped: false,
-            health_ok: runtime_status.health_ok,
-            mode: "managed".to_string(),
-        })
-    }
-
     async fn ensure_question_texts<R: tauri::Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -659,19 +640,6 @@ impl ExamPackageBuildService {
         if all_available {
             return Ok(summary);
         }
-
-        let _ = self
-            .model_runtime_service
-            .ensure_ready(
-                None,
-                ModelRuntimeRequest {
-                    use_case: ModelUseCase::RubricPdfImport,
-                    capability: ModelCapability::Vision,
-                    requires_mmproj: true,
-                    timeout_seconds: 180,
-                },
-            )
-            .await?;
 
         let existing_active_job = self.latest_active_job(project_id, JobKind::RubricPdfImport);
         let job_id = if let Some(job) = existing_active_job {
@@ -974,7 +942,6 @@ mod tests {
         ExamPackageBuildService::new(
             project_store,
             pdf_preview_service,
-            model_runtime_service,
             question_text_service,
             rubric_extraction_service,
             job_manager,
@@ -1091,6 +1058,7 @@ mod tests {
             documents: vec![],
             questions: vec![first, second],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {

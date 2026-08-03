@@ -76,6 +76,9 @@ export const blockingReasonLabels: Record<string, string> = {
   SCORING_NOT_READY: 'Notlandırma için gerekli kontroller tamam değil',
   SCORING_RESULT_MISSING: 'Notlandırma sonucu eksik',
   MODEL_SERVER_NOT_RUNNING: 'Gemma model sunucusu çalışmıyor.',
+  MODEL_PRIVACY_BLOCKED: 'Model kullanımı gizlilik politikası nedeniyle engellendi.',
+  MODEL_EXTERNAL_CONSENT_REQUIRED: 'Harici model kullanımı için açık onay gerekiyor.',
+  MODEL_REDIRECT_REJECTED: 'Model sunucusunun güvenli olmayan yönlendirmesi reddedildi.',
   MODEL_PROCESS_IDENTITY_MISMATCH: 'Yerel model süreci güvenli biçimde doğrulanamadı.',
   MODEL_PROCESS_UNVERIFIED: 'Yerel model süreci güvenli biçimde doğrulanamadı.',
   MODEL_RUNTIME_IN_USE: 'Yerel model şu anda başka işlemler tarafından kullanılıyor.',
@@ -189,6 +192,8 @@ export const rubricSourceLabels: Record<string, string> = {
   manual: 'Manuel',
   json: 'JSON',
   answer_key_pdf: 'Cevap anahtarı PDF',
+  rubric_pdf: 'Rubrik PDF',
+  gemma_draft: 'Model önerisi (onay bekliyor)',
   generated: 'Üretilmiş',
   unknown: 'Bilinmiyor',
 };
@@ -257,6 +262,9 @@ export const scoringWarningLabels: Record<string, string> = {
   criterion_rationale_incomplete: 'Bir veya daha fazla kriterin gerekçesi eksik.',
   scoring_criterion_max_mismatch: 'Model rubrikteki kriter üst puanını değiştirmeye çalıştı; kanonik rubrik değeri korundu.',
   scoring_criterion_score_out_of_range: 'Bir kriter puanı izin verilen aralığın dışındaydı; güvenli aralığa çekildi.',
+  scoring_criterion_id_missing: 'Model çıktısında frozen rubriğin bir kriter kimliği eksik veya hatalı.',
+  scoring_criterion_id_unknown: 'Model çıktısındaki kriter frozen rubrikte bulunamadı; puan uygulanmadı.',
+  scoring_criterion_id_duplicate: 'Model aynı kriter kimliğini birden fazla kez döndürdü; puan uygulanmadı.',
   scoring_evidence_missing: 'Pozitif puan verilen bir kriter için öğrenci cevabından kanıt gösterilmedi; puan uygulanmadı.',
   scoring_evidence_not_in_answer: 'Modelin gösterdiği kanıt öğrenci cevabında birebir bulunamadı; puan uygulanmadı.',
   MODEL_SERVER_NOT_RUNNING: 'Model sunucusuna ulaşılamadı; puan uygulanmadı.',
@@ -269,6 +277,35 @@ export const scoringWarningLabels: Record<string, string> = {
   ModelResponseInvalidJson: 'Model yanıtı doğrulanamadı; puan uygulanmadı.',
   ocr_record_missing: 'Onaylı öğrenci cevabı bulunamadığı için puan uygulanmadı.',
   ocr_not_approved: 'Öğrenci cevabı öğretmen onaylı olmadığı için puan uygulanmadı.',
+  model_direct_score_ignored: 'Modelin doğrudan verdiği puan dikkate alınmadı; puan kanonik seviyeden hesaplanmalı.',
+  semantic_scoring_parse_failed: 'Semantik puanlama çıktısı doğrulanamadı; öğretmen kontrolü gerekli.',
+  semantic_criterion_decisions_missing: 'Model kriter seviyelerini bildirmedi; öğretmen kontrolü gerekli.',
+  semantic_criterion_id_unknown: 'Model bilinmeyen bir kriter seçti; puan uygulanmadı.',
+  semantic_criterion_id_duplicate: 'Model aynı kriteri birden fazla seçti; puan uygulanmadı.',
+  semantic_criterion_id_missing: 'Bir veya daha fazla kriter için seviye seçimi eksik.',
+  semantic_level_id_unknown: 'Model rubrikte bulunmayan bir seviye seçti; puan uygulanmadı.',
+  semantic_level_score_invalid: 'Rubrik seviyesi geçersiz puan içeriyor; öğretmen kontrolü gerekli.',
+  semantic_evidence_missing: 'Gerekli kanıt gösterilmedi; puan uygulanmadı.',
+  semantic_evidence_not_in_answer: 'Gösterilen kanıt öğrenci cevabında bulunamadı; puan uygulanmadı.',
+  semantic_missing_requirement: 'Seçilen seviyede eksik koşul bildirildi; öğretmen kontrolü gerekli.',
+  semantic_contradiction: 'Cevapta çelişki bildirildi; öğretmen kontrolü gerekli.',
+  semantic_rationale_missing: 'Semantik değerlendirme açıklaması eksik.',
+  rubric_levels_missing: 'Rubrik seviyeleri hazırlanıp öğretmen tarafından onaylanmalı.',
+  deterministic_policy_not_frozen: 'Deterministik puanlama için dondurulmuş rubrik politikası gerekli.',
+  structured_answer_missing: 'Yapılandırılmış öğrenci cevabı bulunamadı; öğretmen kontrolü gerekli.',
+  structured_answer_invalid: 'Yapılandırılmış öğrenci cevabı doğrulanamadı.',
+  deterministic_answer_type_unsupported: 'Bu cevap türü için öğretmen kontrolü gerekli.',
+  consistency_review: 'Aynı cevap kümesinde farklı puan veya seviye görüldü; karşılaştırıp onaylayın.',
+};
+
+export const scoringDecisionStateLabels: Record<string, string> = {
+  provisional: 'Geçici sonuç',
+  model_candidate: 'Model adayı · onay bekliyor',
+  deterministic_accepted: 'Deterministik kabul',
+  auto_accepted: 'Otomatik kabul · final değil',
+  teacher_approved: 'Öğretmen finali',
+  rejected: 'Reddedildi',
+  failed: 'Puan uygulanmadı',
 };
 
 export const scoringReviewStatusLabels: Record<string, string> = {
@@ -276,6 +313,13 @@ export const scoringReviewStatusLabels: Record<string, string> = {
   approved: 'Onaylandı',
   edited: 'Düzenlendi',
   invalidated: 'Geçersiz',
+};
+
+export const scoringAnchorEligibilityLabels: Record<string, string> = {
+  eligible: 'Kullanıma uygun anchor',
+  stale: 'Güncelliğini yitirdi; yeniden değerlendirme gerekli',
+  ineligible: 'Anchor kullanıma uygun değil',
+  revoked: 'Anchor statüsü kaldırıldı',
 };
 
 export const ocrWarningLabels: Record<string, string> = {

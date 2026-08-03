@@ -70,7 +70,7 @@ test('question list shows question and rubric presentation states together', () 
     number: 2,
     questionText: { value: 'Taslak', source: 'exam_pdf', status: 'suggested', warnings: [] },
     rubric: {
-      criteria: [], partialCreditHints: [], zeroScoreConditions: [], commonMistakes: [], status: 'missing', warnings: [],
+      criteria: [], keyConcepts: [], partialCreditHints: [], zeroScoreConditions: [], commonMistakes: [], status: 'missing', warnings: [],
     },
   });
   const items = buildExamPackageQuestionItems([review, ready], [rubricItem(ready), rubricItem(review, false)]);

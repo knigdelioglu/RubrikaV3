@@ -11,7 +11,7 @@ import { LoadingButton } from '../components/common/LoadingButton';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { useProjectContext } from '../state/useProjectContext';
 import { ClassStudentRosterPage } from './ClassStudentRosterPage';
-import { getClassesSetupTargetId } from './classesUi';
+import { getClassesSetupTargetId, getClassesTab, setClassesTab } from './classesUi';
 
 type ClassDraft = {
   academicYear: string;
@@ -28,7 +28,7 @@ function derivedClassName(draft: ClassDraft): string {
 export function ClassesPage() {
   const { projectId, projectPath, isResolving } = useProjectContext();
   const queryClient = useQueryClient();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [draft, setDraft] = useState<ClassDraft>(emptyDraft);
   const [editingClassId, setEditingClassId] = useState<string | null>(null);
@@ -45,7 +45,7 @@ export function ClassesPage() {
 
   const [error, setError] = useState<AppError | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'classes' | 'roster'>('classes');
+  const activeTab = getClassesTab(searchParams);
   const setupParam = searchParams.get('setup');
 
   const classesQuery = useQuery({
@@ -95,14 +95,14 @@ export function ClassesPage() {
 
   // Auto scroll effect for ?setup=course | classes | assignments
   useEffect(() => {
+    if (activeTab === 'roster') return;
     const targetId = getClassesSetupTargetId(setupParam);
     if (!targetId) return;
-    setActiveTab('classes');
     const timeoutId = window.setTimeout(() => {
       document.getElementById(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 150);
     return () => window.clearTimeout(timeoutId);
-  }, [setupParam]);
+  }, [activeTab, setupParam]);
 
   const refresh = async () => {
     await Promise.all([
@@ -253,15 +253,17 @@ export function ClassesPage() {
       <div className="exam-package-tabs" role="tablist" style={{ marginBottom: '1.5rem' }}>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'classes' ? 'is-active' : ''}
-          onClick={() => setActiveTab('classes')}
+          onClick={() => setSearchParams(setClassesTab(searchParams, 'classes'), { replace: true })}
         >
           Sınıflar ve Görevlendirmeler
         </button>
         <button
           type="button"
+          data-project-write="false"
           className={activeTab === 'roster' ? 'is-active' : ''}
-          onClick={() => setActiveTab('roster')}
+          onClick={() => setSearchParams(setClassesTab(searchParams, 'roster'), { replace: true })}
         >
           Merkezi Öğrenci Listesi
         </button>
@@ -317,7 +319,7 @@ export function ClassesPage() {
                 </p>
               </div>
               {hasCourse && !editingCourse && (
-                <button type="button" className="button button--secondary" onClick={() => setEditingCourse(true)} style={{ fontSize: '0.8rem' }}>
+                <button type="button" data-project-write="false" className="button button--secondary" onClick={() => setEditingCourse(true)} style={{ fontSize: '0.8rem' }}>
                   Düzenle
                 </button>
               )}
@@ -373,7 +375,7 @@ export function ClassesPage() {
 
                 <div style={{ display: 'flex', gap: '0.5rem' }}>
                   {editingCourse && hasCourse && (
-                    <button type="button" className="button button--secondary" onClick={() => setEditingCourse(false)}>
+                    <button type="button" data-project-write="false" className="button button--secondary" onClick={() => setEditingCourse(false)}>
                       İptal
                     </button>
                   )}
@@ -403,7 +405,7 @@ export function ClassesPage() {
                 <form className="class-editor" onSubmit={(event) => { event.preventDefault(); if (canSaveClass) saveClassMutation.mutate(); }} style={{ marginBottom: '1.25rem' }}>
                   <div className="class-editor__heading">
                     <div><strong>{editingClassId ? 'Sınıfı düzenle' : 'Yeni sınıf'}</strong><span>{derivedClassName(draft) || 'Düzey ve şube seçin'}</span></div>
-                    {editingClassId && <button type="button" className="button button--secondary" onClick={() => { setEditingClassId(null); setDraft(emptyDraft); }}>İptal</button>}
+                    {editingClassId && <button type="button" data-project-write="false" className="button button--secondary" onClick={() => { setEditingClassId(null); setDraft(emptyDraft); }}>İptal</button>}
                   </div>
                   <label><span>Akademik yıl</span><input value={draft.academicYear || academicYear} onChange={(event) => setDraft((current) => ({ ...current, academicYear: event.target.value }))} placeholder="2026-2027" /></label>
                   <label><span>Sınıf düzeyi</span><input type="number" min={1} max={12} value={draft.gradeLevel} onChange={(event) => setDraft((current) => ({ ...current, gradeLevel: event.target.value }))} placeholder="11" /></label>
@@ -431,7 +433,7 @@ export function ClassesPage() {
                               <span>{schoolClass.status === "active" ? "Aktif sınıf" : "Arşivlenmiş sınıf"}</span>
                             </div>
                             <div className="class-card__actions">
-                              <button type="button" className="icon-button" aria-label={`${schoolClass.name} sınıfını düzenle`} onClick={() => {
+                              <button type="button" data-project-write="false" className="icon-button" aria-label={`${schoolClass.name} sınıfını düzenle`} onClick={() => {
                                 setEditingClassId(schoolClass.id);
                                 setDraft({
                                   academicYear: schoolClass.academicYear ?? "",
@@ -440,9 +442,9 @@ export function ClassesPage() {
                                 });
                               }}><Pencil size={16} /></button>
                               {schoolClass.status === "active" ? (
-                                <button type="button" className="icon-button" aria-label={`${schoolClass.name} sınıfını arşivle`} onClick={() => setClassToArchive(schoolClass)}><Archive size={16} /></button>
+                                <button type="button" data-project-write="false" className="icon-button" aria-label={`${schoolClass.name} sınıfını arşivle`} onClick={() => setClassToArchive(schoolClass)}><Archive size={16} /></button>
                               ) : (
-                                <button type="button" className="icon-button" aria-label={`${schoolClass.name} sınıfını yeniden etkinleştir`} onClick={() => restoreMutation.mutate(schoolClass)} disabled={restoreMutation.isPending}><RotateCcw size={16} /></button>
+                                <button type="button" data-project-write="true" className="icon-button" aria-label={`${schoolClass.name} sınıfını yeniden etkinleştir`} onClick={() => restoreMutation.mutate(schoolClass)} disabled={restoreMutation.isPending}><RotateCcw size={16} /></button>
                               )}
                             </div>
                           </div>
@@ -455,7 +457,7 @@ export function ClassesPage() {
                             </p>
                           </div>
                           <div className="class-card__links" style={{ marginTop: "0.5rem" }}>
-                            <button type="button" className="button button--secondary" style={{ fontSize: "0.8rem", width: "100%", justifyContent: "center" }} onClick={() => setActiveTab("roster")}>
+                            <button type="button" data-project-write="false" className="button button--secondary" style={{ fontSize: "0.8rem", width: "100%", justifyContent: "center" }} onClick={() => setSearchParams(setClassesTab(searchParams, 'roster'), { replace: true })}>
                               Öğrencileri yönet
                             </button>
                           </div>
@@ -547,7 +549,7 @@ export function ClassesPage() {
                       {activeAssignments.map((a) => (
                         <span key={a.id} style={{ padding: '0.35rem 0.75rem', background: '#f1f5f9', borderRadius: '0.5rem', fontSize: '0.8rem', color: '#1e293b', fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}>
                           {a.courseName} · {classes.find((c) => c.id === a.classSectionId)?.name || a.classSectionId}
-                          <button type="button" style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#64748b', padding: 0 }} onClick={() => archiveAssignmentMutation.mutate(a)} aria-label="Görevlendirmeyi arşivle">
+                          <button type="button" data-project-write="true" style={{ border: 'none', background: 'none', cursor: 'pointer', color: '#64748b', padding: 0 }} onClick={() => archiveAssignmentMutation.mutate(a)} aria-label="Görevlendirmeyi arşivle">
                             <Archive size={14} />
                           </button>
                         </span>

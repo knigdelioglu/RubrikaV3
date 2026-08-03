@@ -10,9 +10,9 @@ use crate::domain::job::{JobKind, JobSnapshot, JobStatus};
 use crate::domain::project::Project;
 use crate::domain::question::Question;
 use crate::domain::student::{
-    new_student_id, student_identity_is_missing, ClassMembershipSource, PageGroupingMode, Student,
-    StudentAnswerSlot, StudentAnswerSlotStatus, StudentScanReadinessSnapshot, StudentSubmission,
-    StudentSubmissionStatus,
+    default_ocr_review_policy, new_student_id, student_identity_is_missing, ClassMembershipSource,
+    PageGroupingMode, Student, StudentAnswerSlot, StudentAnswerSlotStatus,
+    StudentScanReadinessSnapshot, StudentSubmission, StudentSubmissionStatus,
 };
 use crate::jobs::job_manager::load_persisted_jobs;
 use crate::services::pdf_preview_service::PdfPreviewService;
@@ -771,6 +771,7 @@ impl StudentScanService {
                     "Öğrenci cevap OCR hazırlığı bekleniyor.".to_string()
                 }
             }),
+            ocr_review_policy: default_ocr_review_policy().to_dto(),
         })
     }
 
@@ -1220,7 +1221,10 @@ mod tests {
     use crate::domain::project::Project;
     use crate::domain::question::default_question;
     use crate::domain::school_class::{SchoolClass, SchoolClassStatus, StudentScanBatch};
-    use crate::domain::student::{OcrGeneration, OcrGenerationStatus, OcrTeacherReviewStatus};
+    use crate::domain::student::{
+        AnswerRegionRole, ContinuationPolicy, NormalizedBBox, OcrGeneration, OcrGenerationStatus,
+        OcrTeacherReviewStatus, QuestionAnswerRegion, QuestionAnswerTemplate,
+    };
     use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
     use crate::jobs::job_manager::JobManager;
     use crate::services::pdf_service::SystemPdfService;
@@ -1315,6 +1319,25 @@ mod tests {
     fn ready_grouping_project() -> (ProjectStore, Project) {
         let (store, mut project) = ready_project();
         project.questions.push(default_question(1));
+        let question_id = project.questions[0].id.clone();
+        project.student_answer_crop_template.templates = vec![QuestionAnswerTemplate {
+            question_id: question_id.clone(),
+            regions: vec![QuestionAnswerRegion {
+                region_id: format!("{question_id}-region-0"),
+                page_offset: 0,
+                order: 0,
+                normalized_bbox: NormalizedBBox {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.8,
+                    height: 0.3,
+                },
+                region_role: AnswerRegionRole::Primary,
+                continuation_policy: ContinuationPolicy::Independent,
+                label: None,
+                note: None,
+            }],
+        }];
         project.questions[0].question_text = crate::domain::question::TextFieldState {
             value: "Question 1".to_string(),
             source: crate::domain::question::TextFieldSource::Manual,
@@ -1328,11 +1351,13 @@ mod tests {
             source: Some(crate::domain::rubric::RubricSource::Manual),
             max_score: Some(10.0),
             expected_answer: Some("Answer 1".to_string()),
+            key_concepts: vec![],
             criteria: vec![crate::domain::rubric::RubricCriterion {
                 id: Uuid::new_v4().to_string(),
                 label: "Criterion".to_string(),
                 description: "Desc".to_string(),
                 points: 10.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -1726,6 +1751,7 @@ mod tests {
             source_document_id: "scan".to_string(),
             source_storage_revision: 0,
             failure_reason: None,
+            job_mode: crate::domain::student::StudentAnswerOcrJobMode::Production,
         };
         project
             .student_answer_ocr_generations

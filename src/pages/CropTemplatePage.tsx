@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
-import type { StudentAnswerCropTemplateItem, StudentAnswerOcrCropBBox, StudentIdentityCropTemplate } from '../api/types';
+import type { QuestionAnswerRegion, QuestionAnswerTemplate, StudentAnswerOcrCropBBox, StudentIdentityCropTemplate } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { LoadingButton } from '../components/common/LoadingButton';
 import { ProjectContextState } from '../components/common/ProjectContextState';
@@ -15,7 +15,7 @@ import type { OcrImagePreprocessMode } from '../api/types';
 import { projectStudentOperationsPath } from '../app/projectRoutes';
 import { filterStudentSubmissions } from './studentOperations';
 
-function templateItemKey(item: StudentAnswerCropTemplateItem) {
+function templateItemKey(item: QuestionAnswerTemplate) {
   return item.questionId;
 }
 
@@ -28,7 +28,8 @@ export function CropTemplatePage() {
   const [error, setError] = useState<AppError | null>(null);
   const [selectedQuestionId, setSelectedQuestionId] = useState<string | null>(null);
   const [templatePageIndex, setTemplatePageIndex] = useState(0);
-  const [templateDrafts, setTemplateDrafts] = useState<Record<string, StudentAnswerCropTemplateItem>>({});
+  const [templateDrafts, setTemplateDrafts] = useState<Record<string, QuestionAnswerTemplate>>({});
+  const [selectedRegionOrder, setSelectedRegionOrder] = useState(0);
   const [mode, setMode] = useState<'answers' | 'identity'>('answers');
   const [identityDraft, setIdentityDraft] = useState<StudentIdentityCropTemplate | null>(null);
   const [previewMode, setPreviewMode] = useState<OcrImagePreprocessMode>('handwriting_enhanced');
@@ -62,8 +63,8 @@ export function CropTemplatePage() {
   });
 
   const saveTemplateMutation = useMutation({
-    mutationFn: (items: StudentAnswerCropTemplateItem[]) =>
-      commands.saveStudentAnswerCropTemplate({ projectId, items }),
+    mutationFn: (templates: QuestionAnswerTemplate[]) =>
+      commands.saveStudentAnswerCropTemplate({ projectId, templates }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
@@ -84,7 +85,7 @@ export function CropTemplatePage() {
   useEffect(() => {
     if (!project) return;
     setSelectedQuestionId((current) => current ?? project.questions[0]?.id ?? null);
-    setTemplateDrafts(Object.fromEntries(project.studentAnswerCropTemplate.items.map((item) => [templateItemKey(item), item])));
+    setTemplateDrafts(Object.fromEntries(project.studentAnswerCropTemplate.templates.map((item) => [templateItemKey(item), item])));
     setIdentityDraft(project.studentIdentityCropTemplate ?? null);
   }, [project]);
 
@@ -96,13 +97,16 @@ export function CropTemplatePage() {
   const templateItems = Object.values(templateDrafts);
   const selectedQuestion = project?.questions.find((question) => question.id === selectedQuestionId) ?? project?.questions[0] ?? null;
   const selectedTemplate = selectedQuestion ? templateDrafts[selectedQuestion.id] : null;
-  const selectedTemplateOnCurrentPage =
-    selectedTemplate?.pageIndexWithinSubmission === templatePageIndex ? selectedTemplate : null;
+  const selectedRegion = selectedTemplate?.regions.find((region) => region.order === selectedRegionOrder)
+    ?? (selectedRegionOrder === 0 ? selectedTemplate?.regions[0] : null)
+    ?? null;
+  const selectedTemplateOnCurrentPage = selectedRegion?.pageOffset === templatePageIndex ? selectedRegion : null;
 
   useEffect(() => {
     if (!selectedTemplate || templatePageCount === 0) return;
-    setTemplatePageIndex(Math.min(selectedTemplate.pageIndexWithinSubmission, templatePageCount - 1));
-  }, [selectedQuestionId, selectedTemplate, templatePageCount]);
+    setSelectedRegionOrder(selectedRegion?.order ?? 0);
+    setTemplatePageIndex(Math.min(selectedRegion?.pageOffset ?? 0, templatePageCount - 1));
+  }, [selectedQuestionId, selectedTemplate, selectedRegion, templatePageCount]);
 
   if (isResolving) {
     return <ProjectContextState pageLabel="Crop Şablonu" loading projectPath={projectPath} />;
@@ -142,10 +146,10 @@ export function CropTemplatePage() {
         </div>
 
         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-          <button type="button" onClick={() => setMode('answers')} style={{ padding: '0.5rem 0.75rem', borderRadius: '8px', border: mode === 'answers' ? '2px solid #2563eb' : '1px solid #cbd5e1', background: mode === 'answers' ? '#eff6ff' : 'white' }}>
+          <button type="button" data-project-write="false" onClick={() => setMode('answers')} style={{ padding: '0.5rem 0.75rem', borderRadius: '8px', border: mode === 'answers' ? '2px solid #2563eb' : '1px solid #cbd5e1', background: mode === 'answers' ? '#eff6ff' : 'white' }}>
             Cevap alanı crop’ları
           </button>
-          <button type="button" onClick={() => setMode('identity')} style={{ padding: '0.5rem 0.75rem', borderRadius: '8px', border: mode === 'identity' ? '2px solid #2563eb' : '1px solid #cbd5e1', background: mode === 'identity' ? '#eff6ff' : 'white' }}>
+          <button type="button" data-project-write="false" onClick={() => setMode('identity')} style={{ padding: '0.5rem 0.75rem', borderRadius: '8px', border: mode === 'identity' ? '2px solid #2563eb' : '1px solid #cbd5e1', background: mode === 'identity' ? '#eff6ff' : 'white' }}>
             Kimlik alanı crop’u
           </button>
         </div>
@@ -155,6 +159,7 @@ export function CropTemplatePage() {
             <button
               key={candidate}
               type="button"
+              data-project-write="false"
               onClick={() => setPreviewMode(candidate)}
               style={{ padding: '0.5rem 0.75rem', borderRadius: '8px', border: previewMode === candidate ? '2px solid #16a34a' : '1px solid #cbd5e1', background: previewMode === candidate ? '#f0fdf4' : 'white' }}
             >
@@ -168,6 +173,7 @@ export function CropTemplatePage() {
             <button
               key={question.id}
               type="button"
+              data-project-write="false"
               onClick={() => setSelectedQuestionId(question.id)}
               style={{
                 padding: '0.45rem 0.7rem',
@@ -193,25 +199,51 @@ export function CropTemplatePage() {
                 onChange={(page) => setTemplatePageIndex(page - 1)}
               />
             </div>
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+              <span style={{ color: '#64748b', fontSize: '0.85rem' }}>Cevap bölgeleri:</span>
+              {(selectedTemplate?.regions ?? []).map((region) => (
+                <button
+                  key={region.regionId}
+                  type="button"
+                  data-project-write="false"
+                  onClick={() => setSelectedRegionOrder(region.order)}
+                  style={{ padding: '0.35rem 0.55rem', borderRadius: '7px', border: selectedRegionOrder === region.order ? '2px solid #2563eb' : '1px solid #cbd5e1', background: selectedRegionOrder === region.order ? '#eff6ff' : 'white' }}
+                >
+                  {region.order + 1}. {region.regionRole === 'continuation' ? 'Devam' : 'Ana'} · sf {region.pageOffset + 1}
+                </button>
+              ))}
+            </div>
             
             <PdfPageViewer
               imagePath={previewMode === 'original' ? (templatePreview?.imagePath ?? null) : (cleanTemplatePreview?.outputImagePath ?? templatePreview?.imagePath ?? null)}
               projectId={projectId}
               pageNumber={templatePageNumber ?? 1}
               zoom={0.8}
-              overlayBox={selectedTemplateOnCurrentPage?.bbox ?? null}
+              overlayBox={selectedTemplateOnCurrentPage?.normalizedBBox ?? null}
               editable
               emptyState={<div>Öğrenci 1 sayfa önizlemesi hazır değil.</div>}
               onOverlayChange={(box) => {
-                const bbox: StudentAnswerOcrCropBBox = { ...box, pageIndex: templatePageIndex };
+                const currentTemplate = selectedTemplate ?? { questionId: selectedQuestion.id, regions: [] };
+                const currentRegion = selectedRegion ?? {
+                  regionId: `${selectedQuestion.id}-region-${selectedRegionOrder}`,
+                  pageOffset: templatePageIndex,
+                  order: selectedRegionOrder,
+                  normalizedBBox: box,
+                  regionRole: selectedRegionOrder === 0 ? 'primary' as const : 'continuation' as const,
+                  continuationPolicy: selectedRegionOrder === 0 ? 'independent' as const : 'continues_previous' as const,
+                  label: `Soru ${selectedQuestion.number}`,
+                };
+                const nextRegion: QuestionAnswerRegion = {
+                  ...currentRegion,
+                  pageOffset: templatePageIndex,
+                  normalizedBBox: box,
+                };
                 setTemplateDrafts((current) => ({
                   ...current,
                   [selectedQuestion.id]: {
                     questionId: selectedQuestion.id,
-                    questionNumber: selectedQuestion.number,
-                    pageIndexWithinSubmission: templatePageIndex,
-                    bbox,
-                    label: `Soru ${selectedQuestion.number}`,
+                    regions: [...currentTemplate.regions.filter((region) => region.order !== currentRegion.order), nextRegion]
+                      .sort((left, right) => left.order - right.order),
                   },
                 }));
               }}
@@ -220,10 +252,15 @@ export function CropTemplatePage() {
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
               <button
                 type="button"
+                data-project-write="false"
                 onClick={() => {
                   setTemplateDrafts((current) => {
                     const next = { ...current };
-                    delete next[selectedQuestion.id];
+                    const template = next[selectedQuestion.id];
+                    if (!template) return next;
+                    const regions = template.regions.filter((region) => region.order !== (selectedRegion?.order ?? selectedRegionOrder));
+                    if (regions.length === 0) delete next[selectedQuestion.id];
+                    else next[selectedQuestion.id] = { ...template, regions };
                     return next;
                   });
                 }}
@@ -236,6 +273,16 @@ export function CropTemplatePage() {
               >
                 Şablonu Kaydet
               </LoadingButton>
+              <button
+                type="button"
+                data-project-write="false"
+                onClick={() => {
+                  const nextOrder = (selectedTemplate?.regions.length ?? 0);
+                  setSelectedRegionOrder(nextOrder);
+                }}
+              >
+                Devam bölgesi ekle
+              </button>
             </div>
           </div>
         )}
@@ -277,7 +324,7 @@ export function CropTemplatePage() {
             )}
             
             <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-              <button type="button" onClick={() => setIdentityDraft(null)}>
+              <button type="button" data-project-write="false" onClick={() => setIdentityDraft(null)}>
                 Kimlik Crop’unu Sil
               </button>
               <LoadingButton

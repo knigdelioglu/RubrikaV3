@@ -5,6 +5,9 @@ import { BarChart3, CircleAlert, FileText, Loader2, Mic2, Sparkles, Users } from
 import { commands } from '../api/commands';
 import type { AssessmentKind } from '../api/types';
 import {
+  analysisEvidenceStatusLabel,
+  analysisMetricAnchorId,
+  analysisMetricValueLabel,
   analysisStatusLabel,
   clampAnalysisPercentage,
   latestAnalysisId,
@@ -130,9 +133,12 @@ export function AnalysisPage({ kind }: { kind: AssessmentKind }) {
           </p>
         </div>
         <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
-          <button type="button" className="button button--primary" onClick={() => window.alert('Sınav sonuçları kesinleştirildi.')}>
-            <Sparkles size={16} /> Sonuçları Kesinleştir
-          </button>
+          <span
+            role="status"
+            style={{ padding: '0.55rem 0.75rem', borderRadius: '0.65rem', background: '#f0fdf4', border: '1px solid #bbf7d0', color: '#166534', fontSize: '0.85rem', fontWeight: 700 }}
+          >
+            {analysis.status === 'ready' ? 'Sonuçlar hazır' : analysisStatusLabel(analysis.status)}
+          </span>
           <Link className="button button--secondary" to={backPath}>
             {kind === 'speaking' ? <Mic2 size={16} /> : <FileText size={16} />} Değerlendirmeye dön
           </Link>
@@ -186,13 +192,70 @@ export function AnalysisPage({ kind }: { kind: AssessmentKind }) {
         </div>
       </section>
 
+      <section className="speech-panel" style={{ marginBottom: '1rem' }}>
+        <div className="speech-panel__heading">
+          <div><h3>Canonical ölçümler</h3><p>Öğretmen raporundaki metrik bağlantıları bu toplu değerlerden doğrulanır.</p></div>
+          <BarChart3 size={19} />
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '.75rem' }}>
+          {analysis.metrics.map((metric) => (
+            <article
+              key={metric.id}
+              id={analysisMetricAnchorId(metric.id)}
+              style={{ padding: '.9rem', border: '1px solid #e2e8f0', borderRadius: '.75rem', background: '#f8fafc' }}
+            >
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '.75rem', alignItems: 'baseline' }}>
+                <strong>{metric.label}</strong>
+                <span style={{ fontSize: '1.1rem', fontWeight: 800, color: '#0f766e' }}>
+                  {analysisMetricValueLabel(metric.value, metric.unit)}
+                </span>
+              </div>
+              <p style={{ margin: '.4rem 0 0', color: '#64748b', fontSize: '.82rem' }}>{metric.description}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+
       <section className="speech-panel">
         <div className="speech-panel__heading">
-          <div><h3>Gemma 4 12B öğretmen raporu</h3><p>Anonim toplu ölçümlere dayalıdır</p></div>
+          <div><h3>Gemma 4 12B yapılandırılmış analiz</h3><p>Her iddia canonical aggregate metriklere bağlanır.</p></div>
           {analysis.status === 'generating' ? <Loader2 size={19} className="animate-spin" /> : <Sparkles size={19} />}
         </div>
-        {analysis.modelReport ? (
-          <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7 }}>{analysis.modelReport}</div>
+        {analysis.claims.length > 0 ? (
+          <div style={{ display: 'grid', gap: '1rem' }}>
+            {analysis.claims.map((claim) => (
+              <article key={claim.id} style={{ padding: '1rem', border: '1px solid #e2e8f0', borderRadius: '.85rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                  <h4 style={{ margin: 0, fontSize: '1rem' }}>{claim.claim}</h4>
+                  <span style={{ fontSize: '.8rem', fontWeight: 700, color: claim.evidenceStatus === 'supported' ? '#047857' : '#b45309' }}>
+                    {analysisEvidenceStatusLabel(claim.evidenceStatus)}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', marginTop: '.75rem' }}>
+                  {claim.metricRefs.length > 0 ? claim.metricRefs.map((metric) => (
+                    <a
+                      key={metric.metricId}
+                      href={'#' + analysisMetricAnchorId(metric.metricId)}
+                      style={{ padding: '.35rem .55rem', borderRadius: 999, background: '#ecfeff', color: '#155e75', fontSize: '.8rem' }}
+                    >
+                      {metric.label}: {analysisMetricValueLabel(metric.value, metric.unit)}
+                    </a>
+                  )) : (
+                    <span style={{ color: '#b45309', fontSize: '.82rem' }}>Bağlı canonical metrik yok</span>
+                  )}
+                </div>
+                <p style={{ margin: '.75rem 0 0', color: '#475569', lineHeight: 1.55 }}>{claim.teacherVisibleExplanation}</p>
+                {claim.recommendation.trim() && (
+                  <p style={{ margin: '.55rem 0 0', lineHeight: 1.55 }}><strong>Öneri:</strong> {claim.recommendation}</p>
+                )}
+              </article>
+            ))}
+          </div>
+        ) : analysis.modelReport ? (
+          <div className="speech-form-note">
+            <CircleAlert size={16} />
+            <span>Bu rapor eski biçimde kaydedilmiş; canonical metrik bağlantısı olmadığı için doğrulanmış iddia olarak gösterilemez.</span>
+          </div>
         ) : analysis.status === 'generating' ? (
           <p>Rapor arka planda hazırlanıyor. Grafikler şimdiden kullanılabilir.</p>
         ) : (

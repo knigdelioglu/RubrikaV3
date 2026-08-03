@@ -9,12 +9,14 @@ import { ProjectContextState } from '../components/common/ProjectContextState';
 import { tauriClient } from '../api/tauriClient';
 import { blockingReasonLabels, jobStatusLabels, scoringWarningLabels } from '../utils/labels';
 import { useProjectContext } from '../state/useProjectContext';
-import type { ScoringRecord } from '../api/types';
+import type { ScoringAnchor, ScoringRecord } from '../api/types';
 import { ClassSelector } from '../components/student/ClassSelector';
 import {
   buildStudentSummary,
   dedupeScoringRecords,
+  getDecisionStateLabel,
   getReviewStatusLabel,
+  getScoringAnchorEligibilityLabel,
   getSubmissionSortKey,
   resolveActiveScoringRunId,
 } from './scoringViewModel';
@@ -62,6 +64,18 @@ export function ScoringPage() {
     enabled: !!projectId,
   });
 
+  const { data: scoringSummary, error: scoringSummaryError } = useQuery({
+    queryKey: ['scoring-summary', projectId],
+    queryFn: () => commands.getScoringSummary(projectId!),
+    enabled: !!projectId,
+  });
+
+  const { data: scoringAnchors = [] } = useQuery({
+    queryKey: ['scoring-anchors', projectId],
+    queryFn: () => commands.listScoringAnchors(projectId!),
+    enabled: !!projectId,
+  });
+
   const { data: workflow, error: workflowError } = useQuery({
     queryKey: ['workflow-snapshot', projectId],
     queryFn: () => commands.getWorkflowSnapshot(projectId!),
@@ -88,8 +102,10 @@ export function ScoringPage() {
     onMutate: () => setError(null),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-summary', projectId] });
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
       queryClient.invalidateQueries({ queryKey: ['graded-exam-review', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-anchors', projectId] });
       queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
     },
     onError: (err: AppError) => setError(err),
@@ -106,8 +122,28 @@ export function ScoringPage() {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-summary', projectId] });
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
       queryClient.invalidateQueries({ queryKey: ['graded-exam-review', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-anchors', projectId] });
+    },
+    onError: (err: AppError) => setError(err),
+  });
+
+  const createAnchorMutation = useMutation({
+    mutationFn: (sourceRecordId: string) => commands.createScoringAnchor({ projectId: projectId!, sourceRecordId }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scoring-anchors', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+    },
+    onError: (err: AppError) => setError(err),
+  });
+
+  const revokeAnchorMutation = useMutation({
+    mutationFn: (input: { anchorId: string; reason?: string }) => commands.revokeScoringAnchor({ projectId: projectId!, ...input }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scoring-anchors', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
     },
     onError: (err: AppError) => setError(err),
   });
@@ -135,8 +171,10 @@ export function ScoringPage() {
     void tauriClient.listenToJobEvents(() => {
       if (cancelled) return;
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-summary', projectId] });
       queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
       queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['scoring-anchors', projectId] });
     }).then((cleanup) => {
       unlisten = cleanup;
       if (cancelled) cleanup();
@@ -173,6 +211,11 @@ export function ScoringPage() {
     const activeRecords = activeScoringRunId ? records.filter((record) => record.runId === activeScoringRunId) : records;
     return dedupeScoringRecords(activeRecords.filter((record) => visibleSubmissionIds.has(record.submissionId)));
   }, [project, activeScoringRunId, visibleSubmissionIds]);
+  const anchorByRecordId = useMemo(() => {
+    const result = new Map<string, ScoringAnchor>();
+    for (const anchor of scoringAnchors) result.set(anchor.sourceRecordId, anchor);
+    return result;
+  }, [scoringAnchors]);
   const scoringJobActive = !!jobs.find((job) => job.kind === 'scoring' && (job.status === 'queued' || job.status === 'running'));
   const studentRows = useMemo(() => {
     if (!project) return [];
@@ -183,8 +226,13 @@ export function ScoringPage() {
       grouped.set(record.submissionId, list);
     }
     const submissions = [...visibleSubmissions].sort((left, right) => getSubmissionSortKey(project, left).localeCompare(getSubmissionSortKey(project, right)));
-    return submissions.map((submission) => buildStudentSummary(project, submission, grouped.get(submission.id) ?? []));
-  }, [project, scoringRecords, visibleSubmissions]);
+    return submissions.map((submission) => buildStudentSummary(
+      project,
+      submission,
+      grouped.get(submission.id) ?? [],
+      scoringSummary?.submissions.find((item) => item.submissionId === submission.id),
+    ));
+  }, [project, scoringRecords, scoringSummary, visibleSubmissions]);
   const studentGroups = useMemo(() => {
     if (!project) return [];
     const grouped = new Map<string, typeof studentRows>();
@@ -207,7 +255,10 @@ export function ScoringPage() {
     return <ProjectContextState pageLabel="Notlandırma" projectPath={projectPath} />;
   }
 
-  const queryError = (projectError as AppError | null) || (workflowError as AppError | null) || error;
+  const queryError = (projectError as AppError | null)
+    || (workflowError as AppError | null)
+    || (scoringSummaryError as AppError | null)
+    || error;
   const scoringReady = workflow?.summary.readiness.scoring ?? false;
   const scoringBlockers = workflow?.blockingReasons ?? [];
   const activeJob = jobs.find((job) => job.kind === 'scoring' && (job.status === 'queued' || job.status === 'running'));
@@ -271,6 +322,7 @@ export function ScoringPage() {
         <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
           <button
             type="button"
+            data-project-write="true"
             onClick={() => void handleStart(false)}
             disabled={!scoringReady || startMutation.isPending || scoringJobActive}
             title={
@@ -299,6 +351,7 @@ export function ScoringPage() {
 
           <button
             type="button"
+            data-project-write="true"
             onClick={() => void handleStart(true)}
             disabled={!scoringReady || startMutation.isPending || scoringJobActive || project.scoringRecords.length === 0}
             title={
@@ -385,6 +438,7 @@ export function ScoringPage() {
             <div>
               <button
                 type="button"
+                data-project-write="true"
                 className="button button--primary"
                 disabled={startMutation.isPending || scoringJobActive}
                 onClick={() => void handleStart(false)}
@@ -403,6 +457,15 @@ export function ScoringPage() {
           <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.75rem', flexWrap: 'wrap' }}>
             <span style={{ background: '#e0e7ff', color: '#3730a3', borderRadius: '9999px', padding: '0.35rem 0.75rem', fontSize: '0.8125rem', fontWeight: 700 }}>
               Aktif kayıt: {totalRecordCount}
+            </span>
+            <span style={{ background: '#fef3c7', color: '#92400e', borderRadius: '9999px', padding: '0.35rem 0.75rem', fontSize: '0.8125rem', fontWeight: 700 }}>
+              Geçici puan: {formatScore(scoringSummary?.provisionalScore)}
+            </span>
+            <span style={{ background: '#dcfce7', color: '#166534', borderRadius: '9999px', padding: '0.35rem 0.75rem', fontSize: '0.8125rem', fontWeight: 700 }}>
+              Kabul edilen: {formatScore(scoringSummary?.acceptedScore)}
+            </span>
+            <span style={{ background: '#dbeafe', color: '#1d4ed8', borderRadius: '9999px', padding: '0.35rem 0.75rem', fontSize: '0.8125rem', fontWeight: 700 }}>
+              Final: {formatScore(scoringSummary?.finalScore)} / {formatScore(scoringSummary?.maxScore)}
             </span>
             <span style={{ background: '#dcfce7', color: '#166534', borderRadius: '9999px', padding: '0.35rem 0.75rem', fontSize: '0.8125rem', fontWeight: 700 }}>
               Onaylı: {approvedCount}
@@ -451,7 +514,7 @@ export function ScoringPage() {
 
       {duplicateResultCount > 0 && (
         <div style={{ marginBottom: '1rem', padding: '0.9rem 1rem', borderRadius: '0.9rem', background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', fontSize: '0.875rem' }}>
-          Aynı öğrenci ve soru için geçmişte birden fazla sonuç bulundu. Toplam puan yalnızca son notlandırma çalışmasından hesaplanıyor.
+          Aynı öğrenci ve soru için geçmişte birden fazla sonuç bulundu. Görüntülenen toplamlar backend scoring özetinden geliyor.
         </div>
       )}
 
@@ -496,6 +559,7 @@ export function ScoringPage() {
               <section key={row.submission.id} style={{ background: 'white', border: '1px solid #e2e8f0', borderRadius: '1rem', overflow: 'hidden' }}>
                 <button
                   type="button"
+                  data-project-write="false"
                   onClick={() => setExpandedSubmissionIds((current) => {
                     const next = new Set(current);
                     if (next.has(row.submission.id)) next.delete(row.submission.id);
@@ -607,6 +671,8 @@ export function ScoringPage() {
                         {row.records.map((record) => {
                           const draft = draftScores[record.id] ?? { score: String(record.teacherManualScore ?? record.awardedScore ?? ''), notes: record.teacherNotes ?? '' };
                           const effectiveScore = record.teacherManualScore ?? record.awardedScore;
+                          const anchor = anchorByRecordId.get(record.id);
+                          const anchorMutationPending = createAnchorMutation.isPending || revokeAnchorMutation.isPending;
 
                           return (
                             <article key={record.id} style={{ border: '1px solid #e2e8f0', borderRadius: '0.9rem', padding: '1rem', background: record.needsReview ? '#fffbeb' : 'white' }}>
@@ -620,6 +686,14 @@ export function ScoringPage() {
                                     <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
                                       Öğretmen durumu: {getReviewStatusLabel(record.teacherReviewStatus)}
                                     </span>
+                                    <span style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                                      Karar: {getDecisionStateLabel(record.decisionState)}
+                                    </span>
+                                    {anchor && (
+                                      <span style={{ fontSize: '0.75rem', color: anchor.eligibility === 'eligible' ? '#166534' : '#9a3412', fontWeight: 700 }}>
+                                        {getScoringAnchorEligibilityLabel(anchor.eligibility)} · {anchor.version}
+                                      </span>
+                                    )}
                                   </div>
                                   <p style={{ margin: '0.35rem 0 0 0', color: '#475569', fontSize: '0.875rem' }}>
                                     Model güven göstergesi: {formatConfidence(record.confidence)}
@@ -638,6 +712,12 @@ export function ScoringPage() {
                                   <strong>Bu kayıt öğrenci toplamına sıfır olarak eklenmedi.</strong> Model sonucu güvenilir biçimde üretilemedi. Manuel puan girerek kaydı tamamlayın.
                                 </div>
                               )}
+
+                              {record.consistencyReview?.teacherMessage ? (
+                                <div style={{ marginTop: '0.9rem', padding: '0.8rem', borderRadius: '0.75rem', background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', fontSize: '0.875rem' }}>
+                                  <strong>Karşılaştırmalı kontrol gerekli.</strong> {record.consistencyReview.teacherMessage}
+                                </div>
+                              ) : null}
 
                               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '0.75rem', marginTop: '1rem' }}>
                                 <label style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem', fontSize: '0.875rem', color: '#334155' }}>
@@ -680,6 +760,7 @@ export function ScoringPage() {
                               <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.9rem', flexWrap: 'wrap' }}>
                                 <button
                                   type="button"
+                                  data-project-write="true"
                                   onClick={() => void handleSaveRecord(record, false)}
                                   disabled={saveMutation.isPending || (!record.scoringApplied && draft.score.trim() === '')}
                                   style={{ padding: '0.55rem 0.85rem', borderRadius: '0.6rem', border: '1px solid #cbd5e1', background: saveMutation.isPending ? '#f8fafc' : '#0f172a', color: saveMutation.isPending ? '#94a3b8' : 'white', fontWeight: 700, cursor: saveMutation.isPending ? 'not-allowed' : 'pointer' }}
@@ -688,6 +769,7 @@ export function ScoringPage() {
                                 </button>
                                 <button
                                   type="button"
+                                  data-project-write="true"
                                   onClick={() => void handleSaveRecord(record, true)}
                                   disabled={saveMutation.isPending || (!record.scoringApplied && draft.score.trim() === '')}
                                   style={{ padding: '0.55rem 0.85rem', borderRadius: '0.6rem', border: '1px solid #bbf7d0', background: (saveMutation.isPending || (!record.scoringApplied && draft.score.trim() === '')) ? '#f8fafc' : '#dcfce7', color: '#166534', fontWeight: 700, cursor: (saveMutation.isPending || (!record.scoringApplied && draft.score.trim() === '')) ? 'not-allowed' : 'pointer' }}
@@ -695,7 +777,36 @@ export function ScoringPage() {
                                   <CheckCircle2 size={16} style={{ display: 'inline', marginRight: '0.35rem' }} />
                                   Onayla
                                 </button>
+                                {anchor?.status === 'active' ? (
+                                  <button
+                                    type="button"
+                                    data-project-write="true"
+                                    onClick={() => void revokeAnchorMutation.mutateAsync({ anchorId: anchor.id })}
+                                    disabled={anchorMutationPending}
+                                    title={anchorMutationPending ? 'Anchor işlemi kaydediliyor.' : 'Anchor statüsünü kaldır'}
+                                    style={{ padding: '0.55rem 0.85rem', borderRadius: '0.6rem', border: '1px solid #fed7aa', background: anchorMutationPending ? '#f8fafc' : '#fff7ed', color: '#9a3412', fontWeight: 700, cursor: anchorMutationPending ? 'not-allowed' : 'pointer' }}
+                                  >
+                                    Anchor statüsünü kaldır
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    data-project-write="true"
+                                    onClick={() => void createAnchorMutation.mutateAsync(record.id)}
+                                    disabled={anchorMutationPending}
+                                    title={anchorMutationPending ? 'Anchor işlemi kaydediliyor.' : 'Öğretmen onaylı final kararı anchor olarak kaydet'}
+                                    style={{ padding: '0.55rem 0.85rem', borderRadius: '0.6rem', border: '1px solid #c4b5fd', background: anchorMutationPending ? '#f8fafc' : '#f5f3ff', color: '#5b21b6', fontWeight: 700, cursor: anchorMutationPending ? 'not-allowed' : 'pointer' }}
+                                  >
+                                    {anchor ? 'Yeni anchor sürümü yap' : 'Anchor olarak kaydet'}
+                                  </button>
+                                )}
                               </div>
+
+                              {anchor && anchor.eligibilityReasons.length > 0 && (
+                                <div style={{ marginTop: '0.75rem', padding: '0.7rem', borderRadius: '0.7rem', background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', fontSize: '0.8rem' }}>
+                                  <strong>Anchor açıklaması:</strong> {anchor.eligibilityReasons.join(' ')}
+                                </div>
+                              )}
 
                               {record.warnings.length > 0 && (
                                 <div style={{ marginTop: '0.9rem', padding: '0.75rem', borderRadius: '0.75rem', background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412', fontSize: '0.875rem' }}>

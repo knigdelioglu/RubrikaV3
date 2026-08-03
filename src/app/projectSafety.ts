@@ -9,3 +9,7 @@ export function isProjectWriteBlocked(
     || !report
     || (report.decision === 'DO_NOT_OPEN_FOR_WRITING' && !report.initializationWriteAllowed);
 }
+
+export function isProjectWriteControl(dataProjectWrite: string | null): boolean {
+  return dataProjectWrite !== 'false';
+}

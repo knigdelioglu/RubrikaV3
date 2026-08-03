@@ -83,11 +83,12 @@ export function ConfirmationDialog({
         <h2 id="confirmation-dialog-title">{title}</h2>
         <p id="confirmation-dialog-description">{description}</p>
         <div className="confirmation-dialog__actions">
-          <button ref={cancelButtonRef} type="button" className="button button--secondary" onClick={onCancel} disabled={busy}>
+          <button ref={cancelButtonRef} type="button" data-project-write="false" className="button button--secondary" onClick={onCancel} disabled={busy}>
             İptal
           </button>
           <button
             type="button"
+            data-project-write="true"
             className={destructive ? 'button button--danger' : 'button button--primary'}
             onClick={onConfirm}
             disabled={busy}

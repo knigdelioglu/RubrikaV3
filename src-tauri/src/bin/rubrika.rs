@@ -147,6 +147,8 @@ enum RepairTarget {
     QuestionText { project_path: PathBuf },
     DocumentContent { project_path: PathBuf },
     StaleJobs { project_path: PathBuf },
+    AuditInitialRevision { project_path: PathBuf },
+    AuditLatestRevision { project_path: PathBuf },
 }
 
 #[tokio::main]
@@ -511,6 +513,44 @@ async fn main() {
                 match ctx.repair_stale_jobs(&project_path) {
                     Ok(report) => {
                         print_json_or_human(&report, cli.json, print_stale_jobs_repair);
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                }
+            }
+            RepairTarget::AuditInitialRevision { project_path } => {
+                let service = app_lib::services::audit_service::AuditService::new();
+                match service.repair_missing_initial_revision(&project_path) {
+                    Ok(record) => {
+                        print_json_or_human(&record, cli.json, |record| {
+                            println!(
+                                "audit_revision_repaired={} -> {}",
+                                record.previous_revision.unwrap_or_default(),
+                                record.next_revision.unwrap_or_default()
+                            );
+                        });
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                }
+            }
+            RepairTarget::AuditLatestRevision { project_path } => {
+                let service = app_lib::services::audit_service::AuditService::new();
+                match service.repair_missing_latest_revision(&project_path) {
+                    Ok(record) => {
+                        print_json_or_human(&record, cli.json, |record| {
+                            println!(
+                                "audit_revision_repaired={} -> {}",
+                                record.previous_revision.unwrap_or_default(),
+                                record.next_revision.unwrap_or_default()
+                            );
+                        });
                         0
                     }
                     Err(error) => {

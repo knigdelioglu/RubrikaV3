@@ -231,17 +231,15 @@ impl DocumentContentExtractionService {
                     &model_input_kind,
                     &request.document_id,
                 )?;
-                if !manifest_path.exists() {
-                    model_input_images = self.model_input_image_service.prepare_inputs(
-                        &request.project_root,
-                        model_input_kind,
-                        &request.document_id,
-                        &request.vision_sources,
-                    )?;
-                } else if let Ok(manifest) = load_model_input_manifest(&manifest_path) {
-                    ModelInputImageService::validate_manifest_paths(&trusted_root, &manifest)?;
-                    model_input_images = manifest.images;
-                }
+                // The image service owns cache-key validation and repairs. A
+                // manifest is a derived cache index, never the source of
+                // truth for a model input.
+                model_input_images = self.model_input_image_service.prepare_inputs(
+                    &request.project_root,
+                    model_input_kind,
+                    &request.document_id,
+                    &request.vision_sources,
+                )?;
                 model_input_manifest_path = Some(manifest_path);
             }
         }
@@ -410,16 +408,14 @@ impl DocumentContentExtractionService {
             Vec::new()
         };
         let mut warnings = metadata.warnings.clone();
-        if metadata.vision_fallback_needed
-            && model_input_images.is_empty()
-            && !request.vision_sources.is_empty()
-        {
+        if metadata.vision_fallback_needed && !request.vision_sources.is_empty() {
             let model_input_kind = model_input_kind_for(&metadata.kind);
             let manifest_path = ModelInputImageService::manifest_path(
                 &request.project_root,
                 &model_input_kind,
                 &metadata.document_id,
             )?;
+            let previous_image_count = model_input_images.len();
             model_input_images = self.model_input_image_service.prepare_inputs(
                 &request.project_root,
                 model_input_kind,
@@ -427,7 +423,10 @@ impl DocumentContentExtractionService {
                 &request.vision_sources,
             )?;
             model_input_manifest_path = Some(manifest_path);
-            warnings.push("vision_inputs_rebuilt_from_cache".to_string());
+            if previous_image_count == 0 || model_input_images.iter().any(|image| !image.cache_hit)
+            {
+                warnings.push("vision_inputs_rebuilt_from_cache".to_string());
+            }
         }
         let vision_fallback_needed = match metadata.kind {
             DocumentContentKind::Rubric | DocumentContentKind::AnswerKey => !metadata.enough_text,

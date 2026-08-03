@@ -75,6 +75,7 @@ export function TeacherStarRating({
           return (
             <button
               type="button"
+              data-project-write="true"
               key={starIndex}
               className={`teacher-star-rating__star ${isFilled ? 'is-filled' : ''}`}
               disabled={disabled}
@@ -112,6 +113,7 @@ export function TeacherStarRating({
         {(selectedStars > 0 || isPerformanceNotShown) && (
           <button
             type="button"
+            data-project-write="true"
             className="teacher-star-rating__action-btn"
             disabled={disabled}
             onClick={() => onClear()}
@@ -122,6 +124,7 @@ export function TeacherStarRating({
 
         <button
           type="button"
+          data-project-write="true"
           className="teacher-star-rating__action-btn"
           disabled={disabled}
           onClick={() => onSelectLevel('not_observed')}
@@ -132,6 +135,7 @@ export function TeacherStarRating({
         {!isPerformanceNotShown && (
           <button
             type="button"
+            data-project-write="true"
             className="teacher-star-rating__action-btn is-danger-text"
             disabled={disabled}
             onClick={() => onSelectLevel('performance_not_shown')}

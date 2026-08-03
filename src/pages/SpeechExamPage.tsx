@@ -622,6 +622,7 @@ export function SpeechExamPage() {
           {stage === 'session' && (
             <button
               type="button"
+              data-project-write="false"
               className="button button--secondary"
               onClick={() => setStage('setup')}
             >
@@ -649,6 +650,7 @@ export function SpeechExamPage() {
               return (
               <button
                 type="button"
+                data-project-write="true"
                 key={application.id}
                 className={`speech-class-toolbar__btn ${application.id === classApplicationId ? 'is-active' : ''}`}
                 disabled={isActiveCapture || isProcessing}
@@ -691,6 +693,7 @@ export function SpeechExamPage() {
                   <div role="radiogroup" aria-label="Konuşma türü" className="speech-segmented-control">
                     <button
                       type="button"
+                      data-project-write="false"
                       role="radio"
                       aria-checked={examType === 'prepared'}
                       className={`speech-segmented-btn ${examType === 'prepared' ? 'is-active' : ''}`}
@@ -700,6 +703,7 @@ export function SpeechExamPage() {
                     </button>
                     <button
                       type="button"
+                      data-project-write="false"
                       role="radio"
                       aria-checked={examType === 'impromptu'}
                       className={`speech-segmented-btn ${examType === 'impromptu' ? 'is-active' : ''}`}
@@ -735,6 +739,7 @@ export function SpeechExamPage() {
               <div className="speech-class-actions">
                 <button
                   type="button"
+                  data-project-write="false"
                   className="button button--secondary"
                   onClick={() => setSelectedClassIds(classes.map((c) => c.id))}
                 >
@@ -742,6 +747,7 @@ export function SpeechExamPage() {
                 </button>
                 <button
                   type="button"
+                  data-project-write="false"
                   className="button button--secondary"
                   onClick={() => setSelectedClassIds([])}
                 >
@@ -1117,6 +1123,7 @@ export function SpeechExamPage() {
 
               <button
                 type="button"
+                data-project-write="true"
                 className="button button--primary"
                 style={{ width: '100%', minHeight: '44px', fontSize: '0.88rem' }}
                 disabled={!setupReadiness.isReady || isStarting}
@@ -1162,6 +1169,7 @@ export function SpeechExamPage() {
                   return (
                     <button
                       type="button"
+                      data-project-write="true"
                       key={student.id}
                       className={student.id === selectedStudentId ? 'is-active' : ''}
                       disabled={isActiveCapture && student.id !== selectedStudentId}
@@ -1230,6 +1238,7 @@ export function SpeechExamPage() {
 
               <button
                 type="button"
+                data-project-write="false"
                 className="speech-runtime-toggle"
                 onClick={() => setShowRuntimeDetails((prev) => !prev)}
               >
@@ -1300,6 +1309,7 @@ export function SpeechExamPage() {
               <div className="speech-record-actions">
                 <button
                   type="button"
+                  data-project-write="true"
                   className={`button ${isActiveCapture ? 'button--danger' : 'button--primary'}`}
                   disabled={
                     !selectedStudentId ||
@@ -1326,6 +1336,7 @@ export function SpeechExamPage() {
                 {(isCapturing || isBackendCapturing) && (
                   <button
                     type="button"
+                    data-project-write="true"
                     className="button button--secondary"
                     onClick={() => void controlCapture('pause')}
                   >
@@ -1335,6 +1346,7 @@ export function SpeechExamPage() {
                 {isPaused && (
                   <button
                     type="button"
+                    data-project-write="true"
                     className="button button--secondary"
                     onClick={() => void controlCapture('resume')}
                   >
@@ -1344,6 +1356,7 @@ export function SpeechExamPage() {
                 {isActiveCapture && (
                   <button
                     type="button"
+                    data-project-write="true"
                     className="button button--secondary"
                     onClick={() => void controlCapture('cancel')}
                   >
@@ -1744,6 +1757,7 @@ export function SpeechExamPage() {
               <div className="speech-review-actions">
                 <button
                   type="button"
+                  data-project-write="true"
                   className="button button--primary"
                   disabled={isApproving || attempt.state !== 'teacher_review'}
                   onClick={() => void approveAttempt()}
@@ -1766,6 +1780,7 @@ export function SpeechExamPage() {
             </span>
             <button
               type="button"
+              data-project-write="true"
               className="button button--primary"
               disabled={
                 isActiveCapture || isProcessing || isFinishing || completedStudentIds.length === 0

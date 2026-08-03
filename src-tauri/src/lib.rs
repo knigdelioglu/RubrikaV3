@@ -26,6 +26,7 @@ use services::question_text_service::QuestionTextService;
 use services::rubric_extraction_service::RubricExtractionService;
 use services::rubric_service::RubricService;
 use services::school_class_service::SchoolClassService;
+use services::scoring_anchor_service::ScoringAnchorService;
 use services::scoring_service::ScoringService;
 use services::speaking_exam_service::SpeakingExamService;
 use services::student_answer_crop_service::StudentAnswerCropService;
@@ -57,6 +58,7 @@ pub struct AppState {
     pub rubric_service: Arc<RubricService>,
     pub rubric_extraction_service: Arc<RubricExtractionService>,
     pub scoring_service: Arc<ScoringService>,
+    pub scoring_anchor_service: Arc<ScoringAnchorService>,
     pub school_class_service: Arc<SchoolClassService>,
     pub assessment_organization_service: Arc<AssessmentOrganizationService>,
     pub student_answer_crop_service: Arc<StudentAnswerCropService>,
@@ -72,11 +74,22 @@ pub fn run() {
         log::error!("{}", error.message);
         std::process::exit(0);
     }
+
+    // The managed-asset protocol can receive a request while the builder is
+    // still completing startup. Register this state before installing the
+    // protocol so an early preview request cannot call `state()` before
+    // `manage()` has run. The AppState below keeps the same shared store.
+    let project_store = ProjectStore::new();
+
     tauri::Builder::default()
+        .manage(project_store.clone())
         .register_uri_scheme_protocol("managed-asset", |ctx, request| {
             use crate::platform::managed_asset;
             let request_path = request.uri().path();
-            let store = ctx.app_handle().state::<ProjectStore>();
+            let Some(store) = ctx.app_handle().try_state::<ProjectStore>() else {
+                log::warn!("managed asset request arrived before ProjectStore initialization");
+                return managed_asset_error_response();
+            };
             match managed_asset::resolve_managed_asset(&store, request_path) {
                 Ok(asset) => http::Response::builder()
                     .status(200)
@@ -101,7 +114,6 @@ pub fn run() {
         })
         .plugin(tauri_plugin_dialog::init())
         .manage({
-            let project_store = ProjectStore::new();
             let model_gateway_impl = Arc::new(LlamaServerGateway::default());
             let model_gateway: Arc<dyn ModelGateway> = model_gateway_impl.clone();
             let model_config_service = ModelConfigService::new();
@@ -143,7 +155,6 @@ pub fn run() {
             let exam_package_build_service = Arc::new(ExamPackageBuildService::new(
                 project_store.clone(),
                 pdf_preview_service.clone(),
-                model_runtime_service.clone(),
                 question_text_service.clone(),
                 rubric_extraction_service.clone(),
                 job_manager.clone(),
@@ -159,11 +170,18 @@ pub fn run() {
                 school_class_service.clone(),
             ));
             let rubric_service = Arc::new(RubricService::new(project_store.clone()));
-            let scoring_service = Arc::new(ScoringService::new(
+            let scoring_service = Arc::new(
+                ScoringService::new(
+                    project_store.clone(),
+                    model_gateway.clone(),
+                    model_runtime_service.clone(),
+                    job_manager.clone(),
+                )
+                .with_audit_service(audit_service.clone()),
+            );
+            let scoring_anchor_service = Arc::new(ScoringAnchorService::new(
                 project_store.clone(),
-                model_gateway.clone(),
-                model_runtime_service.clone(),
-                job_manager.clone(),
+                audit_service.clone(),
             ));
             let student_answer_crop_service = Arc::new(StudentAnswerCropService::new(
                 project_store.clone(),
@@ -203,6 +221,7 @@ pub fn run() {
                 rubric_service,
                 rubric_extraction_service,
                 scoring_service,
+                scoring_anchor_service,
                 school_class_service,
                 assessment_organization_service,
                 student_answer_crop_service,
@@ -311,6 +330,7 @@ pub fn run() {
             commands::model_commands::start_model_server,
             commands::model_commands::stop_model_server,
             commands::model_commands::set_model_mode,
+            commands::model_commands::enable_external_model,
             commands::model_commands::reset_model_profile,
             commands::model_commands::preview_model_server_args,
             commands::model_commands::get_model_log_tail,
@@ -322,6 +342,7 @@ pub fn run() {
             commands::question_text_commands::confirm_all_question_texts,
             commands::question_text_commands::edit_question_text,
             commands::rubric_commands::import_rubric_json,
+            commands::rubric_commands::migrate_rubric_levels,
             commands::rubric_commands::get_rubric_state,
             commands::rubric_commands::list_rubric_items,
             commands::rubric_commands::update_question_rubric,
@@ -331,6 +352,10 @@ pub fn run() {
             commands::rubric_commands::start_rubric_pdf_import,
             commands::scoring_commands::start_scoring_job,
             commands::scoring_commands::update_scoring_record,
+            commands::scoring_commands::get_scoring_summary,
+            commands::scoring_commands::list_scoring_anchors,
+            commands::scoring_commands::create_scoring_anchor,
+            commands::scoring_commands::revoke_scoring_anchor,
             commands::graded_exam_review_commands::get_graded_exam_review,
             commands::speaking_exam_commands::start_speaking_exam,
             commands::speaking_exam_commands::list_speaking_exam_microphones,

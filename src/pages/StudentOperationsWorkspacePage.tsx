@@ -138,6 +138,7 @@ export function StudentOperationsWorkspacePage() {
           <div className="student-operations-tabs" role="tablist" style={{ marginBottom: '1rem' }}>
             <button
               type="button"
+              data-project-write="false"
               className={tab === 'identity' ? 'is-active' : ''}
               onClick={() => updateSelection({ tab: 'identity' })}
             >
@@ -145,6 +146,7 @@ export function StudentOperationsWorkspacePage() {
             </button>
             <button
               type="button"
+              data-project-write="false"
               className={tab === 'crops' ? 'is-active' : ''}
               onClick={() => updateSelection({ tab: 'crops' })}
             >

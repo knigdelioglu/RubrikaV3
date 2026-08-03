@@ -12,7 +12,7 @@ use crate::domain::project::Project;
 use crate::domain::school_class::{
     normalize_school_class_name, SchoolClass, SchoolClassStatus, StudentScanBatch,
 };
-use crate::domain::scoring::scoring_active_records;
+use crate::domain::scoring::{scoring_active_records, scoring_record_is_accepted};
 use crate::domain::student::{
     student_identity_is_missing, ClassMembershipSource, PageGroupingMode, Student,
     StudentAnswerOcrStatus, StudentSubmission,
@@ -1142,7 +1142,7 @@ pub fn build_school_class_overview(project: &Project) -> SchoolClassOverviewSnap
                             active_scoring_records.iter().any(|record| {
                                 record.submission_id == submission.id
                                     && record.question_id == question.id
-                                    && record.scoring_applied
+                                    && scoring_record_is_accepted(record)
                             })
                         })
                 })

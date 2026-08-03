@@ -10,6 +10,7 @@ pub mod rubric;
 pub mod school_class;
 pub mod scoring;
 pub mod speaking;
+pub mod structured_answer;
 pub mod student;
 pub mod submission;
 pub mod workflow;

@@ -6,6 +6,8 @@ import type { ProjectSnapshot, ScoringRecord } from '../api/types';
 import {
   buildStudentSummary,
   dedupeScoringRecords,
+  getDecisionStateLabel,
+  getScoringAnchorEligibilityLabel,
   getStudentSummaryBadges,
   resolveActiveScoringRunId,
 } from './scoringViewModel.ts';
@@ -36,6 +38,7 @@ function createProject(): ProjectSnapshot {
       source: 'manual' as const,
       maxScore: 10,
       expectedAnswer: null,
+      keyConcepts: [],
       criteria: [],
       partialCreditHints: [],
       zeroScoreConditions: [],
@@ -86,7 +89,7 @@ function createProject(): ProjectSnapshot {
       },
     ],
     studentAnswerOcrRecords: [],
-    studentAnswerCropTemplate: { items: [], updatedAt: null },
+    studentAnswerCropTemplate: { templates: [], updatedAt: null },
     studentIdentityCropTemplate: null,
     studentScanDocumentId: null,
     studentGroupingMode: null,
@@ -129,6 +132,7 @@ function createRecord(overrides: Partial<ScoringRecord> & Pick<ScoringRecord, 'i
     questionTextHash: 'qt',
     rubricHash: 'rubric',
     teacherReviewStatus: 'pending_review',
+    decisionState: 'auto_accepted',
     teacherManualScore: null,
     teacherReviewedAt: null,
     teacherNotes: null,
@@ -159,6 +163,18 @@ test('resolveActiveScoringRunId prefers explicit latest run id', () => {
     }),
     'run-new',
   );
+});
+
+test('decision states stay teacher-facing and do not expose backend codes', () => {
+  assert.equal(getDecisionStateLabel('model_candidate'), 'Model adayı · onay bekliyor');
+  assert.equal(getDecisionStateLabel('deterministic_accepted'), 'Deterministik kabul');
+  assert.equal(getDecisionStateLabel('teacher_approved'), 'Öğretmen finali');
+});
+
+test('anchor eligibility uses teacher-facing labels', () => {
+  assert.equal(getScoringAnchorEligibilityLabel('eligible'), 'Kullanıma uygun anchor');
+  assert.equal(getScoringAnchorEligibilityLabel('stale'), 'Güncelliğini yitirdi; yeniden değerlendirme gerekli');
+  assert.equal(getScoringAnchorEligibilityLabel('revoked'), 'Anchor statüsü kaldırıldı');
 });
 
 test('dedupeScoringRecords keeps the latest record per student-question key', () => {
@@ -237,7 +253,18 @@ test('buildStudentSummary keeps duplicate history out of the active total', () =
   const activeRecords = dedupeScoringRecords(
     project.scoringRecords.filter((record) => record.runId === resolveActiveScoringRunId(project)),
   );
-  const summary = buildStudentSummary(project, project.studentSubmissions[0], activeRecords);
+  const summary = buildStudentSummary(project, project.studentSubmissions[0], activeRecords, {
+    submissionId: 'submission-1',
+    provisionalScore: 58,
+    acceptedScore: 58,
+    finalScore: 58,
+    maxScore: 60,
+    isComplete: true,
+    expectedRecordCount: 6,
+    acceptedRecordCount: 6,
+    provisionalRecordCount: 0,
+    reviewRequiredCount: 0,
+  });
 
   assert.equal(activeRecords.length, 6);
   assert.equal(summary.records.length, 6);
@@ -260,13 +287,25 @@ test('buildStudentSummary does not turn an unapplied model failure into zero poi
     questionNumber: 1,
     awardedScore: null,
     scoringApplied: false,
+    decisionState: 'failed',
     needsReview: true,
     reviewReasons: ['scoring_json_parse_failed'],
     createdAt: '2026-07-04T00:00:00Z',
     updatedAt: '2026-07-04T00:00:00Z',
   });
 
-  const summary = buildStudentSummary(project, submission, [record]);
+  const summary = buildStudentSummary(project, submission, [record], {
+    submissionId: submission.id,
+    provisionalScore: 0,
+    acceptedScore: 0,
+    finalScore: null,
+    maxScore: 60,
+    isComplete: false,
+    expectedRecordCount: 6,
+    acceptedRecordCount: 0,
+    provisionalRecordCount: 0,
+    reviewRequiredCount: 1,
+  });
 
   assert.equal(summary.totalScore, null);
   assert.equal(summary.scoredCount, 0);
@@ -291,8 +330,19 @@ test('buildStudentSummary excludes scoringApplied false even when a model score 
     updatedAt: `2026-07-04T00:00:0${index}Z`,
   }));
 
-  const summary = buildStudentSummary(project, submission, records);
-  assert.equal(summary.totalScore, null);
+  const summary = buildStudentSummary(project, submission, records, {
+    submissionId: submission.id,
+    provisionalScore: 50,
+    acceptedScore: 50,
+    finalScore: null,
+    maxScore: 60,
+    isComplete: false,
+    expectedRecordCount: 6,
+    acceptedRecordCount: 5,
+    provisionalRecordCount: 0,
+    reviewRequiredCount: 1,
+  });
+  assert.equal(summary.totalScore, 50);
   assert.equal(summary.scoredCount, 5);
   assert.equal(summary.unscoredCount, 1);
   assert.equal(summary.isComplete, false);

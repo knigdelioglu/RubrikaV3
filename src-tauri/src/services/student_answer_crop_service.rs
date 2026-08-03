@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::project::Project;
 use crate::domain::student::{
-    StudentAnswerCropTemplateItem, StudentAnswerOcrCropBBox, StudentAnswerOcrRenderDiagnostics,
+    QuestionAnswerRegion, QuestionAnswerTemplate, StudentAnswerCropTemplateItem,
+    StudentAnswerOcrCropBBox, StudentAnswerOcrJobMode, StudentAnswerOcrRenderDiagnostics,
     StudentIdentityCropTemplate, StudentSubmission,
 };
 use crate::platform::project_paths::TrustedProjectRoot;
@@ -25,6 +26,9 @@ pub struct StudentAnswerCropService {
 pub struct StudentAnswerCropArtifacts {
     pub model_input_images: Vec<(u32, PathBuf)>,
     pub source_page_numbers: Vec<u32>,
+    pub region_ids: Vec<String>,
+    pub region_orders: Vec<u32>,
+    pub region_page_offsets: Vec<u32>,
     pub render_diagnostics: StudentAnswerOcrRenderDiagnostics,
     pub layout_hint: String,
 }
@@ -57,6 +61,25 @@ impl StudentAnswerCropService {
         submission: &StudentSubmission,
         question: &crate::domain::question::Question,
     ) -> Result<StudentAnswerCropArtifacts, AppError> {
+        self.prepare_source_artifacts_for_mode(
+            project_id,
+            project_root,
+            document_id,
+            submission,
+            question,
+            StudentAnswerOcrJobMode::Production,
+        )
+    }
+
+    pub fn prepare_source_artifacts_for_mode(
+        &self,
+        project_id: &str,
+        project_root: &str,
+        document_id: &str,
+        submission: &StudentSubmission,
+        question: &crate::domain::question::Question,
+        mode: StudentAnswerOcrJobMode,
+    ) -> Result<StudentAnswerCropArtifacts, AppError> {
         let project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
@@ -67,11 +90,9 @@ impl StudentAnswerCropService {
             .iter()
             .map(|preview| (preview.page_number, PathBuf::from(&preview.image_path)))
             .collect();
-        let template_item = project
+        let template = project
             .student_answer_crop_template
-            .items
-            .iter()
-            .find(|item| item.question_id == question.id)
+            .template_for_question(&question.id)
             .cloned();
 
         self.build_sources(
@@ -80,21 +101,27 @@ impl StudentAnswerCropService {
             submission,
             question,
             &preview_by_page,
-            template_item.as_ref(),
+            template.as_ref(),
+            mode,
         )
     }
 
     pub fn save_template(
         &self,
         project_id: &str,
-        mut items: Vec<StudentAnswerCropTemplateItem>,
+        templates: Vec<QuestionAnswerTemplate>,
     ) -> Result<Project, AppError> {
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
-        items.sort_by_key(|item| item.question_number);
-        let template_changed = project.student_answer_crop_template.items != items;
-        project.student_answer_crop_template.items = items;
+        let mut canonical = crate::domain::student::StudentAnswerCropTemplate {
+            templates,
+            updated_at: None,
+        };
+        canonical.normalize();
+        let template_changed =
+            project.student_answer_crop_template.templates != canonical.templates;
+        project.student_answer_crop_template.templates = canonical.templates;
         project.student_answer_crop_template.updated_at = Some(chrono::Utc::now().to_rfc3339());
         if template_changed {
             project.student_answer_ocr_records.clear();
@@ -258,6 +285,7 @@ impl StudentAnswerCropService {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_sources(
         &self,
         project_root: &str,
@@ -265,7 +293,8 @@ impl StudentAnswerCropService {
         submission: &StudentSubmission,
         question: &crate::domain::question::Question,
         preview_by_page: &BTreeMap<u32, PathBuf>,
-        template_item: Option<&StudentAnswerCropTemplateItem>,
+        template: Option<&QuestionAnswerTemplate>,
+        mode: StudentAnswerOcrJobMode,
     ) -> Result<StudentAnswerCropArtifacts, AppError> {
         let full_page_preview_refs = submission
             .page_numbers
@@ -281,6 +310,8 @@ impl StudentAnswerCropService {
 
         let mut render_diagnostics = StudentAnswerOcrRenderDiagnostics {
             crop_refs: vec![],
+            region_ids: vec![],
+            region_orders: vec![],
             full_page_preview_refs: full_page_preview_refs.clone(),
             crop_bbox: None,
             crop_width: None,
@@ -305,73 +336,100 @@ impl StudentAnswerCropService {
         };
 
         let mut source_refs: Vec<(u32, PathBuf)> = Vec::new();
-        let source_pages = submission.page_numbers.clone();
-        let mut layout_hint = "full page fallback".to_string();
+        let mut region_ids = Vec::new();
+        let mut region_orders = Vec::new();
+        let mut region_page_offsets = Vec::new();
+        let mut layout_hint = "manual answer regions".to_string();
 
-        if let Some(crop_template) = template_item {
-            if let Some(page_number) = submission
-                .page_numbers
-                .get(crop_template.page_index_within_submission as usize)
-                .copied()
-            {
-                if let Some(preview_path) = preview_by_page.get(&page_number).cloned() {
-                    let crop_render = self.crop_preview_image(
-                        project_root,
-                        document_id,
-                        submission.id.as_str(),
-                        question.number,
-                        page_number,
-                        &preview_path,
-                        crop_template,
-                    )?;
-                    render_diagnostics
-                        .crop_refs
-                        .push(crop_render.path.to_string_lossy().to_string());
-                    render_diagnostics.crop_bbox = Some(crop_render.bbox);
+        if let Some(template) = template.filter(|template| !template.regions.is_empty()) {
+            let mut missing_region = false;
+            for region in template.sorted_regions() {
+                let Some(page_number) = submission
+                    .page_numbers
+                    .get(region.page_offset as usize)
+                    .copied()
+                else {
+                    missing_region = true;
+                    continue;
+                };
+                let Some(preview_path) = preview_by_page.get(&page_number).cloned() else {
+                    missing_region = true;
+                    continue;
+                };
+                let crop_render = self.crop_preview_image(
+                    project_root,
+                    document_id,
+                    submission.id.as_str(),
+                    question.number,
+                    page_number,
+                    &preview_path,
+                    region,
+                    region.order,
+                )?;
+                render_diagnostics
+                    .crop_refs
+                    .push(crop_render.path.to_string_lossy().to_string());
+                render_diagnostics.region_ids.push(region.region_id.clone());
+                render_diagnostics.region_orders.push(region.order);
+                if render_diagnostics.crop_bbox.is_none() {
+                    render_diagnostics.crop_bbox = Some(crop_render.bbox.clone());
                     render_diagnostics.crop_width = Some(crop_render.crop_width);
                     render_diagnostics.crop_height = Some(crop_render.crop_height);
-                    render_diagnostics.rendered_crop_exists = true;
-                    render_diagnostics.crop_was_clamped = crop_render.crop_was_clamped;
-                    render_diagnostics.crop_margin_applied = crop_render.crop_margin_applied;
-                    render_diagnostics.answer_region_source = Some("manual_template".to_string());
-                    layout_hint = format!(
-                        "crop page {} on submission page {}",
-                        question.number, page_number
-                    );
-                    source_refs.push((page_number, crop_render.path));
-                    if submission.page_numbers.len() > 1 || crop_render.crop_was_clamped {
-                        render_diagnostics.partial_answer_suspected = true;
-                    }
-                } else {
-                    render_diagnostics.crop_missing = true;
-                    render_diagnostics.answer_region_source = Some("crop_missing".to_string());
-                    source_refs.extend(submission.page_numbers.iter().filter_map(|page_number| {
-                        preview_by_page
-                            .get(page_number)
-                            .cloned()
-                            .map(|path| (*page_number, path))
-                    }));
                 }
-            } else {
-                render_diagnostics.crop_missing = true;
-                render_diagnostics.answer_region_source = Some("crop_page_missing".to_string());
-                source_refs.extend(submission.page_numbers.iter().filter_map(|page_number| {
-                    preview_by_page
-                        .get(page_number)
-                        .cloned()
-                        .map(|path| (*page_number, path))
-                }));
+                render_diagnostics.rendered_crop_exists = true;
+                render_diagnostics.crop_was_clamped |= crop_render.crop_was_clamped;
+                render_diagnostics.crop_margin_applied |= crop_render.crop_margin_applied;
+                render_diagnostics.answer_region_source = Some("manual_template".to_string());
+                source_refs.push((page_number, crop_render.path));
+                region_ids.push(region.region_id.clone());
+                region_orders.push(region.order);
+                region_page_offsets.push(region.page_offset);
+                if crop_render.crop_was_clamped {
+                    render_diagnostics.partial_answer_suspected = true;
+                }
             }
-        } else {
+            if missing_region && mode == StudentAnswerOcrJobMode::Production {
+                return Err(crop_region_missing_error(
+                    &submission.id,
+                    &question.id,
+                    "Cevap region’larından biri öğrenci sayfa grubunda veya önizlemede bulunamadı.",
+                ));
+            }
+            if missing_region {
+                source_refs.clear();
+                region_ids.clear();
+                region_orders.clear();
+                region_page_offsets.clear();
+                render_diagnostics.crop_missing = true;
+            }
+        } else if mode == StudentAnswerOcrJobMode::Production {
+            return Err(crop_region_missing_error(
+                &submission.id,
+                &question.id,
+                "Üretim OCR’ı için cevap region şablonu gerekli.",
+            ));
+        }
+
+        if source_refs.is_empty() {
             source_refs.extend(submission.page_numbers.iter().filter_map(|page_number| {
                 preview_by_page
                     .get(page_number)
                     .cloned()
                     .map(|path| (*page_number, path))
             }));
-            render_diagnostics.answer_region_source = Some("full_page_fallback".to_string());
-            render_diagnostics.partial_answer_suspected = true;
+            region_ids.clear();
+            region_orders.clear();
+            region_page_offsets.clear();
+            render_diagnostics.answer_region_source =
+                Some("experimental_full_page_review_only".to_string());
+            render_diagnostics.crop_missing = true;
+            layout_hint = "experimental full page review only".to_string();
         }
+
+        let source_pages = source_refs
+            .iter()
+            .map(|(page, _)| *page)
+            .collect::<Vec<_>>();
 
         if source_refs.is_empty() {
             return Err(AppError {
@@ -390,18 +448,28 @@ impl StudentAnswerCropService {
         if render_diagnostics.crop_missing || render_diagnostics.partial_answer_suspected {
             layout_hint = format!("{layout_hint} (review_needed)");
         }
-        if render_diagnostics.answer_region_source.as_deref() == Some("manual_template") {
-            // Manual template crops are the authoritative OCR input for this question.
-        } else if render_diagnostics.crop_missing {
+        if matches!(
+            render_diagnostics.answer_region_source.as_deref(),
+            Some("manual_template") | Some("experimental_full_page_review_only")
+        ) {
+            // The source label is already explicit: either canonical crop regions or
+            // the separately typed experimental full-page mode.
+        } else if render_diagnostics.crop_missing
+            && render_diagnostics.answer_region_source.as_deref()
+                != Some("experimental_full_page_review_only")
+        {
             render_diagnostics.answer_region_source = Some("crop_missing".to_string());
         } else if render_diagnostics.partial_answer_suspected {
             render_diagnostics.answer_region_source =
-                Some("full_page_fallback_review_required".to_string());
+                Some("manual_template_review_needed".to_string());
         }
 
         Ok(StudentAnswerCropArtifacts {
             model_input_images: source_refs,
             source_page_numbers: source_pages,
+            region_ids,
+            region_orders,
+            region_page_offsets,
             render_diagnostics,
             layout_hint,
         })
@@ -416,7 +484,8 @@ impl StudentAnswerCropService {
         question_number: u32,
         page_number: u32,
         preview_path: &Path,
-        crop_template: &StudentAnswerCropTemplateItem,
+        region: &QuestionAnswerRegion,
+        region_order: u32,
     ) -> Result<CropRenderInfo, AppError> {
         let image = image::open(preview_path).map_err(|error| AppError {
             code: AppErrorCode::PdfRenderFailed,
@@ -428,7 +497,7 @@ impl StudentAnswerCropService {
         })?;
         let (width, height) = image.dimensions();
         let (x, y, crop_width, crop_height, crop_was_clamped, crop_margin_applied) =
-            crop_rect(crop_template, width, height);
+            crop_rect_normalized(&region.normalized_bbox, width, height);
         let cropped = image.crop_imm(x, y, crop_width, crop_height);
         let trusted_root =
             TrustedProjectRoot::from_canonical_root(PathBuf::from(project_root), false)?;
@@ -437,7 +506,9 @@ impl StudentAnswerCropService {
         ))?;
         let crop_dir = trusted_root.root().join(crop_relative.as_path());
         trusted_root.ensure_managed_directory(&crop_dir)?;
-        let crop_path = crop_dir.join(format!("q{question_number}_p{page_number}.png"));
+        let crop_path = crop_dir.join(format!(
+            "q{question_number}_r{region_order}_p{page_number}.png"
+        ));
         cropped.save(&crop_path).map_err(|error| AppError {
             code: AppErrorCode::PdfRenderFailed,
             message: "Crop görüntüsü kaydedilemedi.".to_string(),
@@ -451,7 +522,7 @@ impl StudentAnswerCropService {
             y: y as f32 / height.max(1) as f32,
             width: crop_width as f32 / width.max(1) as f32,
             height: crop_height as f32 / height.max(1) as f32,
-            page_index: crop_template.page_index_within_submission,
+            page_index: region.page_offset,
         };
         Ok(CropRenderInfo {
             path: crop_path,
@@ -519,6 +590,21 @@ impl StudentAnswerCropService {
     }
 }
 
+fn crop_region_missing_error(submission_id: &str, question_id: &str, message: &str) -> AppError {
+    AppError {
+        code: AppErrorCode::CropRegionMissing,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Crop Şablonu sayfasında tüm cevap bölgelerini kaydedin.".to_string(),
+        ),
+        technical_details: Some(format!(
+            "submission_id={submission_id}; question_id={question_id}"
+        )),
+        correlation_id: Uuid::new_v4().to_string(),
+    }
+}
+
 struct CropRenderInfo {
     path: PathBuf,
     bbox: StudentAnswerOcrCropBBox,
@@ -534,28 +620,47 @@ pub(crate) fn crop_rect(
     height: u32,
 ) -> (u32, u32, u32, u32, bool, bool) {
     let bbox = &crop_template.bbox;
-    let normalized = bbox.x <= 1.0 && bbox.y <= 1.0 && bbox.width <= 1.0 && bbox.height <= 1.0;
+    crop_rect_values(bbox.x, bbox.y, bbox.width, bbox.height, width, height)
+}
+
+fn crop_rect_normalized(
+    bbox: &crate::domain::student::NormalizedBBox,
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32, bool, bool) {
+    crop_rect_values(bbox.x, bbox.y, bbox.width, bbox.height, width, height)
+}
+
+fn crop_rect_values(
+    bbox_x: f32,
+    bbox_y: f32,
+    bbox_width: f32,
+    bbox_height: f32,
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32, bool, bool) {
+    let normalized = bbox_x <= 1.0 && bbox_y <= 1.0 && bbox_width <= 1.0 && bbox_height <= 1.0;
     let margin_applied = true;
     let margin = if normalized { 0.04 } else { 12.0 };
     let mut x = if normalized {
-        (bbox.x * width as f32).round() as u32
+        (bbox_x * width as f32).round() as u32
     } else {
-        bbox.x.round() as u32
+        bbox_x.round() as u32
     };
     let mut y = if normalized {
-        (bbox.y * height as f32).round() as u32
+        (bbox_y * height as f32).round() as u32
     } else {
-        bbox.y.round() as u32
+        bbox_y.round() as u32
     };
     let mut w = if normalized {
-        (bbox.width * width as f32).round() as u32
+        (bbox_width * width as f32).round() as u32
     } else {
-        bbox.width.round() as u32
+        bbox_width.round() as u32
     };
     let mut h = if normalized {
-        (bbox.height * height as f32).round() as u32
+        (bbox_height * height as f32).round() as u32
     } else {
-        bbox.height.round() as u32
+        bbox_height.round() as u32
     };
     if normalized {
         let margin_px_x = (margin * width as f32).round() as i32;
@@ -598,7 +703,12 @@ pub(crate) fn crop_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::student::{StudentAnswerOcrRecord, StudentAnswerOcrStatus};
+    use crate::domain::question::default_question;
+    use crate::domain::student::{
+        AnswerRegionRole, ContinuationPolicy, NormalizedBBox, QuestionAnswerRegion,
+        QuestionAnswerTemplate, StudentAnswerCropTemplate, StudentAnswerOcrRecord,
+        StudentAnswerOcrStatus, StudentSubmissionStatus,
+    };
     use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
     use crate::jobs::job_manager::JobManager;
     use crate::services::pdf_service::SystemPdfService;
@@ -667,6 +777,68 @@ mod tests {
         )
     }
 
+    fn test_submission(page_numbers: Vec<u32>) -> StudentSubmission {
+        StudentSubmission {
+            id: "submission-1".to_string(),
+            student_id: "student-1".to_string(),
+            document_id: "scan-1".to_string(),
+            class_id: None,
+            scan_batch_id: None,
+            class_membership_source: None,
+            page_numbers,
+            status: StudentSubmissionStatus::ReadyForOcr,
+            answer_slots: vec![],
+            warnings: vec![],
+            updated_at: None,
+        }
+    }
+
+    fn test_preview_map(root: &Path, pages: &[u32]) -> BTreeMap<u32, PathBuf> {
+        let preview_dir = root.join("previews");
+        std::fs::create_dir_all(&preview_dir).unwrap();
+        pages
+            .iter()
+            .map(|page| {
+                let path = preview_dir.join(format!("page-{page}.png"));
+                image::RgbaImage::from_pixel(100, 100, image::Rgba([255, 255, 255, 255]))
+                    .save(&path)
+                    .unwrap();
+                (*page, path)
+            })
+            .collect()
+    }
+
+    fn test_region(
+        question_id: &str,
+        region_id: &str,
+        page_offset: u32,
+        order: u32,
+    ) -> QuestionAnswerRegion {
+        QuestionAnswerRegion {
+            region_id: region_id.to_string(),
+            page_offset,
+            order,
+            normalized_bbox: NormalizedBBox {
+                x: 0.1,
+                y: 0.1,
+                width: 0.6,
+                height: 0.3,
+            },
+            region_role: if order == 0 {
+                AnswerRegionRole::Primary
+            } else {
+                AnswerRegionRole::Continuation
+            },
+            continuation_policy: if order == 0 {
+                ContinuationPolicy::Independent
+            } else {
+                ContinuationPolicy::ContinuesPrevious
+            },
+            label: Some(format!("{question_id}-{order}")),
+            note: None,
+        }
+    }
+
     #[test]
     fn save_template_invalidates_existing_ocr_when_crop_changes() {
         let root = temp_root();
@@ -674,7 +846,8 @@ mod tests {
         let mut project = project_store
             .create_project("Crop".to_string(), root.to_string_lossy().to_string())
             .unwrap();
-        project.student_answer_crop_template.items = vec![crop_item("q1", 1, 0.1)];
+        project.student_answer_crop_template =
+            StudentAnswerCropTemplate::from_legacy_items(vec![crop_item("q1", 1, 0.1)]);
         project.student_answer_ocr_records = vec![ocr_record()];
         project.workflow = WorkflowSnapshot {
             current_stage: WorkflowStage::StudentAnswerOcrReadyForScoring,
@@ -686,7 +859,11 @@ mod tests {
         project_store.save_project(&project).unwrap();
 
         let updated = service(project_store)
-            .save_template(&project.id, vec![crop_item("q1", 1, 0.3)])
+            .save_template(
+                &project.id,
+                StudentAnswerCropTemplate::from_legacy_items(vec![crop_item("q1", 1, 0.3)])
+                    .templates,
+            )
             .unwrap();
 
         assert!(updated.student_answer_ocr_records.is_empty());
@@ -694,6 +871,97 @@ mod tests {
             updated.workflow.current_stage,
             WorkflowStage::StudentAnswerOcrReadyForScoring
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn multi_page_regions_are_ordered_and_not_partial_by_page_count_alone() {
+        let root = temp_root();
+        let pages = test_preview_map(&root, &[10, 11]);
+        let project_store = ProjectStore::new();
+        let service = service(project_store);
+        let mut question = default_question(1);
+        question.id = "q1".to_string();
+        let submission = test_submission(vec![10, 11]);
+        let template = QuestionAnswerTemplate {
+            question_id: question.id.clone(),
+            regions: vec![
+                test_region(&question.id, "q1-region-1", 1, 1),
+                test_region(&question.id, "q1-region-0", 0, 0),
+            ],
+        };
+
+        let artifacts = service
+            .build_sources(
+                &root.to_string_lossy(),
+                "scan-1",
+                &submission,
+                &question,
+                &pages,
+                Some(&template),
+                StudentAnswerOcrJobMode::Production,
+            )
+            .unwrap();
+
+        assert_eq!(artifacts.source_page_numbers, vec![10, 11]);
+        assert_eq!(artifacts.region_ids, vec!["q1-region-0", "q1-region-1"]);
+        assert_eq!(artifacts.region_orders, vec![0, 1]);
+        assert!(!artifacts.render_diagnostics.partial_answer_suspected);
+        assert_eq!(
+            artifacts.render_diagnostics.answer_region_source.as_deref(),
+            Some("manual_template")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_crop_is_production_error_but_explicit_experimental_mode_is_review_only() {
+        let root = temp_root();
+        let pages = test_preview_map(&root, &[1, 2]);
+        let project_store = ProjectStore::new();
+        let service = service(project_store);
+        let mut question = default_question(1);
+        question.id = "q1".to_string();
+        let submission = test_submission(vec![1, 2]);
+
+        let production = service.build_sources(
+            &root.to_string_lossy(),
+            "scan-1",
+            &submission,
+            &question,
+            &pages,
+            None,
+            StudentAnswerOcrJobMode::Production,
+        );
+        assert_eq!(
+            production
+                .err()
+                .expect("production crop must be blocked")
+                .code,
+            AppErrorCode::CropRegionMissing
+        );
+
+        let experimental = service
+            .build_sources(
+                &root.to_string_lossy(),
+                "scan-1",
+                &submission,
+                &question,
+                &pages,
+                None,
+                StudentAnswerOcrJobMode::ExperimentalFullPageReviewOnly,
+            )
+            .unwrap();
+        assert_eq!(experimental.model_input_images.len(), 2);
+        assert!(experimental.region_ids.is_empty());
+        assert_eq!(
+            experimental
+                .render_diagnostics
+                .answer_region_source
+                .as_deref(),
+            Some("experimental_full_page_review_only")
+        );
+        assert!(experimental.layout_hint.contains("review"));
         let _ = std::fs::remove_dir_all(root);
     }
 }

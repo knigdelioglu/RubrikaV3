@@ -11,8 +11,9 @@ use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::project::{ExamPackageFreeze, ExamPackageFreezeStatus, Project};
 use crate::domain::question::{is_question_text_ready, AnswerType, Question};
 use crate::domain::rubric::{
-    normalize_text, teacher_facing_warnings, validate_rubric_state, RubricCriterion, RubricSource,
-    RubricState, RubricStatus, RubricValidationIssue,
+    migrate_legacy_rubric_levels, normalize_text, rubric_requires_level_migration,
+    teacher_facing_warnings, validate_rubric_levels, validate_rubric_state, RubricCriterion,
+    RubricSource, RubricState, RubricStatus, RubricValidationIssue,
 };
 use crate::services::project_store::ProjectStore;
 use crate::services::workflow_engine;
@@ -43,6 +44,23 @@ pub struct ImportRubricJsonOutput {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MigrateRubricLevelsInput {
+    pub project_id: String,
+    #[serde(default)]
+    pub question_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateRubricLevelsOutput {
+    pub migrated_count: u32,
+    pub teacher_confirmation_required: bool,
+    pub qep_invalidated: bool,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateQuestionRubricInput {
     pub project_id: String,
     pub question_id: String,
@@ -50,6 +68,8 @@ pub struct UpdateQuestionRubricInput {
     pub answer_type: Option<AnswerType>,
     pub max_score: Option<f32>,
     pub expected_answer: Option<String>,
+    #[serde(default)]
+    pub key_concepts: Vec<String>,
     pub criteria: Vec<RubricCriterion>,
     pub partial_credit_hints: Vec<String>,
     pub zero_score_conditions: Vec<String>,
@@ -116,6 +136,7 @@ struct NormalizedRubricEntry {
     question_number: u32,
     max_score: Option<f32>,
     expected_answer: Option<String>,
+    key_concepts: Vec<String>,
     criteria: Vec<RubricCriterion>,
     partial_credit_hints: Vec<String>,
     zero_score_conditions: Vec<String>,
@@ -126,6 +147,62 @@ struct NormalizedRubricEntry {
 impl RubricService {
     pub fn new(project_store: ProjectStore) -> Self {
         Self { project_store }
+    }
+
+    /// One-way migration for old numeric/max-only rubrics. Existing criterion
+    /// data is retained; generated levels are suggestions and never become
+    /// authoritative without a later teacher confirmation.
+    pub fn migrate_rubric_levels(
+        &self,
+        input: MigrateRubricLevelsInput,
+    ) -> Result<MigrateRubricLevelsOutput, AppError> {
+        let mut project = self.load_project(&input.project_id)?;
+        let mut migrated_count = 0u32;
+        let mut warnings = Vec::new();
+        for question in &mut project.questions {
+            if input
+                .question_id
+                .as_deref()
+                .is_some_and(|question_id| question_id != question.id)
+            {
+                continue;
+            }
+            if !rubric_requires_level_migration(&question.rubric) {
+                continue;
+            }
+            question.rubric = migrate_legacy_rubric_levels(&question.rubric);
+            let level_validation = validate_rubric_levels(&question.rubric);
+            warnings.extend(level_validation.warnings);
+            warnings.extend(
+                level_validation
+                    .issues
+                    .into_iter()
+                    .map(|issue| issue.message),
+            );
+            question.rubric.updated_at = Some(chrono::Utc::now().to_rfc3339());
+            migrated_count += 1;
+        }
+
+        let qep_was_frozen = project
+            .exam_package_freeze
+            .as_ref()
+            .is_some_and(|freeze| freeze.freeze_status == ExamPackageFreezeStatus::Frozen);
+        if migrated_count > 0 {
+            project.invalidate_exam_package_if_frozen("rubric_levels_changed_after_freeze");
+            project.workflow = workflow_engine::evaluate_workflow(&project);
+            self.project_store
+                .commit_snapshot_cas(&project)
+                .map(|_| ())?;
+        }
+
+        warnings.sort();
+        warnings.dedup();
+        Ok(MigrateRubricLevelsOutput {
+            migrated_count,
+            teacher_confirmation_required: migrated_count > 0,
+            qep_invalidated: migrated_count > 0 && qep_was_frozen,
+            warnings,
+        })
     }
 
     pub fn import_rubric_json(
@@ -174,6 +251,7 @@ impl RubricService {
                 source: Some(RubricSource::Json),
                 max_score: entry.max_score,
                 expected_answer: entry.expected_answer.clone(),
+                key_concepts: entry.key_concepts.clone(),
                 criteria: entry.criteria.clone(),
                 partial_credit_hints: entry.partial_credit_hints.clone(),
                 zero_score_conditions: entry.zero_score_conditions.clone(),
@@ -259,6 +337,7 @@ impl RubricService {
                 .expected_answer
                 .clone()
                 .map(|text| normalize_text(&text)),
+            key_concepts: input.key_concepts.clone(),
             criteria: input.criteria.clone(),
             partial_credit_hints: input.partial_credit_hints.clone(),
             zero_score_conditions: input.zero_score_conditions.clone(),
@@ -315,6 +394,24 @@ impl RubricService {
         let validation = validate_rubric_state(&question.rubric, Some(&question.answer_type));
         if !validation.valid || question.rubric.max_score.is_none() {
             return Err(build_rubric_confirm_error(question.number, &validation));
+        }
+        if question
+            .rubric
+            .criteria
+            .iter()
+            .any(|criterion| !criterion.levels.is_empty())
+        {
+            let level_validation = validate_rubric_levels(&question.rubric);
+            if level_validation
+                .issues
+                .iter()
+                .any(|issue| issue.code != "RUBRIC_LEVELS_MISSING")
+            {
+                return Err(build_rubric_confirm_error(
+                    question.number,
+                    &level_validation,
+                ));
+            }
         }
 
         question.rubric.status = RubricStatus::Confirmed;
@@ -480,6 +577,25 @@ impl RubricService {
         for question in &project.questions {
             let validation = validate_rubric_state(&question.rubric, Some(&question.answer_type));
             let mut issues = validation.issues.clone();
+            let mut level_invalid = false;
+            if question
+                .rubric
+                .criteria
+                .iter()
+                .any(|criterion| !criterion.levels.is_empty())
+            {
+                let level_validation = validate_rubric_levels(&question.rubric);
+                level_invalid = level_validation
+                    .issues
+                    .iter()
+                    .any(|issue| issue.code != "RUBRIC_LEVELS_MISSING");
+                issues.extend(
+                    level_validation
+                        .issues
+                        .into_iter()
+                        .filter(|issue| issue.code != "RUBRIC_LEVELS_MISSING"),
+                );
+            }
             let question_text_ready = is_question_text_ready(&question.question_text);
             if !question_text_ready {
                 issues.push(RubricValidationIssue {
@@ -493,7 +609,7 @@ impl RubricService {
             } else {
                 question.rubric.status.clone()
             };
-            if !validation.valid || !question_text_ready {
+            if !validation.valid || level_invalid || !question_text_ready {
                 valid = false;
                 confirmable = false;
                 blocking_questions.push(question.number);
@@ -798,6 +914,7 @@ fn parse_format_a_question(value: &Value) -> Result<NormalizedRubricEntry, AppEr
         question_number,
         max_score: get_optional_f32(value, &["max_score", "points"])?,
         expected_answer: get_optional_string(value, &["expected_answer", "answer_key"])?,
+        key_concepts: get_string_list(value, &["key_concepts", "keyConcepts", "key_terms"])?,
         criteria,
         partial_credit_hints: get_string_list(value, &["partial_credit_hints"])?,
         zero_score_conditions: get_string_list(value, &["zero_score_conditions"])?,
@@ -813,6 +930,7 @@ fn parse_format_b_question(value: &Value) -> Result<NormalizedRubricEntry, AppEr
         question_number,
         max_score: get_optional_f32(value, &["points", "max_score"])?,
         expected_answer: get_optional_string(value, &["answer_key", "expected_answer"])?,
+        key_concepts: get_string_list(value, &["key_concepts", "keyConcepts", "key_terms"])?,
         criteria,
         partial_credit_hints: get_string_list(value, &["partial_credit_hints"])?,
         zero_score_conditions: get_string_list(value, &["zero_score_conditions"])?,
@@ -942,6 +1060,7 @@ fn get_criteria(value: &Value, keys: &[&str]) -> Result<Vec<RubricCriterion>, Ap
                         label,
                         description,
                         points: points.unwrap_or(0.0),
+                        levels: vec![],
                     })
                 })
                 .collect();
@@ -989,6 +1108,7 @@ mod tests {
                 source: None,
                 max_score: None,
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1181,11 +1301,13 @@ mod tests {
             source: Some(RubricSource::Json),
             max_score: Some(10.0),
             expected_answer: Some("örnek cevap".to_string()),
+            key_concepts: vec![],
             criteria: vec![RubricCriterion {
                 id: "c1".to_string(),
                 label: "Kriter".to_string(),
                 description: "Açıklama".to_string(),
                 points: 10.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -1208,11 +1330,13 @@ mod tests {
             source: Some(RubricSource::Json),
             max_score: Some(10.0),
             expected_answer: Some("Cevap".to_string()),
+            key_concepts: vec![],
             criteria: vec![RubricCriterion {
                 id: "c1".to_string(),
                 label: "Kriter".to_string(),
                 description: "Açıklama".to_string(),
                 points: 8.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -1235,11 +1359,13 @@ mod tests {
             source: Some(RubricSource::Json),
             max_score: None,
             expected_answer: Some("Cevap".to_string()),
+            key_concepts: vec![],
             criteria: vec![RubricCriterion {
                 id: "c1".to_string(),
                 label: "Kriter".to_string(),
                 description: "Açıklama".to_string(),
                 points: 10.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -1268,11 +1394,13 @@ mod tests {
             source: Some(RubricSource::Json),
             max_score: Some(10.0),
             expected_answer: Some("Cevap".to_string()),
+            key_concepts: vec![],
             criteria: vec![RubricCriterion {
                 id: "c1".to_string(),
                 label: "Kriter".to_string(),
                 description: "Açıklama".to_string(),
                 points: 8.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -1336,11 +1464,13 @@ mod tests {
                 answer_type: None,
                 max_score: Some(10.0),
                 expected_answer: Some("Cevap 2".to_string()),
+                key_concepts: vec![],
                 criteria: vec![RubricCriterion {
                     id: "c2".to_string(),
                     label: "Kriter".to_string(),
                     description: "Açıklama".to_string(),
                     points: 10.0,
+                    levels: vec![],
                 }],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1378,11 +1508,13 @@ mod tests {
                     answer_type: None,
                     max_score: Some(10.0),
                     expected_answer: Some(format!("Cevap {}", question.number)),
+                    key_concepts: vec![],
                     criteria: vec![RubricCriterion {
                         id: format!("c{}", question.number),
                         label: "Kriter".to_string(),
                         description: "Açıklama".to_string(),
                         points: 10.0,
+                        levels: vec![],
                     }],
                     partial_credit_hints: vec![],
                     zero_score_conditions: vec![],
@@ -1416,11 +1548,13 @@ mod tests {
                     answer_type: None,
                     max_score: Some(10.0),
                     expected_answer: Some(format!("Cevap {}", question.number)),
+                    key_concepts: vec![],
                     criteria: vec![RubricCriterion {
                         id: format!("c{}", question.number),
                         label: "Kriter".to_string(),
                         description: "Açıklama".to_string(),
                         points: 10.0,
+                        levels: vec![],
                     }],
                     partial_credit_hints: vec![],
                     zero_score_conditions: vec![],
@@ -1461,11 +1595,13 @@ mod tests {
                     answer_type: None,
                     max_score: Some(10.0),
                     expected_answer: Some(format!("Cevap {}", question.number)),
+                    key_concepts: vec![],
                     criteria: vec![RubricCriterion {
                         id: format!("c{}", question.number),
                         label: "Kriter".to_string(),
                         description: "Açıklama".to_string(),
                         points: 10.0,
+                        levels: vec![],
                     }],
                     partial_credit_hints: vec![],
                     zero_score_conditions: vec![],
@@ -1485,11 +1621,13 @@ mod tests {
                 answer_type: None,
                 max_score: Some(10.0),
                 expected_answer: Some("Değişen cevap".to_string()),
+                key_concepts: vec![],
                 criteria: vec![RubricCriterion {
                     id: "c1".to_string(),
                     label: "Kriter".to_string(),
                     description: "Açıklama".to_string(),
                     points: 10.0,
+                    levels: vec![],
                 }],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1509,6 +1647,68 @@ mod tests {
     }
 
     #[test]
+    fn level_migration_is_one_way_suggested_and_invalidates_frozen_qep() {
+        let (store, project) = confirmed_project();
+        let service = RubricService::new(store.clone());
+        let mut snapshot = store
+            .get_project_snapshot(project.id.clone())
+            .expect("snapshot");
+        snapshot.questions[0].rubric = RubricState {
+            status: RubricStatus::Confirmed,
+            source: Some(RubricSource::Manual),
+            max_score: Some(10.0),
+            expected_answer: Some("Cevap".to_string()),
+            key_concepts: vec![],
+            criteria: vec![RubricCriterion {
+                id: "legacy-c1".to_string(),
+                label: "Doğruluk".to_string(),
+                description: "Cevap doğruluğu".to_string(),
+                points: 10.0,
+                levels: vec![],
+            }],
+            partial_credit_hints: vec![],
+            zero_score_conditions: vec![],
+            common_mistakes: vec![],
+            warnings: vec![],
+            updated_at: None,
+        };
+        snapshot.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            exam_package_version: 1,
+            freeze_status: ExamPackageFreezeStatus::Frozen,
+            frozen_at: "now".to_string(),
+            frozen_by: Some("teacher".to_string()),
+            source_hash: "source".to_string(),
+            rubric_hash: "rubric".to_string(),
+            question_text_hash: "question".to_string(),
+            invalidated_at: None,
+            invalidation_reason: None,
+        });
+        store
+            .save_project(&snapshot)
+            .expect("save legacy frozen project");
+
+        let result = service
+            .migrate_rubric_levels(MigrateRubricLevelsInput {
+                project_id: project.id.clone(),
+                question_id: Some(snapshot.questions[0].id.clone()),
+            })
+            .expect("migration");
+        assert_eq!(result.migrated_count, 1);
+        assert!(result.teacher_confirmation_required);
+        assert!(result.qep_invalidated);
+
+        let migrated = store
+            .get_project_snapshot(project.id)
+            .expect("migrated snapshot");
+        assert_eq!(migrated.questions[0].rubric.status, RubricStatus::Suggested);
+        assert_eq!(migrated.questions[0].rubric.criteria[0].levels.len(), 1);
+        assert_eq!(
+            migrated.exam_package_freeze.expect("freeze").freeze_status,
+            ExamPackageFreezeStatus::Invalidated
+        );
+    }
+
+    #[test]
     fn rubric_update_persists_teacher_selected_answer_type() {
         let (store, project) = confirmed_project();
         let service = RubricService::new(store.clone());
@@ -1521,11 +1721,13 @@ mod tests {
                 answer_type: Some(AnswerType::Matching),
                 max_score: Some(10.0),
                 expected_answer: Some("A-2, B-1".to_string()),
+                key_concepts: vec![],
                 criteria: vec![RubricCriterion {
                     id: "matching".to_string(),
                     label: "Eşler".to_string(),
                     description: "Doğru eşleri kurar.".to_string(),
                     points: 10.0,
+                    levels: vec![],
                 }],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],

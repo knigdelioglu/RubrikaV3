@@ -87,6 +87,7 @@ function question(number: number): Question {
       source: 'manual',
       maxScore: 10,
       expectedAnswer: null,
+      keyConcepts: [],
       criteria: [],
       partialCreditHints: [],
       zeroScoreConditions: [],
@@ -161,7 +162,7 @@ test('crop missing preview helper returns explicit diagnostics', () => {
   });
 
   assert.equal(getStudentAnswerOcrPreviewMode(record), 'missing');
-  assert.match(getStudentAnswerOcrPreviewMessage(record), /crop_missing=true/);
+  assert.match(getStudentAnswerOcrPreviewMessage(record), /Crop ve sayfa önizlemesi eksik/);
 });
 
 test('fallback review helper warns about full page fallback', () => {
@@ -264,6 +265,7 @@ test('issue review helper prefers the direct model input crop ref', () => {
 test('issue helpers capture only actionable OCR signals and highlights', () => {
   const record = baseRecord({
     needsReview: true,
+    reviewReasons: ['ocr_low_confidence'],
     criticalKeywordUncertain: true,
     uncertainSpans: [
       {
@@ -371,6 +373,27 @@ test('partial answer warning does not create an actionable issue', () => {
   });
 
   assert.equal(getStudentAnswerOcrActionableIssueEntries(record).length, 0);
+});
+
+test('mid-range confidence is shown when backend marks the record for review', () => {
+  const record = baseRecord({
+    confidence: 0.65,
+    needsReview: true,
+    reviewReasons: ['ocr_low_confidence'],
+    uncertainSpans: [
+      {
+        text: 'belirsiz',
+        start: 0,
+        end: 8,
+        alternatives: [],
+        confidence: 0.65,
+        reason: 'handwriting_ambiguity',
+        highlightRegion: null,
+      },
+    ],
+  });
+
+  assert.equal(getStudentAnswerOcrIssueKinds(record).includes('ocr_low_confidence'), true);
 });
 
 test('critical keyword uncertainty with no structured fields still creates a concrete issue card', () => {

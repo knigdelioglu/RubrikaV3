@@ -156,6 +156,7 @@ export function StudentIdentityPage() {
       <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
         <button
           type="button"
+          data-project-write="true"
           onClick={handleStartIdentityOcr}
           disabled={!hasIdentityTemplate || ocrStarting}
           title={!hasIdentityTemplate ? 'Önce Crop Şablonu sayfasında kimlik alanını seçin.' : undefined}
@@ -262,7 +263,8 @@ export function StudentIdentityPage() {
                       )}
                     </td>
                     <td style={{ padding: '1rem', textAlign: 'right' }}>
-                      <button 
+                      <button
+                        data-project-write="true"
                         onClick={() => handleVerify(sub.id, sub.studentId)}
                         disabled={!canVerify || isSaving}
                         style={{ 

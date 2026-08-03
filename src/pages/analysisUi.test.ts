@@ -5,6 +5,8 @@ import test from 'node:test';
 
 import type { AssessmentAnalysis } from '../api/types.ts';
 import {
+  analysisEvidenceStatusLabel,
+  analysisMetricValueLabel,
   analysisStatusLabel,
   clampAnalysisPercentage,
   latestAnalysisId,
@@ -22,6 +24,8 @@ function analysis(id: string, kind: 'written' | 'speaking'): AssessmentAnalysis 
     criteria: [],
     students: [],
     scoreBands: [],
+    metrics: [],
+    claims: [],
     createdAt: '2026-07-28T00:00:00Z',
   };
 }
@@ -44,4 +48,13 @@ test('analysis states use teacher-facing labels', () => {
   assert.equal(analysisStatusLabel('generating'), 'Gemma raporu hazırlanıyor');
   assert.equal(analysisStatusLabel('partial'), 'grafikler hazır, rapor kısmi');
   assert.equal(analysisStatusLabel('failed'), 'analiz tamamlanamadı');
+});
+
+test('analysis evidence and metric values use teacher-facing labels', () => {
+  assert.equal(analysisEvidenceStatusLabel('supported'), 'Metrikle destekleniyor');
+  assert.equal(analysisEvidenceStatusLabel('review'), 'Öğretmen incelemesi gerekli');
+  assert.equal(analysisEvidenceStatusLabel('unsupported'), 'Desteklenmiyor');
+  assert.equal(analysisMetricValueLabel(84.6, 'percentage'), '%85');
+  assert.equal(analysisMetricValueLabel(3, 'count'), '3');
+  assert.equal(analysisMetricValueLabel(8.25, 'score'), '8,3');
 });

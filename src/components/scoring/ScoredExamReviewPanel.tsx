@@ -82,10 +82,10 @@ export function ScoredExamReviewPanel({ review, projectId }: ScoredExamReviewPan
             <small style={{ display: 'block', fontSize: '0.58rem', fontWeight: 800, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Model toplamı</small>
             <strong style={{ fontSize: '0.95rem' }}>{formatReviewScore(review.modelTotalScore)} <span style={{ color: '#94a3b8', fontWeight: 600 }}>/</span> {formatReviewScore(review.maxTotalScore)}</strong>
           </div>
-          <button type="button" aria-label="Uzaklaştır" onClick={() => setZoom((value) => Math.max(0.65, value - 0.1))} style={toolbarButtonStyle}><ZoomOut size={16} /></button>
-          <button type="button" onClick={fitCurrentPage} title="Kâğıdı ekrana sığdır ve yeni ölçek referansı yap" style={{ ...toolbarButtonStyle, width: 'auto', padding: '0 0.55rem', gap: '0.3rem' }}><Maximize2 size={14} /> Sığdır</button>
+          <button type="button" data-project-write="false" aria-label="Uzaklaştır" onClick={() => setZoom((value) => Math.max(0.65, value - 0.1))} style={toolbarButtonStyle}><ZoomOut size={16} /></button>
+          <button type="button" data-project-write="false" onClick={fitCurrentPage} title="Kâğıdı ekrana sığdır ve yeni ölçek referansı yap" style={{ ...toolbarButtonStyle, width: 'auto', padding: '0 0.55rem', gap: '0.3rem' }}><Maximize2 size={14} /> Sığdır</button>
           <span style={{ minWidth: '2.8rem', textAlign: 'center', color: '#475569', fontSize: '0.72rem', fontWeight: 800 }}>%{Math.round(zoom * 100)}</span>
-          <button type="button" aria-label="Yakınlaştır" onClick={() => setZoom((value) => Math.min(2.2, value + 0.1))} style={toolbarButtonStyle}><ZoomIn size={16} /></button>
+          <button type="button" data-project-write="false" aria-label="Yakınlaştır" onClick={() => setZoom((value) => Math.min(2.2, value + 0.1))} style={toolbarButtonStyle}><ZoomIn size={16} /></button>
         </div>
       </header>
 
@@ -153,9 +153,9 @@ export function ScoredExamReviewPanel({ review, projectId }: ScoredExamReviewPan
 
         <aside style={{ minHeight: 0, overflow: 'auto', background: 'white', borderLeft: '1px solid #dbe4ef', padding: '0.65rem' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '0.3rem', marginBottom: '0.65rem' }}>
-            <button type="button" aria-label="Önceki sayfa" disabled={pageIndex === 0} onClick={() => setPageIndex((value) => Math.max(0, value - 1))} style={{ ...toolbarButtonStyle, opacity: pageIndex === 0 ? 0.35 : 1 }}><ChevronLeft size={16} /></button>
+            <button type="button" data-project-write="false" aria-label="Önceki sayfa" disabled={pageIndex === 0} onClick={() => setPageIndex((value) => Math.max(0, value - 1))} style={{ ...toolbarButtonStyle, opacity: pageIndex === 0 ? 0.35 : 1 }}><ChevronLeft size={16} /></button>
             <strong style={{ color: '#334155', fontSize: '0.72rem' }}>Sayfa {pageIndex + 1}/{review.pages.length}</strong>
-            <button type="button" aria-label="Sonraki sayfa" disabled={pageIndex === review.pages.length - 1} onClick={() => setPageIndex((value) => Math.min(review.pages.length - 1, value + 1))} style={{ ...toolbarButtonStyle, opacity: pageIndex === review.pages.length - 1 ? 0.35 : 1 }}><ChevronRight size={16} /></button>
+            <button type="button" data-project-write="false" aria-label="Sonraki sayfa" disabled={pageIndex === review.pages.length - 1} onClick={() => setPageIndex((value) => Math.min(review.pages.length - 1, value + 1))} style={{ ...toolbarButtonStyle, opacity: pageIndex === review.pages.length - 1 ? 0.35 : 1 }}><ChevronRight size={16} /></button>
           </div>
 
           {review.needsReviewCount > 0 && (
@@ -170,7 +170,7 @@ export function ScoredExamReviewPanel({ review, projectId }: ScoredExamReviewPan
               const colors = annotationColors(annotation);
               const activePage = pageIndex === annotation.pageIndex;
               return (
-                <button key={annotation.recordId} type="button" onClick={() => setPageIndex(annotation.pageIndex)} style={{ display: 'grid', gridTemplateColumns: '1.7rem minmax(0, 1fr)', alignItems: 'center', gap: '0.45rem', padding: '0.42rem 0.48rem', borderRadius: '0.55rem', border: activePage ? `1px solid ${colors.border}` : '1px solid #e2e8f0', background: activePage ? colors.background : '#fff', color: '#0f172a', cursor: 'pointer', textAlign: 'left' }}>
+                <button key={annotation.recordId} type="button" data-project-write="false" onClick={() => setPageIndex(annotation.pageIndex)} style={{ display: 'grid', gridTemplateColumns: '1.7rem minmax(0, 1fr)', alignItems: 'center', gap: '0.45rem', padding: '0.42rem 0.48rem', borderRadius: '0.55rem', border: activePage ? `1px solid ${colors.border}` : '1px solid #e2e8f0', background: activePage ? colors.background : '#fff', color: '#0f172a', cursor: 'pointer', textAlign: 'left' }}>
                   <span style={{ width: '1.65rem', height: '1.65rem', borderRadius: '0.5rem', display: 'grid', placeItems: 'center', background: activePage ? colors.border : '#f1f5f9', color: activePage ? 'white' : '#475569', fontSize: '0.68rem', fontWeight: 900 }}>{annotation.questionNumber}</span>
                   <span style={{ minWidth: 0, display: 'flex', alignItems: 'baseline', justifyContent: 'space-between', gap: '0.35rem' }}>
                     <span style={{ fontSize: '0.58rem', color: '#94a3b8' }}>s.{annotation.pageNumber}</span>

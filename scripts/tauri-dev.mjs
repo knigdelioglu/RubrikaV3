@@ -12,6 +12,11 @@ const child = spawn('tauri', ['dev', ...args], {
   env: {
     ...process.env,
     RUBRIKA_SMOKE: smokeEnabled ? '1' : process.env.RUBRIKA_SMOKE,
+    // Current local projects are disposable development fixtures. Keep the
+    // production preflight available, but do not make backup/release proof
+    // markers block normal writes while running the dev app.
+    RUBRIKA_ALLOW_UNVERIFIED_PROJECT_WRITES:
+      process.env.RUBRIKA_ALLOW_UNVERIFIED_PROJECT_WRITES ?? '1',
   },
 });
 

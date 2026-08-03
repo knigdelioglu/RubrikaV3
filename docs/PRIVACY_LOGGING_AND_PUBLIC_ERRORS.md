@@ -29,6 +29,21 @@ Production lib kaynaklarında `println!`, `eprintln!`, `dbg!` yoktur
 (proof_31 tarafından taranır). Model gateway hata mesajları yalnız güvenli
 özet içerir: `status=502 received_bytes=32768 content_type=text/html`.
 
+## Strict Local model policy
+
+`PrivacyMode::StrictLocal` varsayılandır ve eski model profillerinde alan yoksa
+bu değerle migrate edilir. Strict Local yalnız IPv4/IPv6 loopback model URL’sine
+izin verir; `localhost` için tüm DNS sonuçları loopback olmalıdır. Gateway
+redirect izlemez ve ortam proxy’sini kullanmaz. Öğrenci verisi taşıyan OCR,
+düzeltme, scoring ve speaking evaluation use-case’leri external profilde
+çalışmaz.
+
+Harici kullanım ancak `enable_external_model` typed command’ı, açık onay alanı
+ve güçlü UI uyarısı üzerinden etkinleşir. Başarılı onay audit zincirine yalnız
+profil/policy metadata’sı olarak yazılır; öğrenci cevabı, transcript, prompt ve
+model payload’ı audit’e girmez. Eski public external profil sessizce çağrılmaz;
+status `privacyBlocked` ve öğretmen dilinde önerilen sonraki adımı döndürür.
+
 ## Sentinel leak testi
 
 Sentineller: `STUDENT_SECRET_9f4a`, `OCR_SECRET_17ce`,

@@ -439,14 +439,6 @@ pub fn evaluate_workflow_inner(
     if !all_exam_source_previews_ready {
         blocking_reasons.push(BlockingReason::PdfPreviewMissing);
         next_actions.push(WorkflowAction {
-            code: "start_pdf_preview_render".to_string(),
-            label: "PDF sayfa önizlemelerini oluştur".to_string(),
-            enabled: true,
-            disabled_reason: None,
-            command: Some("start_pdf_preview_render".to_string()),
-            requires: None,
-        });
-        next_actions.push(WorkflowAction {
             code: "open_pdf_preview_page".to_string(),
             label: "PDF önizleme sayfasını aç".to_string(),
             enabled: true,
@@ -831,14 +823,6 @@ pub fn evaluate_workflow_inner(
         if preview_missing {
             blocking_reasons.push(BlockingReason::StudentScanPreviewNotReady);
             next_actions.push(WorkflowAction {
-                code: "start_student_scan_preview_render".to_string(),
-                label: "Öğrenci PDF önizlemelerini oluştur".to_string(),
-                enabled: true,
-                disabled_reason: None,
-                command: Some("start_student_scan_preview_render".to_string()),
-                requires: None,
-            });
-            next_actions.push(WorkflowAction {
                 code: "open_student_scans_page".to_string(),
                 label: "Öğrenci PDF’leri sayfasını aç".to_string(),
                 enabled: true,
@@ -976,6 +960,40 @@ pub fn evaluate_workflow_inner(
                 } else {
                     "Öğrenci gruplaması tamamlanabilir.".to_string()
                 }),
+            );
+        }
+
+        let question_ids = project
+            .questions
+            .iter()
+            .map(|question| question.id.clone())
+            .collect::<Vec<_>>();
+        let crop_coverage = project.student_answer_crop_template.coverage(&question_ids);
+        if !crop_coverage.missing_question_ids.is_empty() && !scoring_state.ready {
+            blocking_reasons.push(BlockingReason::CropMissing);
+            next_actions.push(WorkflowAction {
+                code: "open_student_answer_crop_template_page".to_string(),
+                label: "Cevap region şablonunu aç".to_string(),
+                enabled: true,
+                disabled_reason: None,
+                command: Some("open_student_answer_crop_template_page".to_string()),
+                requires: None,
+            });
+            next_actions.push(WorkflowAction {
+                code: "start_student_answer_ocr".to_string(),
+                label: "Öğrenci Cevap OCR’ını Başlat".to_string(),
+                enabled: false,
+                disabled_reason: Some(
+                    "Üretim OCR’ı için her soruya en az bir cevap region’ı kaydedin.".to_string(),
+                ),
+                command: Some("start_student_answer_ocr".to_string()),
+                requires: Some(vec!["crop_template_complete".to_string()]),
+            });
+            return (
+                WorkflowStage::CropMissing,
+                blocking_reasons,
+                next_actions,
+                Some("Üretim OCR’ı için cevap region şablonu eksik.".to_string()),
             );
         }
 
@@ -1278,8 +1296,9 @@ mod tests {
     use crate::domain::question::{AnswerType, Question, TextFieldSource, TextFieldState};
     use crate::domain::rubric::{RubricState, RubricStatus};
     use crate::domain::student::{
-        Student, StudentAnswerOcrRecord, StudentAnswerOcrStatus, StudentAnswerSlot,
-        StudentAnswerSlotStatus, StudentSubmission, StudentSubmissionStatus,
+        AnswerRegionRole, ContinuationPolicy, NormalizedBBox, QuestionAnswerRegion,
+        QuestionAnswerTemplate, Student, StudentAnswerOcrRecord, StudentAnswerOcrStatus,
+        StudentAnswerSlot, StudentAnswerSlotStatus, StudentSubmission, StudentSubmissionStatus,
     };
 
     fn empty_project() -> Project {
@@ -1313,6 +1332,7 @@ mod tests {
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {
@@ -1391,6 +1411,7 @@ mod tests {
                 source: None,
                 max_score: None,
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1478,11 +1499,13 @@ mod tests {
                 source: None,
                 max_score: Some(10.0),
                 expected_answer: Some("Answer".into()),
+                key_concepts: vec![],
                 criteria: vec![crate::domain::rubric::RubricCriterion {
                     id: "c1".into(),
                     label: "Kriter".into(),
                     description: "Açıklama".into(),
                     points: 10.0,
+                    levels: vec![],
                 }],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1497,6 +1520,24 @@ mod tests {
 
     fn frozen_ready_project() -> Project {
         let mut project = question_text_and_rubric_ready_project();
+        project.student_answer_crop_template.templates = vec![QuestionAnswerTemplate {
+            question_id: "q1".to_string(),
+            regions: vec![QuestionAnswerRegion {
+                region_id: "q1-region-0".to_string(),
+                page_offset: 0,
+                order: 0,
+                normalized_bbox: NormalizedBBox {
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.8,
+                    height: 0.3,
+                },
+                region_role: AnswerRegionRole::Primary,
+                continuation_policy: ContinuationPolicy::Independent,
+                label: None,
+                note: None,
+            }],
+        }];
         project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
             exam_package_version: 1,
             freeze_status: ExamPackageFreezeStatus::Frozen,
@@ -1779,10 +1820,14 @@ mod tests {
         p.student_scan_document_id = Some("scan".into());
         let snap = evaluate_workflow(&p);
         assert_eq!(snap.current_stage, WorkflowStage::StudentScanPreviewMissing);
-        assert!(snap
+        assert!(!snap
             .next_actions
             .iter()
             .any(|action| action.code == "start_student_scan_preview_render"));
+        assert!(snap
+            .next_actions
+            .iter()
+            .any(|action| action.code == "open_student_scans_page"));
     }
 
     #[test]
@@ -2086,6 +2131,7 @@ mod tests {
                 source: None,
                 max_score: None,
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -2302,6 +2348,7 @@ mod tests {
                 source: None,
                 max_score: None,
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -2378,6 +2425,7 @@ mod tests {
                 source: None,
                 max_score: None,
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],

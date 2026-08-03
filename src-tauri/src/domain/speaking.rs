@@ -93,6 +93,8 @@ pub struct SpeakingModelProvenance {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<crate::domain::model::ModelInvocationContract>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]

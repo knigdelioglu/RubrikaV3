@@ -16,7 +16,7 @@ export function ErrorBanner({
       <strong>Hata:</strong> {error.safeMessage}
       {error.recoveryAction && <p>Öneri: {error.recoveryAction}</p>}
       {isConflict && onRefresh && (
-        <button type="button" onClick={() => void onRefresh()}>
+        <button type="button" data-project-write="false" onClick={() => void onRefresh()}>
           Son durumu yenile
         </button>
       )}

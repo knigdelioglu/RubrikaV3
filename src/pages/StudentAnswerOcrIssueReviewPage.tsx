@@ -6,6 +6,7 @@ import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
 import type {
   OcrSuggestedCorrection,
+  OcrReviewPolicyDto,
   StudentAnswerOcrCropBBox,
   StudentAnswerOcrRecord,
   Student,
@@ -66,7 +67,9 @@ function studentNumberLabel(student: Student | undefined) {
   return student?.number?.trim() || '-';
 }
 
-function warningMessage(code: string) {
+function warningMessage(code: string, policy?: OcrReviewPolicyDto | null) {
+  const backendLabel = policy?.reasonLabels?.[code];
+  if (backendLabel) return backendLabel;
   switch (code) {
     case 'preprocess_failed':
       return 'Görüntü ön hazırlığı başarısız oldu; orijinal crop kullanıldı.';
@@ -91,6 +94,10 @@ function warningMessage(code: string) {
     case 'answer_crop_may_be_incomplete':
     case 'answer_crop_may_be_truncated':
       return 'Crop sınırı kontrol edilmeli.';
+    case 'experimental_full_page_review_only':
+      return 'Deneysel tam sayfa OCR yalnızca inceleme içindir; notlandırmaya onaylanamaz.';
+    case 'structured_answer_invalid':
+      return 'Yapısal OCR cevabı soru tipiyle doğrulanamadı; öğretmen kontrolü gerekli.';
     default:
       return ocrWarningLabels[code] ?? ocrIssueTypeLabels[code] ?? 'Ek OCR kontrolü gerekiyor.';
   }
@@ -240,6 +247,12 @@ export function StudentAnswerOcrIssueReviewPage() {
     enabled: !!projectId,
   });
 
+  const { data: ocrReadiness } = useQuery({
+    queryKey: ['ocr-readiness', projectId, batchId],
+    queryFn: () => commands.getOcrReadiness(projectId!, batchId || undefined),
+    enabled: !!projectId,
+  });
+
   const { data: jobs = [] } = useQuery({
     queryKey: ['jobs', projectId],
     queryFn: () => commands.listJobs(projectId!),
@@ -286,7 +299,6 @@ export function StudentAnswerOcrIssueReviewPage() {
       projectPath: string;
       ocrRecordId: string;
       observedText: string;
-      suggestedTextFromAnalyzer: string;
       questionNumber: number;
       highlightRegion?: StudentAnswerOcrCropBBox | null;
       cropRef?: string | null;
@@ -411,7 +423,7 @@ export function StudentAnswerOcrIssueReviewPage() {
         return row.issueKind === 'suggested_correction';
       }
       if (selectedFilter === 'ocr_low_confidence') {
-        return row.record.confidence != null && row.record.confidence < 0.6;
+        return row.record.needsReview && row.record.reviewReasons.includes('ocr_low_confidence');
       }
       if (selectedFilter === 'resolved') {
         return row.record.status === 'teacher_approved';
@@ -452,8 +464,8 @@ export function StudentAnswerOcrIssueReviewPage() {
   const activeJob = jobs.find((job) => job.kind === 'student_answer_ocr' && (job.status === 'queued' || job.status === 'running'));
   const currentRow = issueRows.find((row) => row.issueId === selectedIssueId) ?? issueRows[0] ?? null;
   const workflowStage = project.workflow.currentStage;
-  const workflowLabel = stageLabels[workflowStage] ?? workflowStage;
-  const blockerLabels = project.workflow.blockingReasons.map((reason) => blockingReasonLabels[reason] ?? reason);
+  const workflowLabel = stageLabels[workflowStage] ?? 'İş akışı kontrolü gerekli';
+  const blockerLabels = project.workflow.blockingReasons.map((reason) => blockingReasonLabels[reason] ?? 'İş akışı için ek kontrol gerekiyor');
   const issueRecordCount = new Set(issueRows.map((row) => row.record.id)).size;
   const issueExpressionCount = issueRows.length;
   const uniqueStudentCount = new Set(issueRows.map((row) => row.studentLabel)).size;
@@ -464,6 +476,10 @@ export function StudentAnswerOcrIssueReviewPage() {
   ).size;
   const ocrRunning = !!activeJob;
   const currentModelSuggestion = currentRow ? modelSuggestions[currentRow.issueId] ?? null : null;
+  const currentRecordNonApprovable = currentRow?.record.ocrProvenance?.approvableForScoring === false;
+  const currentApprovalDisabledReason = currentRecordNonApprovable
+    ? 'Bu sonuç deneysel tam sayfa OCR çıktısıdır; notlandırmaya onaylanamaz.'
+    : undefined;
   const filterOptions: { key: StudentAnswerOcrIssueFilter; label: string }[] = [
     { key: 'all', label: 'Tümü' },
     { key: 'pending_review', label: 'İncelenecekler' },
@@ -505,7 +521,6 @@ export function StudentAnswerOcrIssueReviewPage() {
       projectPath: projectPath!,
       ocrRecordId: row.record.id,
       observedText: row.observedText,
-      suggestedTextFromAnalyzer: row.suggestionText ?? row.correction?.suggestedText ?? '',
       questionNumber: row.questionNumber,
       highlightRegion: row.overlayBoxes[0] ?? null,
       cropRef: row.modelInputRef,
@@ -569,6 +584,11 @@ export function StudentAnswerOcrIssueReviewPage() {
               OCR işi çalışıyor: {activeJob.progress.message}
             </div>
           )}
+          {ocrReadiness?.ocrReviewPolicy && (
+            <div title={ocrReadiness.ocrReviewPolicy.fingerprint} style={{ padding: '0.5rem 0.75rem', borderRadius: '999px', border: '1px solid #cbd5e1', background: 'white', color: '#475569', fontSize: '0.75rem' }}>
+              OCR politikası: {ocrReadiness.ocrReviewPolicy.version}
+            </div>
+          )}
         </div>
       </div>
 
@@ -609,6 +629,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                   <button
                     key={option.key}
                     type="button"
+                    data-project-write="false"
                     onClick={() => setSelectedFilter(option.key)}
                     style={{
                       border: '1px solid',
@@ -669,6 +690,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                 return (
                   <button
                     key={row.issueId}
+                    data-project-write="false"
                     onClick={() => setSelectedIssueId(row.issueId)}
                     style={{
                       width: '100%',
@@ -715,25 +737,33 @@ export function StudentAnswerOcrIssueReviewPage() {
                     <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#475569', background: '#e2e8f0', padding: '0.2rem 0.45rem', borderRadius: '999px' }}>No {currentRow.studentNumber}</span>
                     <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#475569', background: '#e2e8f0', padding: '0.2rem 0.45rem', borderRadius: '999px' }}>Sınıf {currentRow.studentClassName}</span>
                     <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#1d4ed8', background: '#dbeafe', padding: '0.2rem 0.45rem', borderRadius: '999px' }}>Soru {currentRow.questionNumber}</span>
-                    <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#92400e', background: '#fef3c7', padding: '0.2rem 0.45rem', borderRadius: '999px' }}>{studentAnswerOcrStatusLabels[currentRow.record.status] ?? currentRow.record.status}</span>
+                    <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#92400e', background: '#fef3c7', padding: '0.2rem 0.45rem', borderRadius: '999px' }}>{studentAnswerOcrStatusLabels[currentRow.record.status] ?? 'İnceleme gerekli'}</span>
                     <span style={{ fontSize: '0.75rem', fontWeight: 700, color: issueColor(currentRow.issueKind).color, background: issueColor(currentRow.issueKind).background, border: `1px solid ${issueColor(currentRow.issueKind).border}`, padding: '0.2rem 0.45rem', borderRadius: '999px' }}>{currentRow.issueLabel}</span>
                   </div>
                   <div style={{ marginTop: '0.35rem', fontSize: '0.875rem', color: '#64748b' }}>
                     {currentRow.issueSummary}
                   </div>
+                  {currentRecordNonApprovable && (
+                    <div style={{ marginTop: '0.5rem', color: '#9a3412', background: '#fff7ed', border: '1px solid #fdba74', borderRadius: '0.5rem', padding: '0.5rem 0.65rem', fontSize: '0.75rem' }}>
+                      Yalnızca inceleme ve metin düzeltme referansı. Bu sonuç notlandırmaya onaylanamaz.
+                    </div>
+                  )}
                 </div>
 
                 <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
                   <button
                     type="button"
+                    data-project-write="true"
                     onClick={() => void handleApprove(currentRow)}
-                    disabled={ocrRunning || saveMutation.isPending || approveMutation.isPending}
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #86efac', background: '#dcfce7', color: '#166534', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 0.6 : 1 }}
+                    disabled={ocrRunning || saveMutation.isPending || approveMutation.isPending || !!currentApprovalDisabledReason}
+                    title={currentApprovalDisabledReason}
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #86efac', background: '#dcfce7', color: '#166534', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending || !!currentApprovalDisabledReason) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending || !!currentApprovalDisabledReason) ? 0.6 : 1 }}
                   >
                     <BadgeCheck size={16} /> Bu OCR doğru
                   </button>
                   <button
                     type="button"
+                    data-project-write="true"
                     onClick={() => void handleSave(currentRow)}
                     disabled={ocrRunning || saveMutation.isPending || approveMutation.isPending}
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #cbd5e1', background: 'white', color: '#334155', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 0.6 : 1 }}
@@ -742,14 +772,16 @@ export function StudentAnswerOcrIssueReviewPage() {
                   </button>
                   <button
                     type="button"
+                    data-project-write="true"
                     onClick={() => void handleCheckWithGemma(currentRow)}
                     disabled={ocrRunning || saveMutation.isPending || approveMutation.isPending || suggestMutation.isPending || (!currentRow.suggestionText && !currentRow.correction?.suggestedText)}
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending || suggestMutation.isPending || (!currentRow.suggestionText && !currentRow.correction?.suggestedText)) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending || suggestMutation.isPending || (!currentRow.suggestionText && !currentRow.correction?.suggestedText)) ? 0.6 : 1 }}
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #fde68a', background: '#fffbeb', color: '#92400e', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending || suggestMutation.isPending) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending || suggestMutation.isPending) ? 0.6 : 1 }}
                   >
                     Gemma ile öneriyi kontrol et
                   </button>
                   <button
                     type="button"
+                    data-project-write="false"
                     onClick={goToNext}
                     disabled={issueRows.length < 2}
                     style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #cbd5e1', background: '#f8fafc', color: '#334155', fontWeight: 700, cursor: issueRows.length < 2 ? 'not-allowed' : 'pointer', opacity: issueRows.length < 2 ? 0.6 : 1 }}
@@ -834,6 +866,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                         {currentRow.correction && (
                           <button
                             type="button"
+                            data-project-write="true"
                             onClick={() => void handleApplySuggestion(currentRow, currentRow.correction!)}
                             disabled={ocrRunning || saveMutation.isPending || approveMutation.isPending}
                             style={{ width: 'fit-content', display: 'inline-flex', alignItems: 'center', gap: '0.35rem', padding: '0.45rem 0.7rem', borderRadius: '0.75rem', border: '1px solid #86efac', background: 'white', color: '#166534', fontWeight: 700, cursor: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 'not-allowed' : 'pointer', opacity: (ocrRunning || saveMutation.isPending || approveMutation.isPending) ? 0.6 : 1 }}
@@ -850,7 +883,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                         <div style={{ marginTop: '0.75rem', display: 'grid', gap: '0.5rem' }}>
                           <ul style={{ margin: 0, paddingLeft: '1.1rem', color: '#475569', display: 'grid', gap: '0.3rem' }}>
                             {currentRow.debugWarnings.map((warning) => (
-                              <li key={warning}>{warningMessage(warning)}</li>
+                              <li key={warning}>{warningMessage(warning, currentRow.record.reviewPolicy ?? ocrReadiness?.ocrReviewPolicy)}</li>
                             ))}
                           </ul>
                         </div>
@@ -901,6 +934,7 @@ export function StudentAnswerOcrIssueReviewPage() {
                 </div>
                 <button
                   type="button"
+                  data-project-write="false"
                   onClick={goToNext}
                   disabled={issueRows.length < 2}
                   style={{ display: 'inline-flex', alignItems: 'center', gap: '0.4rem', padding: '0.55rem 0.85rem', borderRadius: '0.75rem', border: '1px solid #cbd5e1', background: '#f8fafc', color: '#334155', fontWeight: 700, cursor: issueRows.length < 2 ? 'not-allowed' : 'pointer', opacity: issueRows.length < 2 ? 0.6 : 1 }}

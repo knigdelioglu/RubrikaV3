@@ -123,12 +123,22 @@ export function rubricDraftFromItem(item: RubricQuestionSnapshot): RubricDraft {
     answerType: item.question.answerType,
     maxScore: item.question.rubric.maxScore?.toString() ?? '',
     expectedAnswer: item.question.rubric.expectedAnswer ?? '',
+    keyConcepts: (item.question.rubric.keyConcepts ?? []).join('\n'),
     criteria: item.question.rubric.criteria.length > 0
       ? item.question.rubric.criteria.map((criterion) => ({
           id: criterion.id,
           label: criterion.label,
           description: criterion.description,
           points: criterion.points.toString(),
+          levels: criterion.levels?.map((level) => ({
+            id: level.id,
+            title: level.title,
+            requiredConditions: [...level.requiredConditions],
+            disqualifyingConditions: [...level.disqualifyingConditions],
+            score: level.score.toString(),
+            evidenceRequired: level.evidenceRequired,
+            version: level.version,
+          })),
         }))
       : [],
     partialCreditHints: item.question.rubric.partialCreditHints.join('\n'),

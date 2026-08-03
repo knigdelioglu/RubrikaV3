@@ -3,7 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
-import type { OcrGeneration, OcrImagePreprocessMode } from '../api/types';
+import type { OcrGeneration, OcrImagePreprocessMode, OcrReviewPolicyDto, StudentAnswerOcrJobMode } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { PdfPageViewer } from '../components/pdf/PdfPageViewer';
@@ -36,11 +36,15 @@ function recordKey(submissionId: string, questionId: string) {
   return `${submissionId}:${questionId}`;
 }
 
-const friendlyWarning = (code: string) => {
+const friendlyWarning = (code: string, policy?: OcrReviewPolicyDto | null) => {
+  const backendLabel = policy?.reasonLabels?.[code];
+  if (backendLabel) return backendLabel;
   switch (code) {
     case 'answer_crop_may_be_incomplete': return 'Kırpma alanı cevabın tamamını içermeyebilir.';
     case 'answer_crop_may_be_truncated': return 'Crop sınırı kontrol edilmeli.';
     case 'full_page_fallback_review_required': return 'Tam sayfa fallback kullanıldı; soru kökü karışabilir.';
+    case 'experimental_full_page_review_only': return 'Deneysel tam sayfa OCR yalnızca öğretmen incelemesi içindir; notlandırmaya onaylanamaz.';
+    case 'structured_answer_invalid': return 'OCR yapısal cevabı soru tipiyle doğrulanamadı; öğretmen kontrolü gerekli.';
     case 'printed_question_leak_detected': return 'Soru kökü cevaba karışmış olabilir.';
     case 'printed_text_mixed': return 'Basılı metin karışmış olabilir.';
     case 'critical_keyword_uncertain': return 'Kritik terim belirsiz olabilir.';
@@ -55,7 +59,7 @@ const friendlyWarning = (code: string) => {
     case 'critical_keyword_ocr_uncertain': return ocrWarningLabels.critical_keyword_ocr_uncertain;
     case 'ocr_critical_keyword_uncertain': return ocrWarningLabels.ocr_critical_keyword_uncertain;
     case 'ocr_parse_failed': return ocrWarningLabels.ocr_parse_failed;
-    default: return ocrWarningLabels[code] ?? ocrIssueTypeLabels[code] ?? code;
+    default: return ocrWarningLabels[code] ?? ocrIssueTypeLabels[code] ?? 'İnceleme gerekli';
   }
 };
 
@@ -81,6 +85,9 @@ function OcrGenerationReviewPanel({
           const active = activeRecords.find((record) =>
             record.submissionId === generation.submissionId && record.questionId === candidate?.questionId,
           );
+          const generationNonApprovable = generation.result.some(
+            (record) => record.ocrProvenance?.approvableForScoring === false,
+          );
           return (
             <div key={generation.generationId} style={{ padding: '0.75rem', borderRadius: '0.6rem', background: 'white', border: '1px solid #c7d2fe' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
@@ -95,8 +102,8 @@ function OcrGenerationReviewPanel({
               )}
               {generation.status === 'ready_for_review' && (
                 <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.7rem' }}>
-                  <button type="button" disabled={disabled} onClick={() => onAccept(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #86efac', borderRadius: '0.45rem', background: '#dcfce7', color: '#166534', fontWeight: 700 }}>Yeni sonucu kabul et</button>
-                  <button type="button" disabled={disabled} onClick={() => onReject(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #fecaca', borderRadius: '0.45rem', background: '#fef2f2', color: '#991b1b', fontWeight: 700 }}>Yeni sonucu reddet</button>
+                  <button type="button" data-project-write="true" disabled={disabled || generationNonApprovable} title={generationNonApprovable ? 'Deneysel OCR sonucu notlandırmaya onaylanamaz.' : undefined} onClick={() => onAccept(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #86efac', borderRadius: '0.45rem', background: '#dcfce7', color: '#166534', fontWeight: 700, opacity: generationNonApprovable ? 0.55 : 1 }}>{generationNonApprovable ? 'Yalnızca inceleme' : 'Yeni sonucu kabul et'}</button>
+                  <button type="button" data-project-write="true" disabled={disabled} onClick={() => onReject(generation.generationId)} style={{ padding: '0.45rem 0.7rem', border: '1px solid #fecaca', borderRadius: '0.45rem', background: '#fef2f2', color: '#991b1b', fontWeight: 700 }}>Yeni sonucu reddet</button>
                 </div>
               )}
             </div>
@@ -124,6 +131,12 @@ export function StudentAnswerOcrPage() {
     enabled: !!projectId,
   });
 
+  const { data: ocrReadiness } = useQuery({
+    queryKey: ['ocr-readiness', projectId, batchId],
+    queryFn: () => commands.getOcrReadiness(projectId!, batchId || undefined),
+    enabled: !!projectId,
+  });
+
   const { data: jobs = [] } = useQuery({
     queryKey: ['jobs', projectId],
     queryFn: () => commands.listJobs(projectId!),
@@ -141,6 +154,20 @@ export function StudentAnswerOcrPage() {
 
   const startMutation = useMutation({
     mutationFn: () => commands.startStudentAnswerOcr({ projectId: projectId! }),
+    onMutate: () => setError(null),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
+      queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
+    },
+    onError: (err: AppError) => setError(err),
+  });
+
+  const experimentalMutation = useMutation({
+    mutationFn: () => commands.startStudentAnswerOcr({
+      projectId: projectId!,
+      mode: 'experimental_full_page_review_only' as StudentAnswerOcrJobMode,
+    }),
     onMutate: () => setError(null),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
@@ -248,7 +275,7 @@ export function StudentAnswerOcrPage() {
     [visibleSubmissions],
   );
   const records = (project?.studentAnswerOcrRecords ?? []).filter((record) => visibleSubmissionIds.has(record.submissionId));
-  const templateItems = project?.studentAnswerCropTemplate.items ?? [];
+  const templateItems = project?.studentAnswerCropTemplate.templates ?? [];
   const missingTemplateQuestions = getMissingStudentAnswerCropQuestionNumbers(project?.questions ?? [], templateItems);
 
 
@@ -273,7 +300,7 @@ export function StudentAnswerOcrPage() {
   const queryError = (projectError as AppError | null) || error;
 
   const workflowStage = project?.workflow.currentStage ?? 'ocr_ready';
-  const workflowLabel = stageLabels[workflowStage] ?? workflowStage;
+  const workflowLabel = stageLabels[workflowStage] ?? 'İş akışı kontrolü gerekli';
   const nextActions = project?.workflow.nextActions ?? [];
   const activeJob = jobs.find((job) => job.kind === 'student_answer_ocr' && (job.status === 'queued' || job.status === 'running'));
   
@@ -291,9 +318,19 @@ export function StudentAnswerOcrPage() {
 
   const totalRecords = records.length;
   const reviewedRecords = getStudentAnswerOcrReviewedCount(records);
+  const hasNonApprovableRecords = records.some(
+    (record) => record.ocrProvenance?.approvableForScoring === false,
+  );
+  const bulkApprovalDisabledReason = hasNonApprovableRecords
+    ? 'Deneysel tam sayfa OCR kayıtları toplu olarak onaylanamaz.'
+    : undefined;
   const hasExistingOcrRecords = (project?.studentAnswerOcrRecords.length ?? 0) > 0;
   const hasApprovedOcrRecords = hasApprovedStudentAnswerOcrRecords(project?.studentAnswerOcrRecords ?? []);
   const canRerun = getStudentAnswerOcrRerunVisible(nextActions, isOcrRunning);
+  const productionAction = nextActions.find((action) => action.code === 'start_student_answer_ocr');
+  const productionDisabledReason = productionAction?.disabledReason
+    ?? getStudentAnswerOcrStartDisabledReasonWithHistory(workflowStage, totalRecords)
+    ?? undefined;
   
   const submissions = visibleSubmissions;
   const currentSubmission = submissions[selectedSubmissionIndex];
@@ -309,9 +346,6 @@ export function StudentAnswerOcrPage() {
         return;
       }
       rerunMutation.mutate();
-      return;
-    }
-    if (missingTemplateQuestions.length > 0 && !window.confirm(`Crop şablonu eksik: ${missingTemplateQuestions.join(', ')}. Eksik sorular kontrol (review) gerektirir. Devam edilsin mi?`)) {
       return;
     }
     startMutation.mutate();
@@ -345,9 +379,15 @@ export function StudentAnswerOcrPage() {
               <span style={{ width: '0.5rem', height: '0.5rem', borderRadius: '9999px', background: modelStatus?.healthOk ? '#10b981' : '#f59e0b' }}></span>
               Model Sunucusu {modelStatus?.healthOk ? 'Aktif' : 'Hazır Değil'}
             </div>
+            {ocrReadiness?.ocrReviewPolicy && (
+              <div title={ocrReadiness.ocrReviewPolicy.fingerprint} style={{ fontSize: '0.75rem', color: '#475569', background: '#f8fafc', border: '1px solid #cbd5e1', padding: '0.375rem 0.625rem', borderRadius: '0.5rem' }}>
+                OCR politikası: {ocrReadiness.ocrReviewPolicy.version}
+              </div>
+            )}
             
             {canRerun && (
-              <button 
+              <button
+                data-project-write="true"
                 onClick={handleRerunOCR}
                 disabled={isOcrRunning || rerunMutation.isPending}
                 style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1rem', background: 'white', color: '#475569', border: '1px solid #cbd5e1', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: (isOcrRunning || rerunMutation.isPending) ? 'not-allowed' : 'pointer' }}
@@ -357,10 +397,12 @@ export function StudentAnswerOcrPage() {
               </button>
             )}
             
-            <button 
+            <button
+              data-project-write="true"
               onClick={handleStartOCR}
-              disabled={isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!getStudentAnswerOcrStartDisabledReasonWithHistory(workflowStage, totalRecords)}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1.25rem', background: '#4f46e5', color: 'white', border: 'none', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: (isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!getStudentAnswerOcrStartDisabledReasonWithHistory(workflowStage, totalRecords)) ? 'not-allowed' : 'pointer', opacity: (isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!getStudentAnswerOcrStartDisabledReasonWithHistory(workflowStage, totalRecords)) ? 0.6 : 1, boxShadow: '0 1px 2px 0 rgba(0,0,0,0.05)' }}
+              disabled={isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!productionDisabledReason}
+              title={productionDisabledReason}
+              style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1.25rem', background: '#4f46e5', color: 'white', border: 'none', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: (isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!productionDisabledReason) ? 'not-allowed' : 'pointer', opacity: (isOcrRunning || startMutation.isPending || rerunMutation.isPending || !!productionDisabledReason) ? 0.6 : 1, boxShadow: '0 1px 2px 0 rgba(0,0,0,0.05)' }}
             >
               {(isOcrRunning || startMutation.isPending || rerunMutation.isPending) ? (
                 <><Clock size={16} className="animate-spin" /> Çalışıyor...</>
@@ -368,6 +410,23 @@ export function StudentAnswerOcrPage() {
                 <><PlayCircle size={16} /> OCR Başlat</>
               )}
             </button>
+            {productionDisabledReason && (
+              <span style={{ width: '100%', color: '#b91c1c', fontSize: '0.75rem' }}>
+                Üretim OCR devre dışı: {productionDisabledReason}
+              </span>
+            )}
+            {missingTemplateQuestions.length > 0 && !isOcrRunning && totalRecords === 0 && (
+              <button
+                type="button"
+                data-project-write="true"
+                onClick={() => experimentalMutation.mutate()}
+                disabled={experimentalMutation.isPending}
+                title="Sonuçlar notlandırmaya onaylanamaz"
+                style={{ padding: '0.5rem 0.75rem', background: '#fff7ed', color: '#9a3412', border: '1px solid #fdba74', borderRadius: '0.5rem', fontSize: '0.75rem', fontWeight: 600 }}
+              >
+                {experimentalMutation.isPending ? 'Deneysel OCR çalışıyor...' : 'Deneysel tam sayfa inceleme'}
+              </button>
+            )}
             <Link
               to={projectStudentOperationsPath(projectId, 'issues', searchParams.toString())}
               style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.5rem 1rem', background: '#fff7ed', color: '#9a3412', border: '1px solid #fdba74', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 600, textDecoration: 'none' }}
@@ -399,6 +458,12 @@ export function StudentAnswerOcrPage() {
       {modelNotice && (
         <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', border: '1px solid #fde68a', borderRadius: '0.5rem', background: '#fffbeb', color: '#92400e', fontSize: '0.875rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexShrink: 0 }}>
           <AlertTriangle size={16} /> {modelNotice}
+        </div>
+      )}
+
+      {missingTemplateQuestions.length > 0 && (
+        <div style={{ marginBottom: '1rem', padding: '0.75rem 1rem', border: '1px solid #fdba74', borderRadius: '0.5rem', background: '#fff7ed', color: '#9a3412', fontSize: '0.875rem' }}>
+          Cevap region’ları eksik olan sorular: {missingTemplateQuestions.join(', ')}. Deneysel tam sayfa çıktıları yalnızca metin düzeltme referansıdır; scoring’e gönderilemez ve onaylanamaz.
         </div>
       )}
       
@@ -478,6 +543,7 @@ export function StudentAnswerOcrPage() {
                return (
                  <button
                    key={sub.id}
+                   data-project-write="false"
                    onClick={() => setSelectedSubmissionIndex(idx)}
                    style={{ width: '100%', textAlign: 'left', padding: '1rem', background: isSelected ? '#eef2ff' : 'transparent', border: 'none', borderBottom: '1px solid #f1f5f9', cursor: 'pointer', transition: 'background 0.2s' }}
                  >
@@ -514,10 +580,12 @@ export function StudentAnswerOcrPage() {
                 : 'Seçili kapsamda öğrenci yok'}
             </h3>
             {!classId && !batchId && (
-              <button 
+              <button
+                data-project-write="true"
                 onClick={() => approveAllMutation.mutate()}
-                disabled={approveAllMutation.isPending || isOcrRunning || totalRecords === 0}
-                style={{ padding: '0.5rem 1rem', background: '#f1f5f9', color: '#334155', border: '1px solid #cbd5e1', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: (approveAllMutation.isPending || isOcrRunning || totalRecords === 0) ? 'not-allowed' : 'pointer' }}
+                disabled={approveAllMutation.isPending || isOcrRunning || totalRecords === 0 || !!bulkApprovalDisabledReason}
+                title={bulkApprovalDisabledReason}
+                style={{ padding: '0.5rem 1rem', background: '#f1f5f9', color: '#334155', border: '1px solid #cbd5e1', borderRadius: '0.5rem', fontSize: '0.875rem', fontWeight: 500, cursor: (approveAllMutation.isPending || isOcrRunning || totalRecords === 0 || !!bulkApprovalDisabledReason) ? 'not-allowed' : 'pointer' }}
               >
                 Tüm Sorunsuzları Onayla
               </button>
@@ -554,6 +622,7 @@ export function StudentAnswerOcrPage() {
                   : ocrPreprocessModeLabels[selectedComparisonMode] ?? selectedComparisonMode;
                 
                 const isApproved = record.status === 'teacher_approved';
+                const isNonApprovable = record.ocrProvenance?.approvableForScoring === false;
                 const hasReviewWarnings = record.needsReview && !isApproved;
 
                 return (
@@ -571,11 +640,12 @@ export function StudentAnswerOcrPage() {
                            </span>
                          )}
                          <span style={{ fontSize: '0.7rem', color: '#64748b' }}>
-                           Durum: {studentAnswerOcrStatusLabels[record.status] || record.status}
+                           Durum: {studentAnswerOcrStatusLabels[record.status] ?? 'İnceleme gerekli'}
                          </span>
                        </div>
-                       {!isApproved && (
-                         <button 
+                       {!isApproved && !isNonApprovable && (
+                         <button
+                           data-project-write="true"
                            onClick={async () => {
                              await saveMutation.mutateAsync({ submissionId: record.submissionId, questionId: record.questionId, text: draftValue });
                              await approveMutation.mutateAsync({ submissionId: record.submissionId, questionId: record.questionId });
@@ -583,8 +653,13 @@ export function StudentAnswerOcrPage() {
                            disabled={isApproving || isSaving}
                            style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.75rem', background: '#10b981', color: 'white', padding: '0.375rem 0.75rem', borderRadius: '0.375rem', border: 'none', fontWeight: 600, cursor: (isApproving || isSaving) ? 'not-allowed' : 'pointer' }}
                          >
-                           <Check size={14} /> Onayla
+                         <Check size={14} /> Onayla
                          </button>
+                       )}
+                       {isNonApprovable && !isApproved && (
+                         <span style={{ fontSize: '0.7rem', color: '#9a3412', background: '#ffedd5', padding: '0.375rem 0.5rem', borderRadius: '0.375rem' }}>
+                           Yalnızca inceleme · Onaylanamaz
+                         </span>
                        )}
                     </div>
                     
@@ -611,7 +686,8 @@ export function StudentAnswerOcrPage() {
                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
                           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                              <span style={{ fontSize: '0.75rem', fontWeight: 600, color: '#64748b', textTransform: 'uppercase' }}>OCR Çıktısı / Düzenleme</span>
-                             <button 
+                             <button
+                               data-project-write="true"
                                onClick={() => saveMutation.mutate({ submissionId: record.submissionId, questionId: record.questionId, text: draftValue })}
                                disabled={isSaving}
                                style={{ fontSize: '0.75rem', color: '#2563eb', background: 'transparent', border: 'none', cursor: isSaving ? 'not-allowed' : 'pointer', fontWeight: 500 }}
@@ -636,9 +712,9 @@ export function StudentAnswerOcrPage() {
                             </div>
                             <ul style={{ margin: 0, paddingLeft: '1.5rem' }}>
                                {[...record.reviewReasons, ...record.warnings, ...(record.preprocessWarnings ?? [])].map(w => (
-                                 <li key={w}>{friendlyWarning(w)}</li>
+                                 <li key={w}>{friendlyWarning(w, record.reviewPolicy ?? ocrReadiness?.ocrReviewPolicy)}</li>
                                ))}
-                               {record.renderDiagnostics?.printedQuestionLeakDetected && <li>{friendlyWarning('printed_question_leak_detected')}</li>}
+                               {record.renderDiagnostics?.printedQuestionLeakDetected && <li>{friendlyWarning('printed_question_leak_detected', record.reviewPolicy ?? ocrReadiness?.ocrReviewPolicy)}</li>}
                              </ul>
                          </div>
                        )}
@@ -655,7 +731,7 @@ export function StudentAnswerOcrPage() {
                                  <li key={`${span.text}-${index}`}>
                                    {span.text}
                                    {span.alternatives.length > 0 ? ` → ${span.alternatives.join(', ')}` : ''}
-                                   {span.reason ? ` (${span.reason})` : ''}
+                                   {span.reason ? ` (${friendlyWarning(span.reason, record.reviewPolicy ?? ocrReadiness?.ocrReviewPolicy)})` : ''}
                                  </li>
                                ))}
                              </ul>
@@ -667,7 +743,7 @@ export function StudentAnswerOcrPage() {
                                  {record.suggestedCorrections.map((item, index) => (
                                    <li key={`${item.originalText}-${index}`}>
                                      {item.originalText} → {item.suggestedText}
-                                     {item.reason ? ` (${item.reason})` : ''}
+                                     {item.reason ? ` (${friendlyWarning(item.reason, record.reviewPolicy ?? ocrReadiness?.ocrReviewPolicy)})` : ''}
                                    </li>
                                  ))}
                                </ul>
@@ -675,6 +751,19 @@ export function StudentAnswerOcrPage() {
                            )}
                          </div>
                        )}
+
+                       {record.ocrProvenance && (
+                         <div style={{ fontSize: '0.8125rem', color: '#475569' }}>
+                           OCR kaynağı: {record.ocrProvenance.sourcePageNumbers.length} sayfa · {record.ocrProvenance.regions.length} cevap bölgesi · {record.ocrProvenance.approvableForScoring ? 'notlandırma akışına uygun' : 'yalnızca inceleme'}
+                         </div>
+                       )}
+
+                       <details style={{ fontSize: '0.8125rem' }}>
+                         <summary style={{ cursor: 'pointer', color: '#64748b', fontWeight: 500 }}>Geliştirici provenance ayrıntıları</summary>
+                         <pre style={{ marginTop: '0.5rem', maxHeight: '16rem', overflow: 'auto', background: '#0f172a', color: '#e2e8f0', borderRadius: '0.5rem', padding: '0.75rem', fontSize: '0.7rem' }}>
+                           {JSON.stringify(record.ocrProvenance ?? { metadata: 'Bilinmiyor' }, null, 2)}
+                         </pre>
+                       </details>
 
                        <details style={{ fontSize: '0.8125rem' }}>
                          <summary style={{ cursor: 'pointer', color: '#64748b', fontWeight: 500 }}>Görüntü karşılaştırması</summary>
@@ -687,6 +776,7 @@ export function StudentAnswerOcrPage() {
                                    <button
                                      key={candidate}
                                      type="button"
+                                     data-project-write="false"
                                      onClick={() => setComparisonModes((current) => ({ ...current, [record.id]: candidate }))}
                                      style={{
                                        padding: '0.35rem 0.6rem',

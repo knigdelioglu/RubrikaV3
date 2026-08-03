@@ -14,7 +14,9 @@ use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
 };
 use crate::services::project_store::ProjectStore;
+use crate::services::prompt_contract::{build_prompt_contract, default_sampling};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
 use tauri::AppHandle;
@@ -226,35 +228,20 @@ impl RubricExtractionService {
             &job_id,
             0,
             expected_question_count,
-            "Gemma model sunucusu kontrol ediliyor...".to_string(),
+            "Gemma model lease'i hazırlanıyor...".to_string(),
         );
-
-        let model_status_at_start = self
+        let runtime_lease = self
             .model_runtime_service
-            .get_model_status(None)
-            .await
-            .unwrap_or_default();
-        if !model_status_at_start.server_running || !model_status_at_start.health_ok {
-            let _ = self.job_manager.update_progress(
-                &app,
-                &job_id,
-                0,
-                expected_question_count,
-                "Gemma model sunucusu başlatılıyor...".to_string(),
-            );
-        }
-        let _runtime_lease = self
-            .model_runtime_service
-            .acquire_runtime(
+            .acquire_ready_runtime_lease(
                 None,
-                &ModelRuntimeRequest {
+                "rubric_extraction",
+                ModelRuntimeRequest {
                     use_case: ModelUseCase::RubricPdfImport,
                     capability: ModelCapability::Vision,
                     requires_mmproj: true,
                     timeout_seconds: 180,
                 },
-                "rubric_extraction",
-                Some(&job_id),
+                &job_id,
             )
             .await?;
 
@@ -294,38 +281,10 @@ impl RubricExtractionService {
                 })?;
         let raw_text = content.raw_text.clone().unwrap_or_default();
         let is_text_based = !content.vision_fallback_needed;
-        let prompt = r#"
-Sen deneyimli bir öğretmensin. Verilen metin veya görsel bir sınavın cevap anahtarı veya rubriği (puanlama rehberi).
-Verilen içerikten her bir soru için puanlama kriterlerini, beklenen cevapları ve maksimum puanları çıkarman gerekiyor.
-
-Aşağıdaki JSON formatında kesin ve eksiksiz bir yanıt dön:
-```json
-{
-  "questions": [
-    {
-      "number": 1,
-      "max_points": 10.0,
-      "expected_answer": "Türkiye'nin başkenti Ankara'dır.",
-      "criteria": [
-        {
-          "label": "Doğru Şehir",
-          "points": 10.0,
-          "description": "Ankara cevabı tam puan alır."
-        }
-      ],
-      "confidence": 0.95,
-      "warnings": []
-    }
-  ],
-  "document_warnings": []
-}
-```
-Kurallar:
-- Soru numaralarını doğru tespit et.
-- Max puanları ve beklenen cevapları bul. Bulamazsan max_points'i null yap ve warnings listesine "Max puan bulunamadı" ekle.
-- Asla halüsinasyon yapma (metinde olmayan bir şeyi uydurma).
-- Çıktı sadece ve sadece geçerli bir JSON olmalıdır.
-"#.to_string();
+        let prompt = format!(
+            "Sen deneyimli bir öğretmensin. Verilen cevap anahtarı veya rubrik içeriğinden her soru için canonical rubric suggestion üret. {}\nKurallar:\n- Metinde olmayanı uydurma.\n- Bulunmayan alanları boş dizi veya null bırak ve warnings alanına ekle.\n- source, status ve updatedAt üretme; backend bunları suggested olarak atar.\n- Placeholder kullanma.\n- Çıktı yalnızca geçerli JSON olsun.",
+            crate::domain::rubric::canonical_rubric_extraction_prompt()
+        );
 
         let _ = self.job_manager.update_progress(
             &app,
@@ -336,11 +295,6 @@ Kurallar:
         );
 
         let start_time = std::time::Instant::now();
-        let model_status_before = self
-            .model_runtime_service
-            .get_model_status(None)
-            .await
-            .unwrap_or_default();
 
         let mut page_count = 1;
         let mut extraction_method = if is_text_based {
@@ -389,14 +343,37 @@ Kurallar:
                             crate::domain::question::TextFieldStatus::Edited => "edited",
                         })
                         .unwrap_or("missing");
+                    let rubric_prompt = build_rubric_question_prompt(
+                        &prompt,
+                        question_number,
+                        expected_question_count,
+                        question_text,
+                        question_text_status,
+                    );
+                    let prompt_contract = build_prompt_contract(
+                        crate::domain::model::ModelRequestKind::RubricDraft,
+                        "rubric_extraction_v2_typed_user_data",
+                        crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
+                        "rubric_extraction_policy_v1",
+                        rubric_prompt.clone(),
+                        json!({
+                            "rawText": raw_text,
+                            "targetQuestionNumber": question_number,
+                            "expectedQuestionCount": expected_question_count,
+                            "questionText": question_text,
+                            "questionTextStatus": question_text_status,
+                            "strictJsonOnly": false,
+                            "attempt": 1,
+                        }),
+                        default_sampling(8192),
+                        Some(crate::domain::model::ModelResponseFormat::JsonSchema {
+                            name: "rubric_extraction_suggestion".to_string(),
+                            schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
+                        }),
+                    );
                     let req = RubricExtractionRequest {
-                        prompt: build_rubric_question_prompt(
-                            &prompt,
-                            question_number,
-                            expected_question_count,
-                            question_text,
-                            question_text_status,
-                        ),
+                        prompt: rubric_prompt,
+                        prompt_contract: Some(prompt_contract),
                         raw_text: Some(raw_text.clone()),
                         image_path: None,
                         target_question_number: question_number,
@@ -472,6 +449,7 @@ Kurallar:
                             reasoning_content_length: None,
                             raw_text_stored_path: None,
                             error_code: None,
+                            provenance: None,
                         },
                     })
                 }
@@ -591,14 +569,37 @@ Kurallar:
                             crate::domain::question::TextFieldStatus::Edited => "edited",
                         })
                         .unwrap_or("missing");
+                    let rubric_prompt = build_rubric_question_prompt(
+                        &prompt,
+                        question_number,
+                        expected_question_count,
+                        question_text,
+                        question_text_status,
+                    );
+                    let prompt_contract = build_prompt_contract(
+                        crate::domain::model::ModelRequestKind::RubricDraft,
+                        "rubric_extraction_v2_typed_user_data",
+                        crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
+                        "rubric_extraction_policy_v1",
+                        rubric_prompt.clone(),
+                        json!({
+                            "targetQuestionNumber": question_number,
+                            "expectedQuestionCount": expected_question_count,
+                            "questionText": question_text,
+                            "questionTextStatus": question_text_status,
+                            "strictJsonOnly": false,
+                            "attempt": 1,
+                            "imageInput": true,
+                        }),
+                        default_sampling(8192),
+                        Some(crate::domain::model::ModelResponseFormat::JsonSchema {
+                            name: "rubric_extraction_suggestion".to_string(),
+                            schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
+                        }),
+                    );
                     let req = RubricExtractionRequest {
-                        prompt: build_rubric_question_prompt(
-                            &prompt,
-                            question_number,
-                            expected_question_count,
-                            question_text,
-                            question_text_status,
-                        ),
+                        prompt: rubric_prompt,
+                        prompt_contract: Some(prompt_contract),
                         raw_text: None,
                         image_path: fallback_image_path.clone(),
                         target_question_number: question_number,
@@ -679,6 +680,7 @@ Kurallar:
                             reasoning_content_length: None,
                             raw_text_stored_path: None,
                             error_code: None,
+                            provenance: None,
                         },
                     })
                 }
@@ -724,8 +726,8 @@ Kurallar:
 
                 let details = format!(
                     "request_kind = RubricExtraction\n\
-                     model_status_at_start = {:?}\n\
-                     model_status_before_model_request = {:?}\n\
+                     model_status_at_start = verified_by_runtime_lease\n\
+                     model_status_before_model_request = verified_by_runtime_lease\n\
                      model_status_after_failure = {:?}\n\
                      endpoint = {}\n\
                      elapsed_time = {} ms\n\
@@ -744,10 +746,8 @@ Kurallar:
                      log_tail_path = {}\n\
                      log_tail_highlights = {:#?}\n\
                      original_details = {:?}",
-                    model_status_at_start,
-                    model_status_before,
                     model_status_after,
-                    model_status_before.base_url,
+                    runtime_lease.base_url(),
                     elapsed,
                     rubric_doc.id,
                     pdf_path.to_string_lossy(),
@@ -766,7 +766,7 @@ Kurallar:
                         &image_paths,
                         &image_byte_sizes
                     ),
-                    model_status_before.profile_id,
+                    runtime_lease.profile_id(),
                     model_status_after
                         .log_path
                         .as_ref()
@@ -778,24 +778,22 @@ Kurallar:
 
                 original_error.technical_details = Some(details);
 
-                if model_status_before.server_running {
-                    if !model_status_after.server_running {
-                        original_error.code = AppErrorCode::ModelServerCrashedDuringRequest;
-                        original_error.message =
-                            "Gemma model sunucusu rubrik çıkarma sırasında kapandı.".to_string();
-                        original_error.suggested_action = Some(
-                            "Model loglarını kontrol edin, modeli yeniden başlatıp daha küçük/optimize edilmiş girişle tekrar deneyin."
-                                .to_string(),
-                        );
-                    } else if !model_status_after.health_ok {
-                        original_error.code = AppErrorCode::ModelServerLostDuringRequest;
-                        original_error.message =
-                            "Gemma model sunucu bağlantısı istek sırasında koptu.".to_string();
-                        original_error.suggested_action = Some(
-                            "Model loglarını kontrol edin, modeli yeniden başlatıp daha küçük/optimize edilmiş girişle tekrar deneyin."
-                                .to_string(),
-                        );
-                    }
+                if !model_status_after.server_running {
+                    original_error.code = AppErrorCode::ModelServerCrashedDuringRequest;
+                    original_error.message =
+                        "Gemma model sunucusu rubrik çıkarma sırasında kapandı.".to_string();
+                    original_error.suggested_action = Some(
+                        "Model loglarını kontrol edin, modeli yeniden başlatıp daha küçük/optimize edilmiş girişle tekrar deneyin."
+                            .to_string(),
+                    );
+                } else if !model_status_after.health_ok {
+                    original_error.code = AppErrorCode::ModelServerLostDuringRequest;
+                    original_error.message =
+                        "Gemma model sunucu bağlantısı istek sırasında koptu.".to_string();
+                    original_error.suggested_action = Some(
+                        "Model loglarını kontrol edin, modeli yeniden başlatıp daha küçük/optimize edilmiş girişle tekrar deneyin."
+                            .to_string(),
+                    );
                 } else if original_error.code == AppErrorCode::ModelTimeout {
                     original_error.code = AppErrorCode::ModelRequestTimeout;
                 }
@@ -837,16 +835,28 @@ Kurallar:
                     .warnings
                     .iter()
                     .any(|warning| warning == "partial_model_json_recovered");
-                question.rubric.status = RubricStatus::Imported;
-                question.rubric.source = Some(RubricSource::RubricPdf);
+                question.rubric.status = RubricStatus::Suggested;
+                question.rubric.source = Some(RubricSource::GemmaDraft);
                 if let Some(mp) = q_cand.max_points {
                     question.rubric.max_score = Some(mp);
                 }
                 if let Some(ea) = q_cand.expected_answer {
                     question.rubric.expected_answer = Some(ea);
                 }
+                if !q_cand.key_concepts.is_empty() {
+                    question.rubric.key_concepts = q_cand.key_concepts;
+                }
                 if !q_cand.criteria.is_empty() {
                     question.rubric.criteria = q_cand.criteria;
+                }
+                if !q_cand.partial_credit_hints.is_empty() {
+                    question.rubric.partial_credit_hints = q_cand.partial_credit_hints;
+                }
+                if !q_cand.zero_score_conditions.is_empty() {
+                    question.rubric.zero_score_conditions = q_cand.zero_score_conditions;
+                }
+                if !q_cand.common_mistakes.is_empty() {
+                    question.rubric.common_mistakes = q_cand.common_mistakes;
                 }
                 question.rubric.warnings = q_cand.warnings;
                 if !has_meaningful_rubric_content(&question.rubric) {
@@ -1000,6 +1010,12 @@ impl RubricExtractionService {
                 let mut retry_request = request;
                 retry_request.strict_json_only = true;
                 retry_request.attempt = 2;
+                if let Some(prompt_contract) = retry_request.prompt_contract.as_mut() {
+                    if let Some(user_data) = prompt_contract.user_data.as_object_mut() {
+                        user_data.insert("strictJsonOnly".to_string(), json!(true));
+                        user_data.insert("attempt".to_string(), json!(2));
+                    }
+                }
                 let retry_result = self.model_gateway.draft_rubric(retry_request).await;
                 match retry_result {
                     Ok(result) => Ok(result),
@@ -1078,21 +1094,16 @@ fn build_rubric_question_prompt(
     question_text: Option<&str>,
     question_text_status: &str,
 ) -> String {
-    let q_text_str = if question_text_status == "missing" || question_text_status == "failed" {
-        "Hedef Sorunun Metni: [Eksik] (questionTextStatus=\"missing\")".to_string()
-    } else {
-        match question_text {
-            Some(text) if !text.trim().is_empty() => format!("Hedef Sorunun Metni: \"{}\"", text),
-            _ => "Hedef Sorunun Metni: [Bilinmiyor / Eksik] (questionTextStatus=\"missing\")"
-                .to_string(),
-        }
-    };
-    format!(
-        "{}\n\n{}\nSadece {} numaralı soruyu işle. Toplam soru sayısı: {}. Başka soru döndürme. JSON içinde yalnızca bu soru yer alsın.",
-        base_prompt.trim(),
-        q_text_str,
+    let _ = (
         question_number,
-        expected_question_count
+        expected_question_count,
+        question_text,
+        question_text_status,
+    );
+    format!(
+        "{}\n\nPrompt sürümü: {}. Kaynak içerik, hedef soru ve soru metni yalnız typed user-data JSON olarak değerlendirilir. Başka soru döndürme; yalnızca şemaya uygun JSON üret.",
+        base_prompt.trim(),
+        crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
     )
 }
 
@@ -1328,6 +1339,7 @@ except Exception as e:
             model_path: "".to_string(),
             mmproj_path: "".to_string(),
             runtime_preset: crate::domain::model::ModelRuntimePreset::Standard,
+            privacy_mode: crate::domain::model::PrivacyMode::StrictLocal,
         };
         model_config.update_profile(profile).unwrap();
 
@@ -1406,6 +1418,7 @@ except Exception as e:
             port,
             base_url: format!("http://127.0.0.1:{port}"),
             runtime_preset: crate::domain::model::ModelRuntimePreset::Standard,
+            privacy_mode: crate::domain::model::PrivacyMode::StrictLocal,
         };
         model_config.update_profile(profile).unwrap();
 
@@ -1551,6 +1564,7 @@ except Exception as e:
             },
             rubric: crate::domain::rubric::RubricState {
                 expected_answer: None,
+                key_concepts: vec![],
                 criteria: vec![],
                 partial_credit_hints: vec![],
                 zero_score_conditions: vec![],
@@ -1610,6 +1624,7 @@ except Exception as e:
             model_path: dummy_server_path.to_string_lossy().to_string(),
             mmproj_path: dummy_server_path.to_string_lossy().to_string(),
             runtime_preset: crate::domain::model::ModelRuntimePreset::Standard,
+            privacy_mode: crate::domain::model::PrivacyMode::StrictLocal,
         };
         model_config.update_profile(profile).unwrap();
 
@@ -1697,6 +1712,7 @@ except Exception as e:
             source: Some(RubricSource::Manual),
             max_score: Some(10.0),
             expected_answer: Some("Teacher answer".to_string()),
+            key_concepts: vec![],
             criteria: vec![],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],

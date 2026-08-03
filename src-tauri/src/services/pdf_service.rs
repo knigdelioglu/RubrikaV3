@@ -558,12 +558,18 @@ impl PdfService for SystemPdfService {
     fn get_renderer_status(&self) -> Result<PdfRendererStatus, AppError> {
         let pdfinfo_opt = find_binary("pdfinfo");
         let pdftoppm_opt = find_binary("pdftoppm");
-        let available = pdfinfo_opt.is_some() && pdftoppm_opt.is_some();
+        let poppler_available = pdfinfo_opt.is_some() && pdftoppm_opt.is_some();
+        // macOS has a native PDFKit renderer. The render methods try it first
+        // and only fall back to Poppler when PDFKit cannot render the source.
+        // Keep the status consistent with that runtime behavior; otherwise the
+        // preview job is rejected before the native fallback is reached.
+        let native_macos_available = cfg!(target_os = "macos");
+        let available = poppler_available || native_macos_available;
 
         let mut backend = "none".to_string();
-        if available {
+        if poppler_available {
             backend = "poppler".to_string();
-        } else if cfg!(target_os = "macos") {
+        } else if native_macos_available {
             backend = "macos_fallback".to_string();
         }
 
@@ -575,7 +581,9 @@ impl PdfService for SystemPdfService {
         let mut warnings = Vec::new();
         let mut install_hint = None;
 
-        if !available {
+        if !poppler_available && native_macos_available {
+            warnings.push("Poppler bulunamadı; macOS PDFKit kullanılacak".to_string());
+        } else if !available {
             warnings.push("pdfinfo or pdftoppm binary not found".to_string());
             install_hint = Some("brew install poppler".to_string());
         }

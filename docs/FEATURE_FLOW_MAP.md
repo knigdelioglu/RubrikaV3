@@ -407,7 +407,7 @@ Arka planda çalışan llama.cpp model sunucusunun sağlık durumunu izlemek, e�
 
 ### Akış
 UI → command → service (model_runtime_service) → service (model_process_manager) → OS (Process start) → domain (ModelRuntimeStatus).
-Model isteyen diğer job'lar: Job → service (model_runtime_service.ensure_ready) → (Eğer kapalıysa) start.
+Model isteyen diğer job'lar: Job → service (model_runtime_service.acquire_ready_runtime_lease) → (Eğer kapalıysa) start + bounded health wait.
 *(Not: Model Durumu UI modernize edildi; autostart ve runtime kararları tamamen backend ModelRuntimeService kaynaklıdır, frontend sadece durumu görselleştirir.)*
 
 ### Kritik invariants
@@ -478,7 +478,7 @@ Tüm hazırlıklar ve OCR bittikten sonra, puanlamanın başlatılabilmesi için
 - Diagnostics: `diagnostics.rs`, `bin/rubrika.rs`
 
 ### Akış
-UI → command → scoring_service (gate + job başlatma) → model_runtime_service.ensure_ready → model_gateway → job_manager → project_store (kalıcı sonuç) → workflow_engine / diagnostics.
+UI → command → scoring_service (gate + job başlatma) → model_runtime_service.acquire_ready_runtime_lease → model_gateway → job_manager → project_store (kalıcı sonuç) → workflow_engine / diagnostics.
 
 ### Kritik invariants
 - **QEP frozen gate must never be weakened** (Mühendislik kuralı 2.9). Kesinlikle UI veya arka planda bu kapı atlatılarak puanlama başlatılamaz.
@@ -534,7 +534,7 @@ Sorunlu OCR span'ı için öğretmene gösterilecek, otomatik uygulanmayan Gemma
 - Diagnostics: `logs/model_responses/student_answer_ocr_issue_correction/...`
 
 ### Akış
-UI → command → service → issue crop seçimi → model runtime ensure_ready → ModelGateway strict JSON issue correction isteği → parsed suggestion DTO → UI sadece sonucu gösterir.
+UI → command → service → issue crop seçimi → model runtime acquire_ready_runtime_lease → ModelGateway strict JSON issue correction isteği → parsed suggestion DTO → UI sadece sonucu gösterir.
 
 ### Kritik invariants
 - OCR metni otomatik değişmez.
@@ -637,7 +637,7 @@ Bu akışların recovery, retention/GC ve regression kanıtı [`docs/GENERATION_
 
 ```text
 Job başlar
-→ ModelRuntimeService::acquire_runtime
+→ ModelRuntimeService::acquire_ready_runtime_lease
 → ModelProcessManager startup lock / identity / readiness
 → lease registry'ye runtime instance + lease yazılır
 → ModelGateway request'leri

@@ -296,6 +296,25 @@ impl AuditService {
         Ok(record)
     }
 
+    /// Writes application-level consent events when no project is open. The
+    /// record deliberately contains only policy/profile metadata, never
+    /// student content.
+    pub fn append_application_event(
+        &self,
+        input: AuditEntryInput,
+    ) -> Result<AuditRecord, AppError> {
+        let root = crate::platform::paths::app_log_dir().join("privacy");
+        std::fs::create_dir_all(&root).map_err(|error| AppError {
+            code: AppErrorCode::AuditWriteFailed,
+            message: "Gizlilik denetim klasörü oluşturulamadı.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Disk alanını ve klasör izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!("privacy audit directory create failed: {error}")),
+            correlation_id: input.correlation_id.clone(),
+        })?;
+        self.append(&root, input)
+    }
+
     pub fn verify_chain(&self, project_root: &Path) -> Result<AuditChainReport, AppError> {
         let root = project_root
             .canonicalize()
@@ -544,6 +563,233 @@ impl AuditService {
             return Err(incomplete_audit_error(&transaction.correlation_id, error));
         }
         Ok(record)
+    }
+
+    /// Repairs the specific legacy shape produced when the first project
+    /// mutation advanced storage revision 0 -> 1 without appending its audit
+    /// record. This is intentionally narrow: it refuses tampered chains,
+    /// multiple gaps, and any project that is not exactly one revision ahead
+    /// of its valid audit history.
+    pub fn repair_missing_initial_revision(
+        &self,
+        project_root: &Path,
+    ) -> Result<AuditRecord, AppError> {
+        let root = project_root.canonicalize().map_err(|error| AppError {
+            code: AppErrorCode::ProjectLoadFailed,
+            message: "Proje klasörü çözümlenemedi.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Proje klasörünü ve izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!("audit repair root canonicalize failed: {error}")),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        let project_content =
+            std::fs::read_to_string(root.join("project.json")).map_err(|error| AppError {
+                code: AppErrorCode::ProjectLoadFailed,
+                message: "Proje verisi okunamadı.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Proje tanılamasını çalıştırıp tekrar deneyin.".to_string()),
+                technical_details: Some(format!("audit repair project read failed: {error}")),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        let project: crate::domain::project::Project = serde_json::from_str(&project_content)
+            .map_err(|error| AppError {
+                code: AppErrorCode::ProjectLoadFailed,
+                message: "Proje verisi okunamadı.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Proje tanılamasını çalıştırıp tekrar deneyin.".to_string()),
+                technical_details: Some(format!("audit repair project parse failed: {error}")),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        let chain = self.verify_chain(&root)?;
+        let records = self.read_records(&root)?;
+        let project_records = records
+            .iter()
+            .filter(|record| record.project_id.as_deref() == Some(project.id.as_str()))
+            .collect::<Vec<_>>();
+        let has_initial_revision = project_records
+            .iter()
+            .any(|record| record.next_revision == Some(0));
+        let has_target_revision = project_records
+            .iter()
+            .any(|record| record.next_revision == Some(1));
+        let can_repair = chain.chain_valid
+            && project.storage_revision == 1
+            && has_initial_revision
+            && !has_target_revision
+            && project_records
+                .iter()
+                .all(|record| record.next_revision.is_none() || record.next_revision == Some(0));
+        if !can_repair {
+            return Err(AppError {
+                code: AppErrorCode::AuditChainInvalid,
+                message: "Denetim zinciri otomatik olarak hizalanamadı.".to_string(),
+                recoverable: false,
+                suggested_action: Some(
+                    "Tanılama raporunu inceleyin; bu onarım yalnızca tek eksik başlangıç revizyonunda kullanılabilir."
+                        .to_string(),
+                ),
+                technical_details: Some(format!(
+                    "repair precondition failed: storage_revision={}, chain_valid={}, initial_revision={}, target_revision={}, project_record_count={}",
+                    project.storage_revision,
+                    chain.chain_valid,
+                    has_initial_revision,
+                    has_target_revision,
+                    project_records.len()
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            });
+        }
+        let incomplete_repairs = crate::services::transaction_journal::list(&root)?
+            .into_iter()
+            .filter(|record| {
+                record.project_id == project.id
+                    && record.operation == "audit_revision_repaired"
+                    && record.expected_revision == Some(0)
+                    && record.target_revision == Some(1)
+                    && record.status == "audit_missing"
+            })
+            .map(|record| record.transaction_id)
+            .collect::<Vec<_>>();
+        let repaired = self.append_transactionally(
+            &root,
+            AuditEntryInput::new(
+                "audit_revision_repaired",
+                "Eksik başlangıç denetim revizyonu hizalandı.",
+            )
+            .project(&project.id)
+            .metadata(serde_json::json!({
+                "kind": "missing_initial_revision",
+                "repairedRevision": 1,
+            })),
+            Some(0),
+            Some(1),
+        )?;
+        for transaction_id in incomplete_repairs {
+            crate::services::transaction_journal::update(&root, &transaction_id, "aborted")?;
+        }
+        Ok(repaired)
+    }
+
+    /// Repairs the specific legacy shape where the project is exactly one
+    /// revision ahead of an otherwise valid audit prefix. This is intentionally
+    /// narrower than general recovery: it refuses tampered chains, multiple
+    /// missing revisions, and any non-terminal divergence.
+    pub fn repair_missing_latest_revision(
+        &self,
+        project_root: &Path,
+    ) -> Result<AuditRecord, AppError> {
+        let root = project_root.canonicalize().map_err(|error| AppError {
+            code: AppErrorCode::ProjectLoadFailed,
+            message: "Proje klasörü çözümlenemedi.".to_string(),
+            recoverable: true,
+            suggested_action: Some("Proje klasörünü ve izinlerini kontrol edin.".to_string()),
+            technical_details: Some(format!(
+                "audit latest repair root canonicalize failed: {error}"
+            )),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        let project_content =
+            std::fs::read_to_string(root.join("project.json")).map_err(|error| AppError {
+                code: AppErrorCode::ProjectLoadFailed,
+                message: "Proje verisi okunamadı.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Proje tanılamasını çalıştırıp tekrar deneyin.".to_string()),
+                technical_details: Some(format!(
+                    "audit latest repair project read failed: {error}"
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        let project: crate::domain::project::Project = serde_json::from_str(&project_content)
+            .map_err(|error| AppError {
+                code: AppErrorCode::ProjectLoadFailed,
+                message: "Proje verisi okunamadı.".to_string(),
+                recoverable: true,
+                suggested_action: Some("Proje tanılamasını çalıştırıp tekrar deneyin.".to_string()),
+                technical_details: Some(format!(
+                    "audit latest repair project parse failed: {error}"
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        let chain = self.verify_chain_against_project(&root, &project)?;
+        let records = self.read_records(&root)?;
+        let project_records = records
+            .iter()
+            .filter(|record| record.project_id.as_deref() == Some(project.id.as_str()))
+            .collect::<Vec<_>>();
+        let expected_previous = project.storage_revision.checked_sub(1);
+        let has_initial_revision = project_records
+            .iter()
+            .any(|record| record.next_revision == Some(0));
+        let can_repair = chain.tamper_count == 0
+            && chain.duplicate_revision_count == 0
+            && chain.missing_revision_count == 0
+            && chain.project_revision_divergence_count == 1
+            && has_initial_revision
+            && expected_previous.is_some()
+            && chain.last_audit_revision == expected_previous
+            && project_records.iter().all(|record| {
+                record
+                    .next_revision
+                    .is_some_and(|revision| revision <= expected_previous.unwrap_or_default())
+            });
+        if !can_repair {
+            return Err(AppError {
+                code: AppErrorCode::AuditChainInvalid,
+                message: "Denetim zincirinin son revizyonu otomatik olarak hizalanamadı.".to_string(),
+                recoverable: false,
+                suggested_action: Some(
+                    "Tanılama raporunu inceleyin; bu onarım yalnızca tek eksik son revizyonda kullanılabilir."
+                        .to_string(),
+                ),
+                technical_details: Some(format!(
+                    "latest repair precondition failed: storage_revision={}, last_audit_revision={:?}, chain_tamper_count={}, project_revision_divergence_count={}, duplicate_revision_count={}, missing_revision_count={}",
+                    project.storage_revision,
+                    chain.last_audit_revision,
+                    chain.tamper_count,
+                    chain.project_revision_divergence_count,
+                    chain.duplicate_revision_count,
+                    chain.missing_revision_count
+                )),
+                correlation_id: Uuid::new_v4().to_string(),
+            });
+        }
+        let previous_revision = expected_previous.ok_or_else(|| AppError {
+            code: AppErrorCode::AuditChainInvalid,
+            message: "Denetim zincirinin son revizyonu çözümlenemedi.".to_string(),
+            recoverable: false,
+            suggested_action: Some("Tanılama raporunu inceleyin.".to_string()),
+            technical_details: None,
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
+        let incomplete_repairs = crate::services::transaction_journal::list(&root)?
+            .into_iter()
+            .filter(|record| {
+                record.project_id == project.id
+                    && record.operation == "audit_revision_repaired"
+                    && record.expected_revision == Some(previous_revision)
+                    && record.target_revision == Some(project.storage_revision)
+                    && record.status == "audit_missing"
+            })
+            .map(|record| record.transaction_id)
+            .collect::<Vec<_>>();
+        let repaired = self.append_transactionally(
+            &root,
+            AuditEntryInput::new(
+                "audit_revision_repaired",
+                "Eksik son denetim revizyonu hizalandı.",
+            )
+            .project(&project.id)
+            .metadata(serde_json::json!({
+                "kind": "missing_latest_revision",
+                "repairedRevision": project.storage_revision,
+            })),
+            Some(previous_revision),
+            Some(project.storage_revision),
+        )?;
+        for transaction_id in incomplete_repairs {
+            crate::services::transaction_journal::update(&root, &transaction_id, "aborted")?;
+        }
+        Ok(repaired)
     }
 
     pub fn read_records(&self, project_root: &Path) -> Result<Vec<AuditRecord>, AppError> {
@@ -815,6 +1061,7 @@ fn load_records(path: &Path) -> Result<Vec<AuditRecord>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::project_store::ProjectStore;
 
     fn temp_root() -> PathBuf {
         let root = std::env::temp_dir().join(format!("rubrika-audit-{}", Uuid::new_v4()));
@@ -933,6 +1180,117 @@ mod tests {
         assert_eq!(report.record_count, 8 * 25);
         assert!(report.chain_valid);
         assert_eq!(report.tamper_count, 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repairs_only_the_single_missing_initial_revision() {
+        let root = std::env::temp_dir().join(format!("rubrika-audit-repair-{}", Uuid::new_v4()));
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Repair fixture".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("project fixture");
+        let service = AuditService::new();
+        service
+            .append_transactionally(
+                Path::new(&project.root_path),
+                AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.")
+                    .project(&project.id),
+                None,
+                Some(0),
+            )
+            .expect("initial audit");
+        store
+            .update_course_info(
+                project.id.clone(),
+                "2026-2027".to_string(),
+                "tde".to_string(),
+                "Türk Dili ve Edebiyatı".to_string(),
+                None,
+            )
+            .expect("first mutation");
+        drop(store);
+
+        service
+            .repair_missing_initial_revision(Path::new(&project.root_path))
+            .expect("audit repair");
+        let repaired = serde_json::from_str::<crate::domain::project::Project>(
+            &std::fs::read_to_string(root.join("project.json")).expect("project after repair"),
+        )
+        .expect("project json");
+        let report = service
+            .verify_chain_against_project(Path::new(&project.root_path), &repaired)
+            .expect("verify repaired audit");
+        assert!(report.chain_valid);
+        assert_eq!(report.last_audit_revision, Some(1));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repairs_only_a_single_missing_latest_revision() {
+        let root =
+            std::env::temp_dir().join(format!("rubrika-audit-latest-repair-{}", Uuid::new_v4()));
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Latest repair fixture".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .expect("project fixture");
+        let service = AuditService::new();
+        service
+            .append_transactionally(
+                Path::new(&project.root_path),
+                AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.")
+                    .project(&project.id),
+                None,
+                Some(0),
+            )
+            .expect("initial audit");
+        store
+            .update_course_info(
+                project.id.clone(),
+                "2026-2027".to_string(),
+                "tde".to_string(),
+                "Türk Dili ve Edebiyatı".to_string(),
+                None,
+            )
+            .expect("first mutation");
+        service
+            .append_transactionally(
+                Path::new(&project.root_path),
+                AuditEntryInput::new("course_info_updated", "Ders bilgileri güncellendi.")
+                    .project(&project.id),
+                Some(0),
+                Some(1),
+            )
+            .expect("first mutation audit");
+        store
+            .update_course_info(
+                project.id.clone(),
+                "2026-2027".to_string(),
+                "tde".to_string(),
+                "Türk Dili ve Edebiyatı (güncel)".to_string(),
+                None,
+            )
+            .expect("missing-audit mutation");
+        drop(store);
+
+        service
+            .repair_missing_latest_revision(Path::new(&project.root_path))
+            .expect("latest audit repair");
+        let repaired = serde_json::from_str::<crate::domain::project::Project>(
+            &std::fs::read_to_string(root.join("project.json")).expect("project after repair"),
+        )
+        .expect("project json");
+        let report = service
+            .verify_chain_against_project(Path::new(&project.root_path), &repaired)
+            .expect("verify repaired audit");
+        assert!(report.chain_valid);
+        assert_eq!(report.last_audit_revision, Some(2));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -30,7 +30,6 @@ export type DocumentWorkspaceItem = {
   previewLabel: string;
   canUpload: boolean;
   canDelete: boolean;
-  canStartPreview: boolean;
 };
 
 export type DocumentWorkspaceSummary = {
@@ -59,7 +58,6 @@ const roleDetails: Record<WorkspaceDocumentRole, Omit<DocumentWorkspaceItem,
   | 'previewLabel'
   | 'canUpload'
   | 'canDelete'
-  | 'canStartPreview'
 >> = {
   exam_source: {
     role: 'exam_source',
@@ -116,6 +114,13 @@ export function getWorkspacePreviewLabel(state: WorkspacePreviewState): string {
   return previewLabels[state];
 }
 
+export function shouldShowSelectedDocumentPanel(
+  role: WorkspaceDocumentRole,
+  hasSelectedDocument: boolean,
+): boolean {
+  return role !== 'student_scan' || hasSelectedDocument;
+}
+
 export function buildDocumentWorkspaceItems(
   documents: Document[],
   preferredDocumentId?: string | null,
@@ -141,7 +146,6 @@ export function buildDocumentWorkspaceItems(
       previewLabel: previewLabels[previewState],
       canUpload: true,
       canDelete: document !== null,
-      canStartPreview: document !== null && (previewState === 'not_started' || previewState === 'failed'),
     };
   });
 }
@@ -156,6 +160,31 @@ export function getDocumentWorkspaceSummary(
     activePreviewCount,
     failedPreviewCount: items.filter((item) => item.previewState === 'failed').length,
   };
+}
+
+export function getAutomaticPreviewTargets(documents: Document[]): Array<{
+  role: WorkspaceDocumentRole;
+  documentId: string;
+}> {
+  return documents.flatMap((document) => (
+    isWorkspaceDocumentRole(document.role)
+      && ['not_started', 'failed'].includes(toWorkspacePreviewState(document.preview?.status))
+      ? [{ role: document.role, documentId: document.id }]
+      : []
+  ));
+}
+
+export async function runAutomaticPreviewQueue(
+  targets: Array<{ role: WorkspaceDocumentRole; documentId: string }>,
+  startPreview: (target: { role: WorkspaceDocumentRole; documentId: string }) => Promise<unknown>,
+): Promise<void> {
+  for (const target of targets) {
+    try {
+      await startPreview(target);
+    } catch {
+      // One failed document must not prevent the remaining documents from being processed.
+    }
+  }
 }
 
 export function resolveWorkspaceRole(

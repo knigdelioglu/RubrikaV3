@@ -6,9 +6,12 @@ use uuid::Uuid;
 
 use crate::domain::document::PdfPagePreview;
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::domain::scoring::{scoring_active_records, ScoringRecord};
+use crate::domain::scoring::{
+    scoring_active_records, scoring_record_effective_score, scoring_record_is_accepted,
+    ScoringRecord,
+};
 use crate::domain::student::{
-    Student, StudentAnswerCropTemplateItem, StudentAnswerOcrCropBBox, StudentSubmission,
+    QuestionAnswerTemplate, Student, StudentAnswerOcrCropBBox, StudentSubmission,
 };
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
@@ -158,7 +161,7 @@ impl GradedExamReviewService {
             submission,
             student,
             &records,
-            &project.student_answer_crop_template.items,
+            &project.student_answer_crop_template.templates,
             &previews,
         )
     }
@@ -170,7 +173,7 @@ fn build_review(
     submission: &StudentSubmission,
     student: Option<&Student>,
     records: &[&ScoringRecord],
-    template_items: &[StudentAnswerCropTemplateItem],
+    templates: &[QuestionAnswerTemplate],
     previews: &[PdfPagePreview],
 ) -> Result<GradedExamReview, AppError> {
     let previews_by_page = previews
@@ -210,23 +213,28 @@ fn build_review(
         if record.needs_review || !record.scoring_applied || record.awarded_score.is_none() {
             needs_review_count += 1;
         }
-        if record.scoring_applied {
-            if let Some(score) = record.awarded_score {
+        if scoring_record_is_accepted(record) {
+            if let Some(score) = scoring_record_effective_score(record) {
                 model_total_score += score;
                 model_score_count += 1;
             }
         }
 
-        let Some(template) = template_items
+        let Some(template) = templates
             .iter()
             .find(|item| item.question_id == record.question_id)
         else {
             unplaced_scores.push(unplaced_score(record, "Soru konumu tanımlı değil."));
             continue;
         };
+        let sorted_regions = template.sorted_regions();
+        let Some(region) = sorted_regions.first() else {
+            unplaced_scores.push(unplaced_score(record, "Soru cevap bölgesi tanımlı değil."));
+            continue;
+        };
         let Some(page_number) = submission
             .page_numbers
-            .get(template.page_index_within_submission as usize)
+            .get(region.page_offset as usize)
             .copied()
         else {
             unplaced_scores.push(unplaced_score(
@@ -243,7 +251,14 @@ fn build_review(
             continue;
         };
 
-        let (x, y, placement) = annotation_position(&template.bbox, &page.annotations);
+        let bbox = StudentAnswerOcrCropBBox {
+            x: region.normalized_bbox.x,
+            y: region.normalized_bbox.y,
+            width: region.normalized_bbox.width,
+            height: region.normalized_bbox.height,
+            page_index: region.page_offset,
+        };
+        let (x, y, placement) = annotation_position(&bbox, &page.annotations);
         let model_score = record
             .scoring_applied
             .then_some(record.awarded_score)
@@ -444,8 +459,11 @@ fn app_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::scoring::ScoringReviewStatus;
-    use crate::domain::student::StudentSubmissionStatus;
+    use crate::domain::scoring::{ScoringDecisionState, ScoringReviewStatus};
+    use crate::domain::student::{
+        AnswerRegionRole, ContinuationPolicy, NormalizedBBox, QuestionAnswerRegion,
+        QuestionAnswerTemplate, StudentSubmissionStatus,
+    };
 
     fn scoring_record() -> ScoringRecord {
         let now = chrono::Utc::now();
@@ -462,7 +480,10 @@ mod tests {
             max_score: 10.0,
             awarded_score: Some(7.5),
             scoring_applied: true,
+            decision_state: ScoringDecisionState::AutoAccepted,
+            decision_version: "v1".to_string(),
             criterion_scores: vec![],
+            semantic_decisions: vec![],
             rationale: "Yanıt büyük ölçüde doğru.".to_string(),
             confidence: 0.9,
             needs_review: false,
@@ -471,6 +492,15 @@ mod tests {
             raw_model_output: "{}".to_string(),
             parse_diagnostics: None,
             reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
             source_hash: "source".to_string(),
             package_hash: "package".to_string(),
             ocr_record_hash: "ocr".to_string(),
@@ -503,20 +533,24 @@ mod tests {
         }
     }
 
-    fn template() -> StudentAnswerCropTemplateItem {
-        StudentAnswerCropTemplateItem {
+    fn template() -> QuestionAnswerTemplate {
+        QuestionAnswerTemplate {
             question_id: "question-1".to_string(),
-            question_number: 1,
-            page_index_within_submission: 0,
-            bbox: StudentAnswerOcrCropBBox {
-                x: 0.1,
-                y: 0.2,
-                width: 0.5,
-                height: 0.2,
-                page_index: 0,
-            },
-            label: None,
-            note: None,
+            regions: vec![QuestionAnswerRegion {
+                region_id: "question-1-region-0".to_string(),
+                page_offset: 0,
+                order: 0,
+                normalized_bbox: NormalizedBBox {
+                    x: 0.1,
+                    y: 0.2,
+                    width: 0.5,
+                    height: 0.2,
+                },
+                region_role: AnswerRegionRole::Primary,
+                continuation_policy: ContinuationPolicy::Independent,
+                label: None,
+                note: None,
+            }],
         }
     }
 

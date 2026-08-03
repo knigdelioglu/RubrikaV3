@@ -3,8 +3,9 @@ use crate::domain::project::Project;
 use crate::domain::question::Question;
 use crate::services::rubric_extraction_service::{StartJobOutput, StartRubricPdfImportInput};
 use crate::services::rubric_service::{
-    ImportRubricJsonInput, ImportRubricJsonOutput, RubricQuestionSnapshot, RubricStateSnapshot,
-    RubricValidationReport, UpdateQuestionRubricInput,
+    ImportRubricJsonInput, ImportRubricJsonOutput, MigrateRubricLevelsInput,
+    MigrateRubricLevelsOutput, RubricQuestionSnapshot, RubricStateSnapshot, RubricValidationReport,
+    UpdateQuestionRubricInput,
 };
 use crate::AppState;
 use tauri::State;
@@ -15,6 +16,24 @@ pub async fn import_rubric_json(
     input: ImportRubricJsonInput,
 ) -> Result<ImportRubricJsonOutput, AppError> {
     state.rubric_service.import_rubric_json(input)
+}
+
+#[tauri::command]
+pub async fn migrate_rubric_levels(
+    state: State<'_, AppState>,
+    input: MigrateRubricLevelsInput,
+) -> Result<MigrateRubricLevelsOutput, AppError> {
+    let project_id = input.project_id.clone();
+    let output = state.rubric_service.migrate_rubric_levels(input)?;
+    super::audit_critical(
+        &state,
+        &project_id,
+        crate::services::audit_service::AuditEntryInput::new(
+            "rubric_levels_migrated",
+            "Eski rubrik seviyeleri öğretmen incelemesi için taşındı.",
+        ),
+    )?;
+    Ok(output)
 }
 
 #[derive(serde::Deserialize)]

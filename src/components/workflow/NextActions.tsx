@@ -47,27 +47,6 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           navigate(`/project/${encodeURIComponent(projectId)}/exam/documents`);
           break;
 
-        case 'start_pdf_preview_render': {
-          const project = await commands.getProjectSnapshot(projectId);
-          const examSource = project.documents.find((document) => document.role === 'exam_source');
-          if (!examSource) {
-            throw {
-              code: 'PDF_DOCUMENT_NOT_FOUND',
-              safeMessage: 'Sınav PDF’i bulunamadı.',
-              recoveryAction: 'Önce sınav PDF’ini içe aktarın.',
-              retryable: true,
-              correlationId: 'unknown',
-              detailsAvailable: false,
-            } as AppError;
-          }
-          await commands.startPdfPreviewRender({ projectId, documentId: examSource.id });
-          setSuccessMsg('PDF önizleme işi başlatıldı.');
-          queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
-          queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
-          queryClient.invalidateQueries({ queryKey: ['jobs', projectId] });
-          break;
-        }
-
         case 'open_pdf_preview_page': {
           const project = await commands.getProjectSnapshot(projectId);
           const examSource = project.documents.find((document) => document.role === 'exam_source');
@@ -190,32 +169,6 @@ export function NextActions({ actions }: { actions: WorkflowAction[] }) {
           setQuestionCountAction('start_rubric_pdf_import');
           setQuestionCountDialogOpen(true);
           break;
-
-        case 'start_student_scan_preview_render': {
-          const project = await commands.getProjectSnapshot(projectId);
-          const studentScan =
-            (project.studentScanDocumentId
-              ? project.documents.find((document) => document.id === project.studentScanDocumentId)
-              : null) ??
-            project.documents.find((document) => document.role === 'student_scan');
-          if (!studentScan) {
-            throw {
-              code: 'STUDENT_SCAN_NOT_FOUND',
-              safeMessage: 'Öğrenci cevap PDF’i bulunamadı.',
-              recoveryAction: 'Önce öğrenci cevap PDF’ini içe aktarın.',
-              retryable: true,
-              correlationId: 'unknown',
-              detailsAvailable: false,
-            } as AppError;
-          }
-          await commands.startStudentScanPreviewRender({ projectId, documentId: studentScan.id });
-          setSuccessMsg('Öğrenci PDF önizleme işi başlatıldı.');
-          queryClient.invalidateQueries({ queryKey: ['workflow-snapshot', projectId] });
-          queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] });
-          queryClient.invalidateQueries({ queryKey: ['student-scan-documents', projectId] });
-          queryClient.invalidateQueries({ queryKey: ['ocr-readiness', projectId] });
-          break;
-        }
 
         case 'mark_student_grouping_complete':
           await commands.markStudentGroupingComplete({ projectId });

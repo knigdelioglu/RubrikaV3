@@ -199,16 +199,30 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Errors**: `STUDENT_SCAN_NOT_FOUND`, `STUDENT_SCAN_PREVIEW_NOT_READY`, `STUDENT_IDENTITY_INVALID`
 - **Job-based**: No
 
+### `save_student_answer_crop_template`
+- **Input**: `SaveStudentAnswerCropTemplateInput { project_id: String, templates: QuestionAnswerTemplate[] }`
+- **Output**: `Project`
+- **QuestionAnswerTemplate**: `{ questionId, regions[] }`; each region carries `regionId`, `pageOffset`, deterministic `order`, `normalizedBBox`, `regionRole`, and `continuationPolicy`.
+- **Persistence rule**: UI may keep an unsaved rectangle locally; only this backend command changes the canonical template and recalculates workflow/crop coverage.
+- **Migration**: legacy `studentAnswerCropTemplate.items[]` entries are migrated losslessly into one `regions[0]` entry per item. Region order is normalized before persistence and is preserved in OCR input metadata.
+- **Errors**: `PROJECT_NOT_FOUND`, `CROP_REGION_MISSING`, `PROJECT_MUTATION_CONFLICT`
+- **Job-based**: No
+
 ### `get_ocr_readiness`
 - **Input**: `ProjectIdInput { project_id: String }`
 - **Output**: `StudentScanReadinessSnapshot`
+- **OCR policy**: `ocrReviewPolicy { version, fingerprint, lowConfidenceThreshold, criticalConfidenceThreshold, reasonLabels }` is backend-authoritative and must be rendered by the UI; the UI does not recalculate review readiness.
 - **Errors**: `PROJECT_NOT_FOUND`
 - **Job-based**: No
 
 ### `start_student_answer_ocr`
-- **Input**: `ProjectIdInput { project_id: String }`
-- **Output**: `StartStudentAnswerOcrOutput { job_id: String, status: "queued" }`
-- **Errors**: `WORKFLOW_BLOCKED`, `STUDENT_SCAN_NOT_FOUND`, `STUDENT_SCAN_PREVIEW_NOT_READY`, `STUDENT_GROUPING_NOT_READY`, `QUESTION_TEXT_MISSING`, `MODEL_SERVER_START_FAILED`, `MODEL_SERVER_READY_TIMEOUT`
+- **Input**: `ProjectIdInput { project_id: String, force_rerun?: boolean, mode?: "production" | "experimental_full_page_review_only" }`
+- **Output**: `StartStudentAnswerOcrOutput { job_id: String, status: "queued", rerun: boolean, mode }`
+- **Production gate**: `mode=production` requires at least one saved answer region for every question. Missing coverage returns structured `CROP_REGION_MISSING`/`OCR_NOT_READY`; there is no production full-page fallback.
+- **Experimental mode**: `experimental_full_page_review_only` is explicitly typed and review-only. Its records carry `needsReview=true`, `ocrProvenance.approvableForScoring=false`, and cannot be teacher-approved, accepted as scoring-ready OCR, or pass the scoring gate. It may be used only as a teacher text-correction reference.
+- **OCR provenance**: successful attempts record source checksum/pages, region IDs/order/page offsets, renderer/DPI (or explicit unknown), preprocess policy/variant/version, final prepared model image dimensions/cache keys, invocation contract, input budget, and response diagnostics. Missing legacy metadata remains unknown.
+- **Structured answer**: OCR uses a tagged `StructuredAnswer` union (`multiple_choice`, `matching`, `ordered_slots`, `numeric`, `table`, `correction_table`, `sentence_annotation`, `grammar_analysis`, `open_text`). The backend maps each `AnswerType` to its allowed variant. Mismatch, invalid schema, or placeholder values remain reviewable data and cannot produce an applied score; legacy arbitrary JSON is retained as `legacy_unparsed` salvage.
+- **Errors**: `WORKFLOW_BLOCKED`, `CROP_REGION_MISSING`, `OCR_NOT_READY`, `STUDENT_SCAN_NOT_FOUND`, `STUDENT_SCAN_PREVIEW_NOT_READY`, `STUDENT_GROUPING_NOT_READY`, `QUESTION_TEXT_MISSING`, `MODEL_SERVER_START_FAILED`, `MODEL_SERVER_READY_TIMEOUT`
 - **Job-based**: Yes
 - **Notes**: If the model server is not healthy yet, the backend starts the managed model process, waits for `/health`, then queues OCR. Teacher-facing errors stay structured; technical details remain in diagnostics.
 
@@ -285,11 +299,16 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Job-based**: No
 
 ### `update_question_rubric`
-- **Input**: `UpdateQuestionRubricInput { project_id: String, question_id: String, answer_type?: AnswerType, max_score?: number, expected_answer?: string, criteria: RubricCriterion[], partial_credit_hints: string[], zero_score_conditions: string[], common_mistakes: string[] }`
+- **Input**: `UpdateQuestionRubricInput { project_id: String, question_id: String, answer_type?: AnswerType, max_score?: number, expected_answer?: string, key_concepts: string[], criteria: RubricCriterion[], partial_credit_hints: string[], zero_score_conditions: string[], common_mistakes: string[] }`
 - **Output**: `Question`
 - **Errors**: `RUBRIC_NOT_READY`, `RUBRIC_QUESTION_NOT_FOUND`, `RUBRIC_MAX_SCORE_MISSING`, `RUBRIC_CRITERIA_SCORE_MISMATCH`, `RUBRIC_PLACEHOLDER_DETECTED`
 - **Job-based**: No
 - **Notes**: `answer_type` is persisted in the canonical question model and invalidates a previously frozen package, so OCR cannot depend on screen-local question-type state.
+
+### Rubric extraction contract
+- **Version**: `rubric_extraction_contract_v2`.
+- **Schema source**: JSON Schema and prompt field list are built from canonical `RubricState` DTO data fields: `expectedAnswer`, `keyConcepts`, `criteria`, `partialCreditHints`, `zeroScoreConditions`, `commonMistakes`, `warnings`, and score data. `source`, `status`, and `updatedAt` are backend-owned boundaries and are not model-authored.
+- **Authority**: model output is persisted as `source=gemma_draft`, `status=suggested`; teacher confirmation is required before it can become authoritative. Placeholder detection remains active.
 
 ### `confirm_question_rubric`
 - **Input**: `ConfirmQuestionRubricInput { project_id: String, question_id: String }`
@@ -320,6 +339,13 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Output**: `QuestionSnapshot`
 - **Errors**: `WORKFLOW_BLOCKED`
 - **Job-based**: No
+
+### `migrate_rubric_levels`
+- **Input**: `MigrateRubricLevelsInput { project_id: String, question_id?: String }`
+- **Output**: `MigrateRubricLevelsOutput { migratedCount, teacherConfirmationRequired, qepInvalidated, warnings[] }`
+- **Errors**: `PROJECT_NOT_FOUND`, `PROJECT_SAVE_FAILED`
+- **Job-based**: No
+- **Invariant**: Eski numeric/max-only kriter verisi silinmez; oluşturulan seviyeler `suggested` durumunda kalır ve öğretmen onayı olmadan authoritative scoring policy sayılmaz. Frozen QEP değişiklikte invalidated olur.
 
 ### `start_ocr_job`
 - **Input**: `StartOcrInput { project_id: String }`
@@ -354,6 +380,9 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Job-based**: Yes
 - **Scoring result invariant**: `ScoringRecord.awardedScore` is nullable and `scoringApplied=false` when no trustworthy model score was produced. A model/parse failure must never be persisted as a normal zero.
 - **Deterministic validation**: Criterion ids, titles, and maximum scores come from the frozen rubric. Missing criteria prevent model scoring from being applied; low confidence, short rationales, OCR uncertainty, and criterion contract mismatches require teacher review.
+- **Lifecycle**: `decisionState` separates `modelCandidate`/`provisional`, `deterministicAccepted`, `autoAccepted`, `teacherApproved`, `rejected`, and `failed`. `finalScore` consumes only teacher-approved final records.
+- **Semantic scoring**: Model output carries criterion/level/evidence proposals; Rust maps frozen rubric levels to scores. Direct model score fields are ignored and recorded as review diagnostics.
+- **Reproducibility**: `scoringFingerprint` is an exact QEP/answer/OCR/prompt/schema/policy/model/runtime/sampling/calibration/anchor identity. Candidate cache hits and exact duplicate reuse expose provenance and do not turn a reviewable proposal into a final decision.
 
 ### `update_scoring_record`
 - **Input**: `UpdateScoringRecordInput { project_id: String, record_id: String, teacher_manual_score?: f32, teacher_notes?: String, teacher_approved: bool }`
@@ -362,18 +391,47 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 - **Job-based**: No
 - **Notes**: A record with `scoringApplied=false` cannot be approved until the teacher supplies a manual score.
 
+### `get_scoring_summary`
+- **Input**: `GetScoringSummaryInput { project_id: String }`
+- **Output**: `ScoringSummaryDto { provisionalScore, acceptedScore, finalScore, maxScore, isComplete, submissions[] }`
+- **Errors**: `PROJECT_NOT_FOUND`
+- **Job-based**: No
+- **Notes**: `finalScore` excludes provisional, review-required, rejected and failed records. The frontend displays this backend summary and never calculates a student or project total.
+
+### `list_scoring_anchors`
+- **Input**: `ListScoringAnchorsInput { project_id: String }`
+- **Output**: `ScoringAnchorDto[]`
+- **Errors**: `PROJECT_NOT_FOUND`
+- **Job-based**: No
+- **Notes**: Each DTO includes the immutable anchor version/source record, QEP/question/rubric/policy fingerprints, teacher action history, evidence hashes and a backend-derived `eligibility` (`eligible`, `stale`, `ineligible`, `revoked`) with teacher-facing reasons.
+
+### `create_scoring_anchor`
+- **Input**: `CreateScoringAnchorInput { project_id: String, source_record_id: String }`
+- **Output**: `ScoringAnchorDto`
+- **Errors**: `QEP_NOT_FROZEN`, `SCORING_ANCHOR_NOT_ELIGIBLE`, `SCORING_ANCHOR_ALREADY_EXISTS`, `SCORING_ANCHOR_NOT_FOUND`
+- **Job-based**: No
+- **Invariant**: Only a teacher-approved, final, placeholder-free scoring decision with an approved OCR source and current QEP/policy can be anchored. Model proposals, reviewable records and zero-score fallbacks are rejected. The ProjectStore mutation is atomic and the action is written to the audit log.
+
+### `revoke_scoring_anchor`
+- **Input**: `RevokeScoringAnchorInput { project_id: String, anchor_id: String, reason?: String }`
+- **Output**: `ScoringAnchorDto`
+- **Errors**: `SCORING_ANCHOR_NOT_FOUND`, `SCORING_ANCHOR_ALREADY_REVOKED`
+- **Job-based**: No
+- **Invariant**: Revocation preserves the immutable anchor version/evidence and appends a teacher action; it does not delete historical anchor data. Rubric/QEP/policy changes similarly leave the record present but make it stale/ineligible through the backend read model.
+
 ### `finish_assessment`
 - **Input**: `FinishAssessmentInput { project_id: String, kind: "written" | "speaking", source_id?: String }`
 - **Output**: `FinishAssessmentOutput { analysis_id: String, job_id: String, status: "queued" }`
 - **Errors**: `ANALYSIS_NOT_READY`, `PROJECT_NOT_FOUND`
 - **Job-based**: Yes (`assessment_analysis`)
-- **Notes**: Deterministic charts are saved before the Gemma report starts. Report failure produces a partial analysis and never removes chart data.
+- **Notes**: Deterministic charts and a canonical aggregate `metrics[]` registry are saved before the Gemma job starts. The model receives only anonymous aggregate metrics, never raw student answers or student read-model records. Structured claims are resolved against that registry; missing or contradictory references become teacher-review/unsupported claims. Report failure produces a partial analysis and never removes chart data.
 
 ### `get_assessment_analysis`
 - **Input**: `GetAssessmentAnalysisInput { project_id: String, analysis_id: String }`
-- **Output**: `AssessmentAnalysis`
+- **Output**: `AssessmentAnalysis { metrics[], claims[] }` where each claim has `claim`, `metricRefs`, `recommendation`, `evidenceStatus` and `teacherVisibleExplanation`
 - **Errors**: `ANALYSIS_FAILED`, `PROJECT_NOT_FOUND`
 - **Job-based**: No
+- **Compatibility**: Legacy analysis files without `metrics`/`claims` are opened without data loss; the backend derives the aggregate metric registry and does not treat the legacy free-text report as verified evidence.
 
 ### `list_assessment_analyses`
 - **Input**: `ListAssessmentAnalysesInput { project_id: String }`
@@ -393,8 +451,8 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 
 ### `get_model_status`
 - **Input**: None
-- **Output**: `ModelStatus`
-- **Errors**: None
+- **Output**: `ModelStatus` including optional `privacyMode`, `privacyBlocked`, `privacyBlockReason`, and `modelFingerprint` fields.
+- **Errors**: None for a blocked legacy profile; the blocked state carries a friendly suggested action.
 - **Job-based**: No
 
 ### `get_model_runtime_status`
@@ -419,19 +477,27 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 `stop_model_server` aktif lease varken process'i doğrudan sonlandırmaz. Coordinator
 `Draining` durumuna geçer ve mevcut lease'ler release edilene kadar bekler.
 
-### `acquire_runtime` / `release_runtime` (backend service contract)
+### `acquire_ready_runtime_lease` / `release_runtime` (backend service contract)
 - **Owner**: `ModelProcessManager` üzerinden `ModelRuntimeService`
-- **Acquire**: `profile`, `ModelRuntimeRequest`, `consumerId`, `jobId`
-- **Grant**: lease ID, runtime instance ID, profile fingerprint ve verified base URL
+- **Acquire**: `profile`, `consumer`, `operation`, `correlationId`
+- **Grant**: lease ID, verified runtime instance ID, profile fingerprint, optional model fingerprint, correlation ID ve verified base URL
+- **Readiness**: bounded `/health` + process identity; completion probe yalnız explicit manual probe/doctor/benchmark akışındadır.
 - **Release**: yalnız aynı lease ID + runtime instance ID; idempotent public guard
-- **Errors**: `MODEL_RUNTIME_DRAINING`, `MODEL_RUNTIME_PROFILE_BUSY`, `MODEL_RUNTIME_START_FAILED`, `MODEL_RUNTIME_READINESS_TIMEOUT`, `MODEL_RUNTIME_LEASE_INVALID`, `MODEL_RUNTIME_LEASE_ALREADY_RELEASED`
+- **Errors**: `MODEL_RUNTIME_DRAINING`, `MODEL_RUNTIME_PROFILE_BUSY`, `MODEL_RUNTIME_START_FAILED`, `MODEL_RUNTIME_READINESS_TIMEOUT`, `MODEL_RUNTIME_LEASE_INVALID`, `MODEL_RUNTIME_LEASE_ALREADY_RELEASED`, `MODEL_PRIVACY_BLOCKED`
 - **Invariant**: lease release'i başka job'ın runtime'ını durdurmaz; son lease sonrası idle shutdown uygulanır.
 
 ### `set_model_mode`
 - **Input**: `SetModelModeInput { profileId?: string, mode: "external" | "managed" }`
 - **Output**: `ModelStatus`
-- **Errors**: `MODEL_PROFILE_NOT_FOUND`
+- **Errors**: `MODEL_PROFILE_NOT_FOUND`, `MODEL_EXTERNAL_CONSENT_REQUIRED` when switching to external without explicit consent.
 - **Job-based**: No
+
+### `enable_external_model`
+- **Input**: `EnableExternalModelInput { profileId?: string, projectRootPath?: string, confirmExternalDataTransfer: boolean }`
+- **Output**: `ModelStatus`
+- **Errors**: `MODEL_EXTERNAL_CONSENT_REQUIRED`, `MODEL_PROFILE_NOT_FOUND`, `AUDIT_WRITE_FAILED`
+- **Job-based**: No
+- **Invariant**: This is the only external-privacy opt-in path. The command persists `ExplicitExternal`, requires the explicit confirmation field, and appends a project/application audit event containing no student content.
 
 ### `reset_model_profile`
 - **Input**: None
@@ -469,10 +535,14 @@ project parsing, symlink, active-pointer, audit-chain, or backup verification
 fails.
 
 ## Model Input Pipeline
+- Every model request carries a versioned `PromptContract` at the Rust gateway boundary: immutable system policy, typed serialized user data, and `ModelInvocationContract` provenance (`useCase`, `promptVersion`, `schemaVersion`, `policyVersion`, `modelFingerprint`, `runtimeFingerprint`, `samplingParameters`, and optional `responseFormat`).
+- OCR user data contains question structure and observed student content only; rubric, expected answer, key concepts, partial-credit rules and zero-score conditions are excluded. OCR issue correction is limited to observed text, crop/location and image-quality data; any contextual suggestion remains review-only.
+- Backend schema/domain validation remains mandatory. Raw model response text is diagnostic artifact data and is not part of the teacher-facing result contract.
 - PDF preview cache remains under `cache/page_previews`
 - Shared document content artifacts live under `cache/document_content/<document_id>`
 - Model input cache is written under `cache/model_inputs`
 - Question text extraction and rubric vision fallback use optimized JPEG model inputs
+- Model input JPEG cache keys include source hash, ordered crop regions, alignment/preprocess/resize policy, JPEG quality, and encoder version; cache publication and manifest publication are atomic and transaction-tagged.
 - `inspect document-content` should report `method`, `raw_text_length`, `normalized_text_length`, `enough_text`, `vision_fallback_needed`, question coverage markers, and artifact paths
 - Request diagnostics should include prompt length, image count, image bytes, and base64 size estimates
 

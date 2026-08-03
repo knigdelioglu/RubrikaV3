@@ -18,7 +18,8 @@ Healthy → Failed / Unverified
 
 `Healthy`, runtime'ın teacher-facing karşılığı olan `Hazır` durumudur.
 Coordinator startup'ı `startup_lock` ile single-flight yapar. `Ready` olmayan
-veya health/completion probe'dan geçmeyen bir process lease alamaz.
+veya bounded `/health` ve process identity doğrulamasından geçmeyen bir process
+lease alamaz; completion probe bu hot path'in parçası değildir.
 
 ## Managed process identity
 
@@ -71,12 +72,14 @@ açıldığında kayıt önce `unverified` kabul edilir:
 
 ## Lease/ref-count
 
-Her model tüketimi `acquire_runtime(profile, request, consumer_id, job_id)` ile
+Her model tüketimi `acquire_ready_runtime_lease(profile, consumer, operation, correlation_id)` ile
 lease alır; health/readiness ve ModelGateway çağrıları bu lease kapsamındadır.
 Sonuç dar ProjectStore commit edildikten sonra `lease.release()` yapılır.
 
-Lease; lease ID, runtime instance ID, profile fingerprint, consumer/job ve
-operation kind taşır. Release idempotenttir; yanlış runtime instance veya
+Lease; lease ID, verified runtime instance ID, profile fingerprint, correlation
+ID, consumer/job ve operation kind taşır. Readiness yalnız bounded `/health`
+kontrolü ve process identity ile doğrulanır; completion probe hot path'in
+parçası değildir. Release idempotenttir; yanlış runtime instance veya
 ikinci release typed hata üretir. Bir lease'in release edilmesi yalnız kendi
 registry kaydını siler.
 
@@ -88,7 +91,8 @@ kalır.
 ## Startup single-flight ve profile compatibility
 
 İlk uyumlu acquire startup'ı başlatır; eşzamanlı talepler aynı startup lock ve
-aynı runtime instance'a bağlanır. Runtime profile fingerprint binary/model,
+aynı runtime instance'a bağlanır. Startup lock altında deadline ve bounded
+backoff ile health beklenir; worker yeniden preflight yapmaz. Runtime profile fingerprint binary/model,
 host/port ve runtime preset'ten deterministik üretilir.
 
 - Aynı fingerprint yeni process başlatmaz.

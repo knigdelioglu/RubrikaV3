@@ -2,7 +2,24 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getClassesSetupTargetId } from './classesUi.ts';
+import { getClassesSetupTargetId, getClassesTab, setClassesTab } from './classesUi.ts';
+
+test('roster tab survives class selection query updates', () => {
+  const rosterSearch = setClassesTab(new URLSearchParams('setup=classes'), 'roster');
+  rosterSearch.set('classId', 'class-11-c');
+
+  assert.equal(getClassesTab(rosterSearch), 'roster');
+  assert.equal(rosterSearch.get('setup'), 'classes');
+  assert.equal(rosterSearch.get('classId'), 'class-11-c');
+});
+
+test('returning to class setup removes the roster tab marker', () => {
+  const classSearch = setClassesTab(new URLSearchParams('tab=roster&classId=class-11-c'), 'classes');
+
+  assert.equal(getClassesTab(classSearch), 'classes');
+  assert.equal(classSearch.get('tab'), null);
+  assert.equal(classSearch.get('classId'), 'class-11-c');
+});
 
 test('class selection query changes do not change the setup target', () => {
   const initialSearch = new URLSearchParams('setup=classes');

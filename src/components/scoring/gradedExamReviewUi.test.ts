@@ -33,7 +33,7 @@ test('page changes preserve the displayed paper width when source pixel sizes di
 test('review queue follows submission page order and ignores historical scoring runs', () => {
   const record = (submissionId: string, runId: string, id: string): ScoringRecord => ({
     id, runId, submissionId, studentId: submissionId, questionId: 'q1', questionNumber: 1,
-    maxScore: 10, awardedScore: 8, scoringApplied: true, criterionScores: [], rationale: '', confidence: 1,
+    maxScore: 10, awardedScore: 8, scoringApplied: true, decisionState: 'auto_accepted', criterionScores: [], rationale: '', confidence: 1,
     needsReview: false, reviewReasons: [], warnings: [], rawModelOutput: '{}', sourceHash: '', packageHash: '',
     ocrRecordHash: '', questionTextHash: '', rubricHash: '', teacherReviewStatus: 'pending_review', createdAt: id, updatedAt: id,
   });

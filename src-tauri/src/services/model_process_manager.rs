@@ -7,7 +7,7 @@ use crate::domain::model::{
 use crate::platform::file_access::atomic_write;
 use crate::platform::paths::{app_log_dir, model_server_log_path};
 use crate::platform::process_inspector::{fingerprint, ProcessInspector, SystemProcessInspector};
-use crate::services::llama_server_gateway::LlamaServerGateway;
+use crate::services::llama_server_gateway::{validate_base_url_for_privacy, LlamaServerGateway};
 use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_gateway::ModelGateway;
 use chrono::Utc;
@@ -75,7 +75,9 @@ pub struct RuntimeLeaseGrant {
     pub runtime_instance_id: String,
     pub profile_id: String,
     pub profile_fingerprint: String,
+    pub model_fingerprint: Option<String>,
     pub base_url: String,
+    pub correlation_id: String,
     pub active_lease_count: usize,
 }
 
@@ -191,6 +193,8 @@ impl ModelProcessManager {
     ) -> Result<StartModelServerOutput, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
         self.require_managed(&profile)?;
+        validate_base_url_for_privacy(&profile.base_url, profile.privacy_mode)?;
+        self.gateway.configure_privacy(profile.privacy_mode)?;
         self.recover_persisted_runtime(&profile).await?;
         if self.is_draining()? {
             return Err(model_error(
@@ -202,7 +206,7 @@ impl ModelProcessManager {
         }
 
         if self.is_managed_profile_running(&profile.id)? {
-            let status = self.build_status(Some(&profile.id), true).await?;
+            let status = self.build_status(Some(&profile.id), false).await?;
             return Ok(StartModelServerOutput {
                 started: false,
                 mode: ModelMode::Managed,
@@ -228,7 +232,7 @@ impl ModelProcessManager {
         self.require_paths(&profile)?;
 
         if self.is_port_in_use(&profile.host, profile.port)? {
-            let status = self.gateway.probe_status(&profile.base_url).await?;
+            let status = self.gateway.health_status(&profile.base_url).await?;
             if status.server_running && status.health_ok {
                 return Ok(StartModelServerOutput {
                     started: false,
@@ -447,12 +451,12 @@ impl ModelProcessManager {
         mode: ModelMode,
     ) -> Result<ModelStatus, AppError> {
         self.config_service.set_mode(profile_id, mode)?;
-        self.build_status(profile_id, true).await
+        self.build_status(profile_id, false).await
     }
 
     pub async fn reset_profile(&self) -> Result<ModelStatus, AppError> {
         let profile = self.config_service.reset_active_profile()?;
-        self.build_status(Some(&profile.id), true).await
+        self.build_status(Some(&profile.id), false).await
     }
 
     pub async fn preview_args(
@@ -472,6 +476,7 @@ impl ModelProcessManager {
         probe_completion: bool,
     ) -> Result<ModelStatus, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
+        self.gateway.configure_privacy(profile.privacy_mode)?;
         self.recover_persisted_runtime(&profile).await?;
         let log_path = model_server_log_path(&profile.id);
         let server_path_exists = self.path_exists(&profile.server_path);
@@ -515,6 +520,12 @@ impl ModelProcessManager {
             server_running: false,
             health_ok: false,
             completion_probe_ok: false,
+            health_verified_at: None,
+            completion_probe_verified_at: None,
+            privacy_mode: profile.privacy_mode,
+            privacy_blocked: false,
+            privacy_block_reason: None,
+            model_fingerprint: model_file_fingerprint(&profile),
             managed_process_pid: runtime.as_ref().and_then(|metadata| metadata.pid),
             started_by_app: runtime
                 .as_ref()
@@ -533,6 +544,22 @@ impl ModelProcessManager {
         };
         status.active_lease_count = self.active_lease_count()?;
         status.draining = self.is_draining()?;
+
+        if let Err(error) = validate_base_url_for_privacy(&profile.base_url, profile.privacy_mode) {
+            status.privacy_blocked = true;
+            status.privacy_block_reason = Some(error.message.clone());
+            status.warnings.push(error.message.clone());
+            status.last_error = Some(error);
+            status.can_start_from_app = false;
+            status.can_stop_from_app = false;
+            status.start_disabled_reason =
+                Some("Model adresi Strict Local gizlilik politikasını karşılamıyor.".to_string());
+            status.suggested_actions.push(ModelSuggestedAction {
+                code: "use_managed_local_model".to_string(),
+                label: "Yönetilen yerel model profilini seç".to_string(),
+            });
+            return Ok(status);
+        }
 
         if runtime_unverified {
             status.warnings.push(
@@ -573,6 +600,8 @@ impl ModelProcessManager {
                 status.server_running = probe_status.server_running || status.server_running;
                 status.health_ok = probe_status.health_ok;
                 status.completion_probe_ok = probe_status.completion_probe_ok;
+                status.health_verified_at = probe_status.health_verified_at;
+                status.completion_probe_verified_at = probe_status.completion_probe_verified_at;
                 if let Some(error) = probe_status.last_error {
                     status.last_error = Some(error);
                 }
@@ -580,6 +609,7 @@ impl ModelProcessManager {
                 let health_status = self.gateway.health_status(&profile.base_url).await?;
                 status.server_running = health_status.server_running || status.server_running;
                 status.health_ok = health_status.health_ok;
+                status.health_verified_at = health_status.health_verified_at;
                 if let Some(error) = health_status.last_error {
                     status.last_error = Some(error);
                 }
@@ -665,11 +695,11 @@ impl ModelProcessManager {
     async fn wait_until_ready(
         &self,
         profile: &ModelProfile,
-        timeout: Duration,
+        deadline: Duration,
     ) -> Result<ModelStatus, AppError> {
         let start = Instant::now();
         loop {
-            if start.elapsed() >= timeout {
+            if start.elapsed() >= deadline {
                 return Err(model_error(
                     AppErrorCode::ModelServerReadyTimeout,
                     "Model sunucusu zamanında hazır olmadı.",
@@ -701,12 +731,45 @@ impl ModelProcessManager {
                 ));
             }
 
-            let probe = self.gateway.probe_status(&profile.base_url).await?;
-            if probe.server_running && probe.health_ok && probe.completion_probe_ok {
-                return Ok(probe);
+            let remaining = deadline.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                return Err(model_error(
+                    AppErrorCode::ModelServerReadyTimeout,
+                    "Model sunucusu zamanında hazır olmadı.",
+                    Some(format!("profile_id={}", profile.id)),
+                    Some("Log dosyasını inceleyin.".to_string()),
+                ));
+            }
+            let health =
+                match timeout(remaining, self.gateway.health_status(&profile.base_url)).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        return Err(model_error(
+                            AppErrorCode::ModelServerReadyTimeout,
+                            "Model sunucusu zamanında hazır olmadı.",
+                            Some(format!("profile_id={}", profile.id)),
+                            Some("Log dosyasını inceleyin.".to_string()),
+                        ));
+                    }
+                };
+            if health.server_running && health.health_ok {
+                return Ok(health);
             }
 
-            sleep(Duration::from_secs(2)).await;
+            let elapsed = start.elapsed();
+            let remaining = deadline.saturating_sub(elapsed);
+            if remaining.is_zero() {
+                return Err(model_error(
+                    AppErrorCode::ModelServerReadyTimeout,
+                    "Model sunucusu zamanında hazır olmadı.",
+                    Some(format!("profile_id={}", profile.id)),
+                    Some("Log dosyasını inceleyin.".to_string()),
+                ));
+            }
+            let backoff = Duration::from_millis(
+                50_u64.saturating_mul(1_u64 << ((elapsed.as_millis() / 250) as u32).min(4)),
+            );
+            sleep(backoff.min(remaining)).await;
         }
     }
 
@@ -1352,7 +1415,8 @@ impl ModelProcessManager {
         });
     }
 
-    pub async fn acquire_lease(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn acquire_lease(
         &self,
         profile_id: Option<&str>,
         requires_mmproj: bool,
@@ -1360,8 +1424,12 @@ impl ModelProcessManager {
         consumer_id: &str,
         job_id: Option<&str>,
         operation_kind: &str,
+        correlation_id: &str,
     ) -> Result<RuntimeLeaseGrant, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
+        validate_base_url_for_privacy(&profile.base_url, profile.privacy_mode)?;
+        self.gateway.configure_privacy(profile.privacy_mode)?;
+        let model_fingerprint = model_file_fingerprint(&profile);
         if requires_mmproj && !profile.requires_mmproj() && profile.mmproj_path.trim().is_empty() {
             return Err(model_error(
                 AppErrorCode::ModelMmprojMissing,
@@ -1443,9 +1511,10 @@ impl ModelProcessManager {
             ));
         }
 
-        let status = self.build_status(Some(&profile.id), true).await?;
+        let status = self.build_status(Some(&profile.id), false).await?;
         let usable_existing_runtime = status.health_ok
             && (metadata.is_none() || status.started_by_app || profile.mode == ModelMode::External);
+        let mut ready_health_ok = status.health_ok;
         if !usable_existing_runtime {
             if profile.mode != ModelMode::Managed {
                 return Err(model_error(
@@ -1458,23 +1527,30 @@ impl ModelProcessManager {
                     Some("Model sunucusunu başlatın veya yönetilen moda geçin.".to_string()),
                 ));
             }
-            self.start_server_with_timeout_locked(
-                Some(&profile.id),
-                Duration::from_secs(timeout_seconds),
-            )
-            .await
-            .map_err(|mut error| {
-                if error.code == AppErrorCode::ModelServerReadyTimeout {
-                    error.code = AppErrorCode::ModelRuntimeReadinessTimeout;
-                } else if error.code == AppErrorCode::ModelServerStartFailed {
-                    error.code = AppErrorCode::ModelRuntimeStartFailed;
-                }
-                error
-            })?;
+            let start_result = self
+                .start_server_with_timeout_locked(
+                    Some(&profile.id),
+                    Duration::from_secs(timeout_seconds),
+                )
+                .await
+                .map_err(|mut error| {
+                    if error.code == AppErrorCode::ModelServerReadyTimeout {
+                        error.code = AppErrorCode::ModelRuntimeReadinessTimeout;
+                    } else if error.code == AppErrorCode::ModelServerStartFailed {
+                        error.code = AppErrorCode::ModelRuntimeStartFailed;
+                    }
+                    error
+                })?;
+            ready_health_ok = start_result.health_ok;
         }
 
-        let ready = self.gateway.probe_status(&profile.base_url).await?;
-        if !ready.health_ok {
+        if !ready_health_ok {
+            ready_health_ok = self
+                .wait_until_ready(&profile, Duration::from_secs(timeout_seconds))
+                .await?
+                .health_ok;
+        }
+        if !ready_health_ok {
             return Err(model_error(
                 AppErrorCode::ModelRuntimeReadinessTimeout,
                 "Model sunucusu hazır olmadan lease verilemedi.",
@@ -1523,7 +1599,9 @@ impl ModelProcessManager {
             runtime_instance_id,
             profile_id: profile.id,
             profile_fingerprint,
+            model_fingerprint,
             base_url: profile.base_url,
+            correlation_id: correlation_id.to_string(),
             active_lease_count,
         })
     }
@@ -1896,7 +1974,27 @@ fn runtime_profile_fingerprint(profile: &ModelProfile) -> String {
         profile.host.clone(),
         profile.port.to_string(),
         format!("{:?}", profile.runtime_preset),
+        format!("{:?}", profile.privacy_mode),
     ])
+}
+
+fn model_file_fingerprint(profile: &ModelProfile) -> Option<String> {
+    if profile.model_path.trim().is_empty() {
+        return None;
+    }
+    let path = fs::canonicalize(&profile.model_path).ok()?;
+    let metadata = fs::metadata(&path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos().to_string())
+        .unwrap_or_default();
+    Some(fingerprint(&[
+        path.to_string_lossy().to_string(),
+        metadata.len().to_string(),
+        modified,
+    ]))
 }
 
 fn send_verified_signal(
@@ -2406,11 +2504,21 @@ HTTPServer((host, port), Handler).serve_forever()
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let first = manager
-                .acquire_lease(None, false, 2, "ocr", Some("job-a"), "ocr")
+                .acquire_lease(None, false, 2, "ocr", Some("job-a"), "ocr", "corr-a")
                 .await
                 .expect("first lease");
+            assert_eq!(first.correlation_id, "corr-a");
+            assert!(!first.profile_fingerprint.is_empty());
             let second = manager
-                .acquire_lease(None, false, 2, "scoring", Some("job-b"), "scoring")
+                .acquire_lease(
+                    None,
+                    false,
+                    2,
+                    "scoring",
+                    Some("job-b"),
+                    "scoring",
+                    "corr-b",
+                )
                 .await
                 .expect("second lease");
             assert_eq!(manager.active_lease_count().expect("lease count"), 2);
@@ -2424,7 +2532,7 @@ HTTPServer((host, port), Handler).serve_forever()
                 .await
                 .expect("runtime remains probeable");
             assert!(status.health_ok);
-            assert!(completion_count.load(Ordering::SeqCst) >= 3);
+            assert_eq!(completion_count.load(Ordering::SeqCst), 1);
             manager
                 .release_lease(&second.lease_id, &second.runtime_instance_id)
                 .await
@@ -2571,6 +2679,14 @@ HTTPServer((host, port), Handler).serve_forever()
                 !source.contains("stop_server("),
                 "{file} must not own model lifecycle"
             );
+            assert!(
+                !source.contains("ensure_ready(") && !source.contains("acquire_runtime("),
+                "{file} must use the single ready runtime lease contract"
+            );
+            assert!(
+                source.contains("acquire_ready_runtime_lease"),
+                "{file} must carry readiness into the domain operation"
+            );
         }
     }
 
@@ -2588,6 +2704,41 @@ HTTPServer((host, port), Handler).serve_forever()
             let status = manager.get_model_status(None).await.unwrap();
             assert_eq!(status.mode, ModelMode::Managed);
         });
+    }
+
+    #[test]
+    fn legacy_public_external_profile_returns_privacy_blocked_status() {
+        let config_service = ModelConfigService::new_with_path(std::env::temp_dir().join(format!(
+            "rubrika-model-status-privacy-{}.json",
+            uuid::Uuid::new_v4()
+        )));
+        let mut profile = config_service.get_profile(None).unwrap();
+        profile.mode = ModelMode::External;
+        profile.base_url = "https://model.example.test".to_string();
+        profile.host = "model.example.test".to_string();
+        profile.privacy_mode = crate::domain::model::PrivacyMode::StrictLocal;
+        config_service.update_profile(profile).unwrap();
+        let manager = ModelProcessManager::new_with_state_path(
+            config_service,
+            Arc::new(LlamaServerGateway::default()),
+            std::env::temp_dir().join(format!(
+                "rubrika-model-status-state-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        );
+        let status = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(manager.get_model_status(None))
+            .expect("status should explain the privacy block");
+        assert!(status.privacy_blocked);
+        assert_eq!(
+            status.last_error.as_ref().map(|error| &error.code),
+            Some(&AppErrorCode::ModelPrivacyBlocked)
+        );
+        assert!(status
+            .suggested_actions
+            .iter()
+            .any(|action| action.code == "use_managed_local_model"));
     }
 
     #[test]

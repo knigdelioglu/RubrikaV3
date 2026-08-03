@@ -4,7 +4,7 @@ use super::assessment::{AssessmentActivity, TeachingAssignment};
 use super::document::Document;
 use super::question::Question;
 use super::school_class::{SchoolClass, StudentScanBatch};
-use super::scoring::ScoringRecord;
+use super::scoring::{ScoringAnchor, ScoringRecord};
 use super::speaking::SpeakingExam;
 use super::student::{
     OcrGeneration, OcrGenerationStatus, PageGroupingMode, Student, StudentAnswerCropTemplate,
@@ -70,6 +70,11 @@ pub struct Project {
     pub questions: Vec<Question>,
     #[serde(default)]
     pub scoring_records: Vec<ScoringRecord>,
+    /// Teacher-approved scoring anchors. Legacy project files omit this
+    /// additive collection and deserialize it as empty without touching any
+    /// existing scoring records.
+    #[serde(default)]
+    pub scoring_anchors: Vec<ScoringAnchor>,
     #[serde(default)]
     pub speaking_exams: Vec<SpeakingExam>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

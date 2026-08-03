@@ -43,6 +43,31 @@ a:not(.button):not(.project-navigation__item):hover {
 
 code { font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace; }
 
+.startup-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: #f8fafc;
+}
+.startup-card {
+  width: min(620px, 100%);
+  padding: 32px;
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  box-shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+}
+.startup-card__eyebrow { margin: 0 0 8px; color: #4f46e5; font-size: 0.75rem; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; }
+.startup-card h1 { margin: 0; color: #0f172a; font-size: clamp(1.4rem, 3vw, 2rem); letter-spacing: -0.03em; }
+.startup-card > p:not(.startup-card__eyebrow) { margin: 12px 0 0; color: #64748b; line-height: 1.6; }
+.startup-card__error { margin-top: 20px; }
+.startup-card__actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 24px; }
+.startup-card__actions .button { min-height: 40px; padding: 0 16px; border: 1px solid #cbd5e1; border-radius: 10px; cursor: pointer; font-weight: 700; }
+.startup-card__actions .button:disabled { cursor: wait; opacity: 0.65; }
+.startup-card__actions .button--primary { border-color: #4f46e5; }
+.startup-card--loading { text-align: center; }
+
 .app-shell { display: flex; min-height: 100vh; background: #f8fafc; }
 .project-navigation {
   position: sticky; top: 0; z-index: 40; width: 264px; height: 100vh; flex: 0 0 264px;

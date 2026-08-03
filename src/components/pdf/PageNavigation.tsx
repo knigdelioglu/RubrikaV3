@@ -20,6 +20,7 @@ export function PageNavigation({ currentPage, totalPages, onChange, dark = false
     <div className={`page-navigation ${dark ? 'is-dark' : ''}`} aria-label="PDF sayfa gezinme">
       <button
         type="button"
+        data-project-write="false"
         className={`viewer-icon-button ${dark ? 'is-dark' : ''}`}
         onClick={() => onChange(Math.max(1, currentPage - 1))}
         disabled={currentPage <= 1}
@@ -31,6 +32,7 @@ export function PageNavigation({ currentPage, totalPages, onChange, dark = false
       <strong aria-live="polite">Sayfa {currentPage} / {totalPages}</strong>
       <button
         type="button"
+        data-project-write="false"
         className={`viewer-icon-button ${dark ? 'is-dark' : ''}`}
         onClick={() => onChange(Math.min(totalPages, currentPage + 1))}
         disabled={currentPage >= totalPages}

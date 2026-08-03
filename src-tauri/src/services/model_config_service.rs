@@ -1,7 +1,7 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{
     default_model_profile, speaking_asr_cleanup_model_profile, speaking_rubric_model_profile,
-    ModelMode, ModelProfile,
+    ModelMode, ModelProfile, PrivacyMode,
 };
 use crate::platform::file_access::atomic_write;
 use serde::{Deserialize, Serialize};
@@ -127,6 +127,42 @@ impl ModelConfigService {
         ];
         save_store(&self.config_path, &store)?;
         Ok(default_profile)
+    }
+
+    pub fn enable_external_profile(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<ModelProfile, AppError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|err| crate::domain::errors::AppError {
+                code: crate::domain::errors::AppErrorCode::ModelStateAccessFailed,
+                message: "Model konfigürasyonuna erişilemedi.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Uygulamayı yeniden başlatmayı deneyin.".to_string()),
+                technical_details: Some(format!("Mutex lock failed: {err}")),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        let target_id = profile_id.unwrap_or(&store.active_profile_id).to_string();
+        let profile = store
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == target_id)
+            .ok_or_else(|| AppError {
+                code: AppErrorCode::ModelProfileNotFound,
+                message: "Model profili bulunamadı.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Geçerli bir model profili seçin.".to_string()),
+                technical_details: Some(format!("profile_id={target_id}")),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        profile.privacy_mode = PrivacyMode::ExplicitExternal;
+        profile.mode = ModelMode::External;
+        let cloned = profile.clone();
+        store.active_profile_id = cloned.id.clone();
+        save_store(&self.config_path, &store)?;
+        Ok(cloned)
     }
 
     pub fn active_profile_id(&self) -> String {
@@ -322,5 +358,31 @@ mod tests {
             .set_mode(None, ModelMode::Managed)
             .expect("mode update should succeed");
         assert_eq!(profile.mode, ModelMode::Managed);
+    }
+
+    #[test]
+    fn legacy_profile_without_privacy_mode_defaults_to_strict_local() {
+        let path = env::temp_dir().join(format!("rubrika-model-legacy-{}.json", Uuid::new_v4()));
+        let legacy = serde_json::json!({
+            "activeProfileId": "legacy-external",
+            "profiles": [{
+                "id": "legacy-external",
+                "displayName": "Legacy external",
+                "mode": "external",
+                "serverPath": "/tmp/llama-server",
+                "modelPath": "/tmp/model.gguf",
+                "mmprojPath": "",
+                "host": "model.example.test",
+                "port": 443,
+                "baseUrl": "https://model.example.test"
+            }]
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let service = ModelConfigService::new_with_path(path.clone());
+        let profile = service.get_profile(None).unwrap();
+        assert_eq!(profile.privacy_mode, PrivacyMode::StrictLocal);
+        assert_eq!(profile.mode, ModelMode::External);
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -72,7 +72,7 @@ test('describeStudentScanPreview explains missing previews clearly', () => {
       pageCount: 12,
       preview: { status: 'missing' },
     }),
-    'Öğrenci PDF yüklendi, sayfa önizlemesi henüz oluşturulmadı.',
+    'Öğrenci PDF yüklendi, sayfa önizlemesi arka planda hazırlanıyor.',
   );
 });
 

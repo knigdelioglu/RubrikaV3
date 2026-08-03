@@ -1,5 +1,12 @@
-import type { ProjectSnapshot, ScoringRecord, ScoringReviewStatus, StudentSubmission } from '../api/types';
-import { scoringReviewStatusLabels } from '../utils/labels.ts';
+import type {
+  ProjectSnapshot,
+  ScoringRecord,
+  ScoringAnchorEligibility,
+  ScoringReviewStatus,
+  ScoringSubmissionSummary,
+  StudentSubmission,
+} from '../api/types';
+import { scoringDecisionStateLabels, scoringReviewStatusLabels } from '../utils/labels.ts';
 import { getSubmissionClassName } from './studentOperations.ts';
 
 export function compareScoringRecords(left: ScoringRecord, right: ScoringRecord): number {
@@ -34,6 +41,19 @@ export function resolveActiveScoringRunId(project?: { latestScoringRunId?: strin
 
 export function getReviewStatusLabel(status: ScoringReviewStatus): string {
   return scoringReviewStatusLabels[status] ?? 'Onay bekliyor';
+}
+
+export function getDecisionStateLabel(state: ScoringRecord['decisionState']): string {
+  return scoringDecisionStateLabels[state] ?? 'Notlandırma durumu inceleniyor';
+}
+
+export function getScoringAnchorEligibilityLabel(eligibility: ScoringAnchorEligibility): string {
+  return {
+    eligible: 'Kullanıma uygun anchor',
+    stale: 'Güncelliğini yitirdi; yeniden değerlendirme gerekli',
+    ineligible: 'Anchor kullanıma uygun değil',
+    revoked: 'Anchor statüsü kaldırıldı',
+  }[eligibility] ?? 'Anchor durumu inceleniyor';
 }
 
 export function getStudentDisplayValue(value: string | null | undefined, fallback: string): string {
@@ -74,23 +94,25 @@ export function getSubmissionSortKey(project: ProjectSnapshot, submission: Stude
     .toLowerCase();
 }
 
-export function buildStudentSummary(project: ProjectSnapshot, submission: StudentSubmission, records: ScoringRecord[]) {
+export function buildStudentSummary(
+  project: ProjectSnapshot,
+  submission: StudentSubmission,
+  records: ScoringRecord[],
+  backendSummary?: ScoringSubmissionSummary,
+) {
   const student = project.students.find((item) => item.id === submission.studentId);
-  const maxScore = project.questions.reduce((sum, question) => sum + (question.rubric.maxScore ?? question.maxScore), 0);
-  const scoredRecords = records.filter((record) => (
-    record.scoringApplied && (record.teacherManualScore ?? record.awardedScore) !== null
-  ));
-  const expectedRecordCount = project.questions.length;
-  const isComplete = expectedRecordCount > 0 && scoredRecords.length === expectedRecordCount;
-  const totalScore = !isComplete
-    ? null
-    : Math.min(
-      scoredRecords.reduce((sum, record) => {
-        const score = record.teacherManualScore ?? record.awardedScore;
-        return sum + Math.min(score ?? 0, record.maxScore);
-      }, 0),
-      maxScore,
-    );
+  const expectedRecordCount = backendSummary?.expectedRecordCount ?? project.questions.length;
+  const maxScore = backendSummary?.maxScore ?? null;
+  const isComplete = backendSummary?.isComplete ?? false;
+  const totalScore = backendSummary
+    ? (backendSummary.finalScore
+      ?? (backendSummary.acceptedRecordCount + backendSummary.provisionalRecordCount > 0
+        ? backendSummary.provisionalScore
+        : null))
+    : null;
+  const scoredCount = backendSummary
+    ? backendSummary.acceptedRecordCount + backendSummary.provisionalRecordCount
+    : 0;
   const approvedCount = records.filter((record) => record.teacherReviewStatus === 'approved' || record.teacherReviewStatus === 'edited').length;
   const pendingCount = records.filter((record) => record.teacherReviewStatus === 'pending_review').length;
   const warningCount = records.reduce((sum, record) => sum + record.warnings.length, 0);
@@ -113,8 +135,8 @@ export function buildStudentSummary(project: ProjectSnapshot, submission: Studen
     pendingCount,
     warningCount,
     needsReview,
-    scoredCount: scoredRecords.length,
-    unscoredCount: Math.max(0, expectedRecordCount - scoredRecords.length),
+    scoredCount,
+    unscoredCount: Math.max(0, expectedRecordCount - scoredCount),
     isComplete,
     duplicateCount: Math.max(0, project.scoringRecords.filter((record) => record.submissionId === submission.id).length - records.length),
     badges,

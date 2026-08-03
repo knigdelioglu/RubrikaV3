@@ -114,7 +114,7 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | `extract_student_identity_ocr` | `llama_server_gateway.rs` | Func (Async) | Modeli yalnız kimlik crop görseliyle çağırıp ad/no/sınıf JSON önerisi üretir. |
 | `update_student_identity` | `student_scan_service.rs` | Func | Öğrenci ad/no/sınıf bilgilerini günceller ve kimlik eksikliğini kontrol eder. |
 | `parse_assistant_content` (belirsiz) | `llama_server_gateway.rs`| Func | Gelen raw model metninden JSON çıkarmayı / onarmayı dener (Salvage). |
-| `ensure_ready` | `model_runtime_service.rs` | Func (Async) | Bir job başlamadan önce modelin açık olduğundan emin olur. |
+| `acquire_ready_runtime_lease` | `model_runtime_service.rs` | Func (Async) | Tek akışta health + process identity doğrular, verified runtime lease döndürür; worker preflight yapmaz. |
 | `save_project` | `project_store.rs` | Func | Mutlak tekil doğruluk kaynağını (Project struct) JSON'a atomik olarak basar. |
 | `deserialize_project` | `project_store.rs` | Func | `project.json` için iki aşamalı JSON normalize+deserialize çalıştırır, unknown preprocess mode fallback ve serde path hata detayları üretir. |
 | `ScoringPage` | `ScoringPage.tsx` | Component | Notlandırma job'u, kayıt listesi, manuel düzeltme ve raw diagnostics gösterimi. |

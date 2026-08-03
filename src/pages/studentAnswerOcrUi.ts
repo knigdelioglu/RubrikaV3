@@ -2,6 +2,7 @@ import type {
   OcrImagePreprocessMode,
   OcrSuggestedCorrection,
   Question,
+  QuestionAnswerTemplate,
   StudentAnswerCropTemplateItem,
   StudentAnswerOcrCropBBox,
   StudentAnswerOcrRecord,
@@ -48,7 +49,9 @@ type DerivedOcrCandidate = {
   warningCode?: string | null;
 };
 
-const LOW_CONFIDENCE_THRESHOLD = 0.6;
+function hasBackendLowConfidenceReason(record: StudentAnswerOcrRecord) {
+  return record.needsReview && (record.reviewReasons ?? []).includes('ocr_low_confidence');
+}
 export function getStudentAnswerOcrStartDisabledReason(workflowStage: string) {
   if (workflowStage !== 'ocr_ready') {
     return 'OCR başlatmak için workflow OCR hazır olmalı.';
@@ -111,10 +114,12 @@ export function getStudentAnswerOcrPreviewMessage(record: StudentAnswerOcrRecord
     return 'Tam sayfa fallback kullanıldı; soru kökü karışabilir.';
   }
   if (diagnostics.cropMissing || diagnostics.pagePreviewMissing) {
-    const missing: string[] = [];
-    if (diagnostics.cropMissing) missing.push('crop_missing=true');
-    if (diagnostics.pagePreviewMissing) missing.push('page_preview_missing=true');
-    return `Önizleme eksik: ${missing.join(', ')}`;
+    if (diagnostics.cropMissing && diagnostics.pagePreviewMissing) {
+      return 'Crop ve sayfa önizlemesi eksik.';
+    }
+    return diagnostics.cropMissing
+      ? 'Cevap crop önizlemesi eksik.'
+      : 'Sayfa önizlemesi eksik.';
   }
   return 'Önizleme hazır.';
 }
@@ -123,6 +128,8 @@ export function getStudentAnswerOcrRawOutput(record: StudentAnswerOcrRecord) {
   return record.parseDiagnostics?.rawModelOutput ?? '';
 }
 
+// View-only text-range matching for highlighting; domain comparison/readiness
+// decisions remain in the Rust normalizer and backend review policy.
 function normalizeSearch(value: string) {
   return value.toLocaleLowerCase('tr-TR').replace(/\s+/g, ' ').trim();
 }
@@ -361,7 +368,7 @@ function buildIssueEntries(record: StudentAnswerOcrRecord, context?: StudentAnsw
     const summary = span.text.trim() || 'Belirsiz ifade';
     const confidence = span.confidence ?? record.confidence ?? null;
     const categories = ['critical_term_uncertain'];
-    if (confidence != null && confidence < LOW_CONFIDENCE_THRESHOLD) {
+    if (hasBackendLowConfidenceReason(record)) {
       categories.push('ocr_low_confidence');
     }
     entries.push({
@@ -380,7 +387,7 @@ function buildIssueEntries(record: StudentAnswerOcrRecord, context?: StudentAnsw
   for (const correction of record.suggestedCorrections) {
     const confidence = correction.confidence ?? null;
     const categories = ['suggested_correction'];
-    if (confidence != null && confidence < LOW_CONFIDENCE_THRESHOLD) {
+    if (hasBackendLowConfidenceReason(record)) {
       categories.push('ocr_low_confidence');
     }
     entries.push({
@@ -404,7 +411,7 @@ function buildIssueEntries(record: StudentAnswerOcrRecord, context?: StudentAnsw
     }
     const confidence = record.confidence ?? null;
     const categories = ['critical_term_uncertain'];
-    if (confidence != null && confidence < LOW_CONFIDENCE_THRESHOLD) {
+    if (hasBackendLowConfidenceReason(record)) {
       categories.push('ocr_low_confidence');
     }
     entries.push({
@@ -459,7 +466,7 @@ function buildIssueEntries(record: StudentAnswerOcrRecord, context?: StudentAnsw
         entries,
         'semantic_warning',
         label,
-        quoted.length > 0 ? issueSummaryFromLabels(label, quoted[0] ?? warning) : warning,
+        quoted.length > 0 ? issueSummaryFromLabels(label, quoted[0] ?? label) : label,
         ['critical_term_uncertain'],
         quoted,
       );
@@ -607,7 +614,7 @@ export function applyStudentAnswerOcrSuggestedCorrection(
 }
 
 export function getStudentAnswerOcrIssueFilterLabel(kind: string) {
-  return ocrIssueTypeLabels[kind] ?? kind;
+  return ocrIssueTypeLabels[kind] ?? ocrWarningLabels[kind] ?? 'İnceleme gerekli';
 }
 
 export function getStudentAnswerOcrUncertaintySummary(record: StudentAnswerOcrRecord) {
@@ -666,18 +673,32 @@ export function getStudentAnswerOcrIssueReviewModelInputRef(record: StudentAnswe
 
 export function getStudentAnswerCropTemplateSummary(
   questions: Question[],
-  items: StudentAnswerCropTemplateItem[],
+  items: QuestionAnswerTemplate[] | StudentAnswerCropTemplateItem[],
 ) {
   const questionIds = new Set(questions.map((question) => question.id));
-  const covered = new Set(items.filter((item) => questionIds.has(item.questionId)).map((item) => item.questionId));
-  return `${covered.size}/${questions.length} soru için crop var`;
+  const covered = new Set(
+    items
+      .filter((item) => questionIds.has(item.questionId))
+      .filter((item) => 'regions' in item ? item.regions.length > 0 : true)
+      .map((item) => item.questionId),
+  );
+  const regionCount = items.reduce(
+    (total, item) => total + ('regions' in item ? item.regions.length : 1),
+    0,
+  );
+  const summary = `${covered.size}/${questions.length} soru için crop var`;
+  return regionCount > covered.size ? `${summary} · ${regionCount} region` : summary;
 }
 
 export function getMissingStudentAnswerCropQuestionNumbers(
   questions: Question[],
-  items: StudentAnswerCropTemplateItem[],
+  items: QuestionAnswerTemplate[] | StudentAnswerCropTemplateItem[],
 ) {
-  const covered = new Set(items.map((item) => item.questionId));
+  const covered = new Set(
+    items
+      .filter((item) => 'regions' in item ? item.regions.length > 0 : true)
+      .map((item) => item.questionId),
+  );
   return questions
     .filter((question) => !covered.has(question.id))
     .map((question) => question.number);

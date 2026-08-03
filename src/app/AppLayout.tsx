@@ -11,7 +11,7 @@ import { shouldShowProjectNavigation } from './assessmentMode';
 import type { AssessmentActivity, DataLossPreflightReport, JobSnapshot, ProjectListItem } from '../api/types';
 import { setActiveProject } from '../state/projectSession';
 import { projectOverviewPath } from './projectRoutes';
-import { isProjectWriteBlocked } from './projectSafety';
+import { isProjectWriteBlocked, isProjectWriteControl } from './projectSafety';
 import { formatDateTime } from '../utils/formatting';
 import {
   formatAssessmentOption,
@@ -90,6 +90,7 @@ function ProjectSwitcher({
     <div ref={switcherRef} className="project-switcher">
       <button
         type="button"
+        data-project-write="false"
         className="project-switcher__trigger"
         onClick={() => setOpen((current) => !current)}
         disabled={openMutation.isPending}
@@ -112,7 +113,7 @@ function ProjectSwitcher({
               <strong>Ders alanı ve sınav seç</strong>
               <span>Dönem ve sınav sırası burada açıkça görünür.</span>
             </div>
-            <button type="button" className="icon-button" onClick={() => setOpen(false)} aria-label="Seçiciyi kapat">
+            <button type="button" data-project-write="false" className="icon-button" onClick={() => setOpen(false)} aria-label="Seçiciyi kapat">
               <X size={18} />
             </button>
           </div>
@@ -124,6 +125,7 @@ function ProjectSwitcher({
                 <button
                   key={project.id}
                   type="button"
+                  data-project-write="false"
                   className={`project-switcher__item ${project.id === projectId ? 'is-selected' : ''}`}
                   onClick={() => {
                     if (project.id === projectId) {
@@ -156,6 +158,7 @@ function ProjectSwitcher({
                 <button
                   key={activity.id}
                   type="button"
+                  data-project-write="false"
                   className={`project-switcher__item ${activity.id === activeActivityId ? 'is-selected' : ''}`}
                   onClick={() => selectActivity(activity)}
                 >
@@ -257,6 +260,7 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
     <div className="job-center">
       <button
         type="button"
+        data-project-write="false"
         className={`project-header__job-button ${failedJobs.length ? 'has-error' : ''}`}
         onClick={() => setOpen((current) => !current)}
         aria-expanded={open}
@@ -273,7 +277,7 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
               <strong>İşlem merkezi</strong>
               <span>Arka plandaki işlemler bu sayfadan bağımsız devam eder.</span>
             </div>
-            <button type="button" className="icon-button" onClick={() => setOpen(false)} aria-label="İşlem merkezini kapat">
+            <button type="button" data-project-write="false" className="icon-button" onClick={() => setOpen(false)} aria-label="İşlem merkezini kapat">
               <X size={18} />
             </button>
           </div>
@@ -284,7 +288,8 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
               {visibleJobs.map((job) => {
                 const percent = getJobProgressPercent(job);
                 const isCancellable = (job.status === 'queued' || job.status === 'running') && job.cancellable !== false;
-                const isRetryable = job.status === 'failed' || job.status === 'cancelled' || job.status === 'interrupted';
+                const isRetryable = job.kind !== 'pdf_preview_render'
+                  && (job.status === 'failed' || job.status === 'cancelled' || job.status === 'interrupted');
                 return (
                   <article key={job.id} className="job-center__item">
                     <div className="job-center__item-title">
@@ -305,6 +310,7 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
                       {isCancellable && !job.cancellationRequested && (
                         <button
                           type="button"
+                          data-project-write="false"
                           className="button button--secondary button--small"
                           onClick={() => handleCancel(job.id)}
                         >
@@ -314,6 +320,7 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
                       {isRetryable && (
                         <button
                           type="button"
+                          data-project-write="false"
                           className="button button--secondary button--small"
                           onClick={() => handleRetry(job.id)}
                         >
@@ -374,6 +381,12 @@ function ProjectSafetyBanner({ report, loading, failed }: {
     return <div className="project-safety-banner project-safety-banner--blocked" role="alert">
       <strong>Yazma işlemleri koruma amacıyla bekletiliyor.</strong>
       <span>Veri güvenliği ön kontrolü alınamadı. Taslaklarınız korunur; doğrulama tamamlanmadan kaydetme işlemi yapılmaz.</span>
+    </div>;
+  }
+  if (report.unverifiedWritesAllowed) {
+    return <div className="project-safety-banner project-safety-banner--warning" role="status">
+      <strong>Deneme modu açık.</strong>
+      <span>Bu geliştirme çalışma alanında yedek ve release doğrulama koşulları yazmayı engellemiyor. Gerçek proje bütünlüğü sorunları yine gösterilir ve engellenir.</span>
     </div>;
   }
   if (report.initializationWriteAllowed) {
@@ -441,7 +454,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
       {showProjectNavigation && <aside className={`project-navigation ${navigationOpen ? 'is-open' : ''}`} aria-label="Ders alanı menüsü">
         <div className="project-navigation__brand">
           <Link to="/projects">Rubrika<span>V3</span></Link>
-          <button type="button" className="icon-button project-navigation__close" onClick={() => setNavigationOpen(false)} aria-label="Menüyü kapat">
+          <button type="button" data-project-write="false" className="icon-button project-navigation__close" onClick={() => setNavigationOpen(false)} aria-label="Menüyü kapat">
             <X size={20} />
           </button>
         </div>
@@ -471,12 +484,12 @@ export function AppLayout({ children }: { children: ReactNode }) {
         )}
       </aside>}
 
-      {showProjectNavigation && navigationOpen && <button type="button" className="navigation-scrim" onClick={() => setNavigationOpen(false)} aria-label="Menüyü kapat" />}
+      {showProjectNavigation && navigationOpen && <button type="button" data-project-write="false" className="navigation-scrim" onClick={() => setNavigationOpen(false)} aria-label="Menüyü kapat" />}
 
       <div className="project-workspace">
         <header className="project-header">
           <div className="project-header__identity">
-            {showProjectNavigation && <button type="button" className="icon-button project-header__menu" onClick={() => setNavigationOpen(true)} aria-label="Ders alanı menüsünü aç">
+            {showProjectNavigation && <button type="button" data-project-write="false" className="icon-button project-header__menu" onClick={() => setNavigationOpen(true)} aria-label="Ders alanı menüsünü aç">
               <Menu size={21} />
             </button>}
             <div>
@@ -496,7 +509,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               />
             )}
             {projectId && <GlobalJobCenter projectId={projectId} />}
-            <button type="button" className="icon-button" aria-label="Bildirimler" title="Bildirimler">
+            <button type="button" data-project-write="false" className="icon-button" aria-label="Bildirimler" title="Bildirimler">
               <Bell size={19} />
             </button>
                       </div>
@@ -512,7 +525,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
               isError: preflightQuery.isError,
             });
             const isProjectWrite = button
-              && button.getAttribute('data-project-write') !== 'false';
+              && isProjectWriteControl(button.getAttribute('data-project-write'));
             if (isProjectWrite && blocked) {
               event.preventDefault();
               event.stopPropagation();

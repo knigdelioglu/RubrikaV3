@@ -183,6 +183,7 @@ export function CanonicalExamWorkspaceHeader({
           <span>{blockedAlert}</span>
           <button
             type="button"
+            data-project-write="false"
             className="filter-clear-button"
             onClick={() => setBlockedAlert(null)}
             aria-label="Engeli kapat"
@@ -203,6 +204,7 @@ export function CanonicalExamWorkspaceHeader({
               <li key={stepState.definition.id} className="canonical-exam-workspace-header__step-item">
                 <button
                   type="button"
+                  data-project-write="false"
                   onClick={() => handleStepClick(stepState)}
                   className={`canonical-exam-workspace-header__step-button ${
                     isActive ? 'is-active' : ''

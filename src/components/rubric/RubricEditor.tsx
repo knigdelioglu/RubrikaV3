@@ -28,6 +28,7 @@ export function RubricEditor({
     answerType: 'general_text',
     maxScore: '',
     expectedAnswer: '',
+    keyConcepts: '',
     criteria: [],
     partialCreditHints: '',
     zeroScoreConditions: '',

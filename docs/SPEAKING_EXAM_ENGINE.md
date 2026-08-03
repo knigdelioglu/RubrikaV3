@@ -27,3 +27,12 @@ Sınav kurulurken öğretmen sınav adı, konuşma türü (hazırlıklı/hazırl
 Öğretmen gözlemi ölçütleri (`Ses/Diksiyon`, `Hazırlık/Materyal`, `Beden Dili`, `Öz Değerlendirme`) 3 yıldızlı (`★ ★ ☆`) erişilebilir `TeacherStarRating` kontrolü ile değerlendirilir. Yıldız seçilmeyen kartlar `null` sayılır ve `Geçici toplam` gösterilir.
 
 Production repeatability canonical `evaluationInputHash` ve kayıtlı sonuçla sağlanır. Prompt/policy/model/runtime/transcript değişimi cache’i stale yapar. Legacy decimal kayıtlar okunabilir; yeni model ve öğretmen puanları tam sayıdır.
+
+## Text-only runtime regression (Faz 1.10)
+
+Konuşma rubrik değerlendirmesi mevcut hedef davranışta text-only profildir:
+`speaking_rubric_evaluation_12b` → `SpeakingRubricText` → `mmproj yok`.
+Değerlendirme isteği yalnızca doğrulanmış transkript/rubrik JSON’unu metin
+mesajı olarak taşır; görüntü içeriği gönderilmez. Profil capability/provenance
+kimlikleri ve bu iki koşul regression testleriyle kilitlidir. Bu madde mevcut
+golden speaking fixture sonuçlarını değiştirmez.

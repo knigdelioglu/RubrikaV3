@@ -8,9 +8,12 @@ import {
   createDocumentImportController,
   createPreviewStartController,
   getDocumentWorkspaceSummary,
+  getAutomaticPreviewTargets,
   getWorkspacePreviewStatus,
   importWorkspaceDocument,
   resolveWorkspaceRole,
+  runAutomaticPreviewQueue,
+  shouldShowSelectedDocumentPanel,
   startWorkspacePreview,
   type DocumentWorkspaceCommandGateway,
 } from './documentWorkspace.ts';
@@ -71,6 +74,37 @@ test('deep links preserve document role selection including legacy document type
   assert.equal(resolveWorkspaceRole('exam', null), 'exam_source');
   assert.equal(resolveWorkspaceRole('student', null), 'student_scan');
   assert.equal(resolveWorkspaceRole(null, document('answer_key')), 'answer_key');
+});
+
+test('student intake does not render a duplicate empty document uploader', () => {
+  assert.equal(shouldShowSelectedDocumentPanel('student_scan', false), false);
+  assert.equal(shouldShowSelectedDocumentPanel('student_scan', true), true);
+  assert.equal(shouldShowSelectedDocumentPanel('answer_key', false), true);
+});
+
+test('automatic preview targets include uploaded documents that need an initial render or retry', () => {
+  const documents = [
+    document('exam_source'),
+    document('answer_key', { preview: { status: 'failed' } }),
+    document('student_scan', { preview: { status: 'ready' } }),
+  ];
+  assert.deepEqual(getAutomaticPreviewTargets(documents), [
+    { role: 'exam_source', documentId: 'exam_source-1' },
+    { role: 'answer_key', documentId: 'answer_key-1' },
+  ]);
+});
+
+test('automatic preview queue serializes project preview starts and continues after a failure', async () => {
+  const events: string[] = [];
+  await runAutomaticPreviewQueue([
+    { role: 'exam_source', documentId: 'exam-1' },
+    { role: 'answer_key', documentId: 'answer-1' },
+  ], async (target) => {
+    events.push(`start:${target.documentId}`);
+    if (target.documentId === 'exam-1') throw new Error('preview failed');
+    events.push(`done:${target.documentId}`);
+  });
+  assert.deepEqual(events, ['start:exam-1', 'start:answer-1', 'done:answer-1']);
 });
 
 test('each role calls its existing upload command', async () => {

@@ -263,11 +263,21 @@ export function ExamPackageWorkspacePage() {
         answerType: draft.answerType,
         maxScore: draft.maxScore.trim() ? Number(draft.maxScore) : null,
         expectedAnswer: draft.expectedAnswer.trim() || null,
-        criteria: draft.criteria.map((criterion) => ({
+        keyConcepts: splitRubricLines(draft.keyConcepts),
+          criteria: draft.criteria.map((criterion) => ({
           id: criterion.id,
           label: criterion.label.trim(),
           description: criterion.description.trim(),
           points: Number(criterion.points || 0),
+          levels: (criterion.levels ?? []).map((level) => ({
+            id: level.id.trim(),
+            title: level.title.trim(),
+            requiredConditions: level.requiredConditions.map((condition) => condition.trim()).filter(Boolean),
+            disqualifyingConditions: level.disqualifyingConditions.map((condition) => condition.trim()).filter(Boolean),
+            score: Number(level.score || 0),
+            evidenceRequired: level.evidenceRequired,
+            version: level.version.trim(),
+          })),
         })),
         partialCreditHints: splitRubricLines(draft.partialCreditHints),
         zeroScoreConditions: splitRubricLines(draft.zeroScoreConditions),
@@ -356,6 +366,27 @@ export function ExamPackageWorkspacePage() {
     }
   };
 
+  const migrateRubricLevels = async () => {
+    if (!selectedQuestionId || mutationGuardRef.current.has('rubric-level-migration')) return;
+    mutationGuardRef.current.add('rubric-level-migration');
+    setSavingRubricId('level-migration');
+    setError(null);
+    try {
+      const result = await commands.migrateRubricLevels({ projectId, questionId: selectedQuestionId });
+      setSuccessMessage(
+        result.migratedCount > 0
+          ? 'Eski rubrik seviyeleri öğretmen incelemesi için öneri olarak taşındı.'
+          : 'Bu rubrik için taşınacak eski seviye verisi bulunmadı.',
+      );
+      await invalidateWorkspace();
+    } catch (caught) {
+      setError(caught as AppError);
+    } finally {
+      mutationGuardRef.current.delete('rubric-level-migration');
+      setSavingRubricId(null);
+    }
+  };
+
   const queryError = (
     projectQuery.error
     ?? workflowQuery.error
@@ -391,6 +422,7 @@ export function ExamPackageWorkspacePage() {
           </span>
           <LoadingButton
             type="button"
+            projectWrite={false}
             className="button button--primary"
             loading={freezeMutation.isPending}
             disabledReason={freezeUiState.freezeButtonDisabledReason}
@@ -429,6 +461,7 @@ export function ExamPackageWorkspacePage() {
           <button
             key={value}
             type="button"
+            data-project-write="false"
             role="tab"
             aria-selected={tab === value || (tab === 'freeze' && value === 'rubric')}
             className={tab === value || (tab === 'freeze' && value === 'rubric') ? 'is-active' : ''}
@@ -456,6 +489,7 @@ export function ExamPackageWorkspacePage() {
                 <button
                   key={item.id}
                   type="button"
+                  data-project-write="false"
                   role="option"
                   aria-selected={selectedQuestionId === item.id}
                   className={selectedQuestionId === item.id ? 'is-active' : ''}
@@ -493,7 +527,7 @@ export function ExamPackageWorkspacePage() {
                   type="button"
                   onClick={() => void startQuestionExtraction(false)}
                   loading={questionBusy}
-                  disabledReason={!questionStatusQuery.data?.previewReady ? 'Önce Belgeler alanında sınav önizlemesini hazırlayın.' : undefined}
+                  disabledReason={!questionStatusQuery.data?.previewReady ? 'Sınav önizlemesi arka planda hazırlanıyor.' : undefined}
                 >
                   <PlayCircle size={16} /> PDF’den Yeniden Çıkar
                 </LoadingButton>
@@ -522,9 +556,9 @@ export function ExamPackageWorkspacePage() {
                 </div>
                 <div className="question-text-editor__actions">
                   {editingQuestionId !== selectedQuestion.id ? (
-                    <button type="button" className="button button--secondary" onClick={() => setEditingQuestionId(selectedQuestion.id)}>Düzenle</button>
+                    <button type="button" data-project-write="false" className="button button--secondary" onClick={() => setEditingQuestionId(selectedQuestion.id)}>Düzenle</button>
                   ) : (
-                    <button type="button" className="button button--secondary" onClick={() => {
+                    <button type="button" data-project-write="false" className="button button--secondary" onClick={() => {
                       setQuestionDrafts((current) => ({ ...current, [selectedQuestion.id]: selectedQuestion.questionText.value }));
                       setDirtyQuestionIds((current) => {
                         const next = new Set(current);
@@ -573,11 +607,19 @@ export function ExamPackageWorkspacePage() {
                 <LoadingButton type="button" loading={savingRubricId === 'import'} onClick={() => void importRubricJson()}>
                   <FileUp size={16} /> JSON Yükle
                 </LoadingButton>
-                <LoadingButton type="button" loading={rubricBusy} onClick={() => setQuestionCountDialogOpen(true)}>
+                <LoadingButton type="button" projectWrite={false} loading={rubricBusy} onClick={() => setQuestionCountDialogOpen(true)}>
                   <FileSearch size={16} /> PDF’den Yeniden Çıkar
                 </LoadingButton>
-                <LoadingButton type="button" loading={validationQuery.isFetching} onClick={() => void validationQuery.refetch()}>
+                <LoadingButton type="button" projectWrite={false} loading={validationQuery.isFetching} onClick={() => void validationQuery.refetch()}>
                   <CheckCircle2 size={16} /> Rubrikleri Doğrula
+                </LoadingButton>
+                <LoadingButton
+                  type="button"
+                  loading={savingRubricId === 'level-migration'}
+                  disabledReason={!selectedQuestionId ? 'Önce bir soru seçin.' : undefined}
+                  onClick={() => void migrateRubricLevels()}
+                >
+                  <RefreshCcw size={16} /> Eski seviyeleri öneriye taşı
                 </LoadingButton>
               </div>
               {selectedRubricItem && selectedRubricDraft ? (
@@ -656,6 +698,7 @@ export function ExamPackageWorkspacePage() {
                 <p>{freezeUiState.nextStepText}</p>
                 <LoadingButton
                   type="button"
+                  projectWrite={false}
                   className="button button--primary"
                   loading={freezeMutation.isPending}
                   disabledReason={freezeUiState.freezeButtonDisabledReason}
@@ -681,13 +724,13 @@ export function ExamPackageWorkspacePage() {
 
           {tab !== 'freeze' && (
             <footer className="package-question-navigation">
-              <button type="button" className="button button--secondary" disabled={!previousId} onClick={() => updateSearch(location.search, navigate, projectId, { questionId: previousId })}><ArrowLeft size={16} /> Önceki Soru</button>
+              <button type="button" data-project-write="false" className="button button--secondary" disabled={!previousId} onClick={() => updateSearch(location.search, navigate, projectId, { questionId: previousId })}><ArrowLeft size={16} /> Önceki Soru</button>
               {tab === 'question' ? (
-                <button type="button" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'rubric' })}>Rubriğe Geç <ArrowRight size={16} /></button>
+                <button type="button" data-project-write="false" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'rubric' })}>Rubriğe Geç <ArrowRight size={16} /></button>
               ) : followingId ? (
-                <button type="button" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'question', questionId: followingId })}>Sonraki Soru <ArrowRight size={16} /></button>
+                <button type="button" data-project-write="false" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'question', questionId: followingId })}>Sonraki Soru <ArrowRight size={16} /></button>
               ) : (
-                <button type="button" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'freeze' })}>Paket Özetine Geç <ArrowRight size={16} /></button>
+                <button type="button" data-project-write="false" className="button button--primary" onClick={() => updateSearch(location.search, navigate, projectId, { tab: 'freeze' })}>Paket Özetine Geç <ArrowRight size={16} /></button>
               )}
             </footer>
           )}

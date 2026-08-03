@@ -110,6 +110,7 @@ pub fn default_question(number: u32) -> Question {
             source: None,
             max_score: None,
             expected_answer: None,
+            key_concepts: vec![],
             criteria: vec![],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],

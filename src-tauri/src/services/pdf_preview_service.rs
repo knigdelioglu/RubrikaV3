@@ -116,12 +116,20 @@ impl PdfPreviewService {
             .preview
             .as_ref()
             .and_then(|preview| preview.job_id.clone());
-        let total_pages = document
+        let mut total_pages = document
             .preview
             .as_ref()
             .and_then(|preview| preview.page_count)
             .or_else(|| index.as_ref().map(|index| index.page_count))
             .unwrap_or(document.page_count);
+        // Older queued preview jobs were persisted before page_count was
+        // resolved. Recover the display total from the source PDF so those
+        // projects do not remain visible as an unexplained 0/0 operation.
+        if total_pages == 0 {
+            if let Ok(source_path) = document.resolve_path_with_root(&trusted_root) {
+                total_pages = self.pdf_service.page_count(&source_path).unwrap_or(0);
+            }
+        }
         let subject = if document.role == DocumentRole::StudentScan {
             "Öğrenci PDF"
         } else {
@@ -181,7 +189,10 @@ impl PdfPreviewService {
         let trusted_root = self.project_store.trusted_project_root(project_id)?;
         let metadata_path = active_preview_metadata_path(&trusted_root, document)?;
         read_active_preview_index(&metadata_path, document)
-            .and_then(|index| materialize_preview_pages(&trusted_root, index.pages))
+            // The command result is a frontend read model. Keep the managed
+            // relative path here so the UI can resolve it through the
+            // `managed-asset` protocol without exposing a filesystem path.
+            .and_then(|index| normalize_preview_pages(&trusted_root, index.pages))
             .map_err(|_| AppError {
                 code: AppErrorCode::PdfPreviewNotFound,
                 message: "Sayfa önizleme önbelleği bulunamadı.".to_string(),
@@ -288,6 +299,23 @@ impl PdfPreviewService {
         let trusted_root = self.project_store.trusted_project_root(&project_id)?;
         validate_pdf_source(&document, &trusted_root)?;
         let source_path = document.resolve_path_with_root(&trusted_root)?;
+        let expected_page_count = if document.page_count > 0 {
+            document.page_count
+        } else {
+            self.pdf_service.page_count(&source_path)?
+        };
+        if expected_page_count == 0 {
+            return Err(AppError {
+                code: AppErrorCode::PreviewGenerationFailed,
+                message: "PDF sayfa sayısı belirlenemedi.".to_string(),
+                recoverable: true,
+                suggested_action: Some(
+                    "Geçerli bir PDF seçip önizlemeyi yeniden oluşturun.".to_string(),
+                ),
+                technical_details: Some(format!("document_id={document_id}; page_count=0")),
+                correlation_id: Uuid::new_v4().to_string(),
+            });
+        }
         let source_fingerprint = file_fingerprint(&source_path)?;
         let generation_id = Uuid::new_v4().to_string();
 
@@ -308,7 +336,7 @@ impl PdfPreviewService {
             project_id.clone(),
             Some(project.root_path.clone()),
             JobKind::PdfPreviewRender,
-            1,
+            expected_page_count,
             "PDF önizlemeleri hazırlanıyor...".to_string(),
         )?;
 
@@ -331,7 +359,7 @@ impl PdfPreviewService {
                             rendered_at: current_preview
                                 .as_ref()
                                 .and_then(|value| value.rendered_at.clone()),
-                            page_count: current_preview.as_ref().and_then(|value| value.page_count),
+                            page_count: Some(expected_page_count),
                             job_id: Some(job.id.clone()),
                             error_message: None,
                             active_generation_id: current_preview
@@ -963,12 +991,28 @@ fn materialize_preview_pages(
     trusted_root: &TrustedProjectRoot,
     pages: Vec<PdfPagePreview>,
 ) -> Result<Vec<PdfPagePreview>, AppError> {
+    let normalized = normalize_preview_pages(trusted_root, pages)?;
+    normalized
+        .into_iter()
+        .map(|mut page| {
+            let managed = trusted_root.managed(&page.image_path)?;
+            let resolved = trusted_root.resolve_existing_file(&managed)?;
+            page.image_path = resolved.to_string_lossy().to_string();
+            Ok(page)
+        })
+        .collect()
+}
+
+fn normalize_preview_pages(
+    trusted_root: &TrustedProjectRoot,
+    pages: Vec<PdfPagePreview>,
+) -> Result<Vec<PdfPagePreview>, AppError> {
     pages
         .into_iter()
         .map(|mut page| {
             let managed = trusted_root.adapt_legacy_document_path(&page.image_path)?;
-            let resolved = trusted_root.resolve_existing_file(&managed)?;
-            page.image_path = resolved.to_string_lossy().to_string();
+            trusted_root.resolve_existing_file(&managed)?;
+            page.image_path = managed.as_str().to_string();
             Ok(page)
         })
         .collect()
@@ -1051,6 +1095,7 @@ mod tests {
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {
@@ -1132,6 +1177,7 @@ mod tests {
             }],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {
@@ -1215,6 +1261,44 @@ mod tests {
     }
 
     #[test]
+    fn preview_status_keeps_known_total_when_no_page_is_rendered_yet() {
+        let store = ProjectStore::new();
+        let root = temp_project_root();
+        let mut project = store
+            .create_project("p".into(), root.to_string_lossy().to_string())
+            .expect("project");
+        project.student_scan_document_id = None;
+        project.documents.push(Document {
+            id: "doc-1".into(),
+            role: DocumentRole::AnswerKey,
+            file_name: "rubric.pdf".into(),
+            stored_path: "documents/rubric.pdf".into(),
+            page_count: 0,
+            added_at: "now".into(),
+            checksum: None,
+            preview: Some(PdfPreviewState {
+                status: PdfPreviewStatus::Queued,
+                rendered_at: None,
+                page_count: Some(2),
+                job_id: None,
+                error_message: None,
+                active_generation_id: None,
+                pending_generation_id: Some("generation".into()),
+                source_fingerprint: None,
+            }),
+        });
+        store.save_project(&project).expect("save project");
+
+        let service = service_for_tests(store);
+        let status = service
+            .get_pdf_preview_status(&project.id, "doc-1")
+            .expect("status");
+        assert_eq!(status.preview_count, 0);
+        assert_eq!(status.page_count, 2);
+        assert!(status.message.contains("0/2"));
+    }
+
+    #[test]
     fn require_ready_page_previews_returns_not_ready_when_image_missing() {
         let store = ProjectStore::new();
         let root = temp_project_root();
@@ -1272,6 +1356,67 @@ mod tests {
             .require_ready_page_previews(&project.id, "doc-1")
             .expect_err("image should be missing");
         assert_eq!(error.code, AppErrorCode::PdfPreviewNotReady);
+    }
+
+    #[test]
+    fn list_page_previews_returns_managed_relative_paths_for_frontend() {
+        let store = ProjectStore::new();
+        let root = temp_project_root();
+        let mut project = store
+            .create_project("p".into(), root.to_string_lossy().to_string())
+            .expect("project");
+        project.student_scan_document_id = None;
+
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(PathBuf::from(&project.root_path), false)
+                .expect("trusted root");
+        let image_path = root.join("outputs/previews/doc-1/page_1.png");
+        std::fs::create_dir_all(image_path.parent().expect("image parent")).expect("image dir");
+        std::fs::write(&image_path, b"PNGDATA").expect("image");
+        let metadata = PdfPreviewIndex {
+            document_id: "doc-1".into(),
+            page_count: 1,
+            rendered_at: "now".into(),
+            pages: vec![PdfPagePreview {
+                document_id: "doc-1".into(),
+                page_number: 1,
+                image_path: image_path.to_string_lossy().to_string(),
+                width: 100,
+                height: 100,
+                rendered_at: "now".into(),
+            }],
+        };
+        write_preview_index(
+            &preview_metadata_path(&trusted_root, "doc-1").expect("metadata path"),
+            &metadata,
+        )
+        .expect("metadata");
+        project.documents.push(Document {
+            id: "doc-1".into(),
+            role: DocumentRole::ExamSource,
+            file_name: "exam.pdf".into(),
+            stored_path: "documents/exam.pdf".into(),
+            page_count: 1,
+            added_at: "now".into(),
+            checksum: None,
+            preview: Some(PdfPreviewState {
+                status: PdfPreviewStatus::Ready,
+                rendered_at: Some("now".into()),
+                page_count: Some(1),
+                job_id: Some("job".into()),
+                error_message: None,
+                active_generation_id: None,
+                pending_generation_id: None,
+                source_fingerprint: None,
+            }),
+        });
+        store.save_project(&project).expect("save project");
+
+        let service = service_for_tests(store);
+        let pages = service
+            .list_pdf_page_previews(&project.id, "doc-1")
+            .expect("pages");
+        assert_eq!(pages[0].image_path, "outputs/previews/doc-1/page_1.png");
     }
 
     #[test]

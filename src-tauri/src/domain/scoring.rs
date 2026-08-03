@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use super::model::{SamplingParameters, SemanticCriterionDecision};
 use super::project::{ExamPackageFreezeStatus, Project};
 use super::question::is_question_text_ready;
 use super::rubric::{validate_rubric_state, RubricCriterion};
@@ -16,7 +17,215 @@ pub enum ScoringReviewStatus {
     Invalidated,
 }
 
+/// No calibration model is enabled in this phase. The version is still
+/// persisted so an anchor can never silently cross a future calibration
+/// policy boundary.
+pub const SCORING_ANCHOR_CALIBRATION_VERSION: &str = "not_calibrated_v1";
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringAnchorStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringAnchorActionKind {
+    Created,
+    Revoked,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringAnchorEligibility {
+    Eligible,
+    Stale,
+    Ineligible,
+    Revoked,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringAnchorAction {
+    pub action: ScoringAnchorActionKind,
+    pub actor_kind: String,
+    pub occurred_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringAnchorEvidence {
+    #[serde(default)]
+    pub answer_normalized_hash: String,
+    #[serde(default)]
+    pub answer_raw_hash: String,
+    #[serde(default)]
+    pub ocr_record_hash: String,
+    pub awarded_score: f32,
+    pub max_score: f32,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub criterion_scores: Vec<ScoringCriterionScore>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_notes: Option<String>,
+}
+
+/// Canonical, append-preserving anchor state. Eligibility is intentionally
+/// not stored here: it is derived against the currently open project/QEP by
+/// `ScoringAnchorService`, so rubric and policy changes cannot be hidden by a
+/// stale persisted flag.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringAnchor {
+    pub id: String,
+    pub version: String,
+    pub source_record_id: String,
+    pub question_id: String,
+    pub question_number: u32,
+    pub qep_fingerprint: String,
+    pub question_text_hash: String,
+    pub rubric_hash: String,
+    pub policy_version: String,
+    #[serde(default)]
+    pub scoring_fingerprint: String,
+    pub calibration_version: String,
+    pub final_score: f32,
+    pub max_score: f32,
+    pub evidence: ScoringAnchorEvidence,
+    pub status: ScoringAnchorStatus,
+    #[serde(default)]
+    pub actions: Vec<ScoringAnchorAction>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_reason: Option<String>,
+}
+
+/// Teacher-facing read DTO. The canonical anchor remains immutable apart from
+/// explicit revoke metadata; the eligibility fields are a current read model.
+#[derive(Debug, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringAnchorDto {
+    #[serde(flatten)]
+    pub anchor: ScoringAnchor,
+    pub eligibility: ScoringAnchorEligibility,
+    pub eligibility_reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringDecisionState {
+    #[default]
+    Provisional,
+    #[serde(alias = "candidate")]
+    ModelCandidate,
+    DeterministicAccepted,
+    AutoAccepted,
+    TeacherApproved,
+    Rejected,
+    Failed,
+}
+
 pub type ScoringCriterionScore = crate::domain::model::ScoringCriterionScore;
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringExecutionKind {
+    Deterministic,
+    Model,
+    CandidateCache,
+    ExactDuplicateReuse,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringExecutionDiagnostics {
+    pub kind: ScoringExecutionKind,
+    pub model_called: bool,
+    pub model_call_count: u32,
+    pub scorer_version: String,
+    pub policy_version: String,
+    #[serde(default)]
+    pub cache_hit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_fingerprint: Option<String>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringCacheProvenance {
+    pub fingerprint: String,
+    pub artifact_schema_version: String,
+    pub cache_hit: bool,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringReuseProvenance {
+    pub source_record_id: String,
+    pub source_decision_version: String,
+    pub target_decision_version: String,
+    pub match_key: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringConsistencyReview {
+    pub reason_code: String,
+    pub teacher_message: String,
+    pub cluster_key: String,
+    pub conflicting_record_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringFingerprintComponents {
+    pub qep_fingerprint: String,
+    pub question_id: String,
+    pub answer_hash: String,
+    pub ocr_generation: String,
+    pub prompt_version: String,
+    pub schema_version: String,
+    pub policy_version: String,
+    pub policy_fingerprint: String,
+    pub model_file_fingerprint: String,
+    pub runtime_fingerprint: String,
+    pub sampling_parameters: SamplingParameters,
+    pub calibration_version: String,
+    pub anchor_version: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringFingerprint {
+    pub value: String,
+    pub components: ScoringFingerprintComponents,
+}
+
+impl ScoringFingerprint {
+    pub fn from_components(components: ScoringFingerprintComponents) -> Self {
+        use sha2::{Digest, Sha256};
+
+        let bytes = serde_json::to_vec(&components).unwrap_or_default();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        Self {
+            value: hex::encode(hasher.finalize()),
+            components,
+        }
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -72,7 +281,13 @@ pub struct ScoringRecord {
     #[serde(default = "default_scoring_applied")]
     pub scoring_applied: bool,
     #[serde(default)]
+    pub decision_state: ScoringDecisionState,
+    #[serde(default)]
+    pub decision_version: String,
+    #[serde(default)]
     pub criterion_scores: Vec<ScoringCriterionScore>,
+    #[serde(default)]
+    pub semantic_decisions: Vec<SemanticCriterionDecision>,
     pub rationale: String,
     pub confidence: f32,
     pub needs_review: bool,
@@ -85,6 +300,24 @@ pub struct ScoringRecord {
     pub parse_diagnostics: Option<ScoringParseDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconciliation_diagnostics: Option<ScoringReconciliationDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_diagnostics: Option<ScoringExecutionDiagnostics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_provenance: Option<ScoringCacheProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse_provenance: Option<ScoringReuseProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consistency_review: Option<ScoringConsistencyReview>,
+    #[serde(default)]
+    pub scoring_fingerprint: String,
+    #[serde(default)]
+    pub policy_version: String,
+    #[serde(default)]
+    pub answer_normalized_hash: String,
+    #[serde(default)]
+    pub answer_raw_hash: String,
+    #[serde(default)]
+    pub ocr_generation: String,
     pub source_hash: String,
     pub package_hash: String,
     pub ocr_record_hash: String,
@@ -118,6 +351,38 @@ pub struct ScoringJobResult {
     pub needs_review: u32,
     pub approved: u32,
     pub partial: bool,
+    #[serde(default)]
+    pub summary: ScoringSummaryDto,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringSubmissionSummaryDto {
+    pub submission_id: String,
+    pub provisional_score: f32,
+    pub accepted_score: f32,
+    pub final_score: Option<f32>,
+    pub max_score: f32,
+    pub is_complete: bool,
+    pub expected_record_count: u32,
+    pub accepted_record_count: u32,
+    pub provisional_record_count: u32,
+    pub review_required_count: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ScoringSummaryDto {
+    pub provisional_score: f32,
+    pub accepted_score: f32,
+    pub final_score: Option<f32>,
+    pub max_score: f32,
+    pub is_complete: bool,
+    pub expected_record_count: u32,
+    pub accepted_record_count: u32,
+    pub provisional_record_count: u32,
+    pub review_required_count: u32,
+    pub submissions: Vec<ScoringSubmissionSummaryDto>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +417,7 @@ pub fn scoring_record_hash(record: &StudentAnswerOcrRecord) -> String {
         &record
             .structured_answer
             .as_ref()
-            .map(serde_json::Value::to_string)
+            .map(|answer| serde_json::to_string(answer).unwrap_or_default())
             .unwrap_or_default(),
     ])
 }
@@ -204,11 +469,12 @@ pub fn scoring_rubric_hash(project: &Project) -> String {
                         .iter()
                         .map(|criterion| {
                             format!(
-                                "{}:{}:{}:{}",
+                                "{}:{}:{}:{}:{}",
                                 criterion.id,
                                 criterion.label,
                                 criterion.description,
-                                criterion.points
+                                criterion.points,
+                                serde_json::to_string(&criterion.levels).unwrap_or_default()
                             )
                         })
                         .collect::<Vec<_>>()
@@ -488,6 +754,239 @@ pub fn scoring_record_effective_score(record: &ScoringRecord) -> Option<f32> {
     record.teacher_manual_score.or(record.awarded_score)
 }
 
+pub fn scoring_record_is_final(record: &ScoringRecord) -> bool {
+    record.decision_state == ScoringDecisionState::TeacherApproved
+        && record.scoring_applied
+        && !record.needs_review
+        && scoring_record_effective_score(record).is_some()
+        && matches!(
+            record.teacher_review_status,
+            ScoringReviewStatus::Approved | ScoringReviewStatus::Edited
+        )
+        && !matches!(
+            record.teacher_review_status,
+            ScoringReviewStatus::Invalidated
+        )
+}
+
+pub fn scoring_decision_transition_allowed(
+    from: Option<ScoringDecisionState>,
+    to: ScoringDecisionState,
+    teacher_action: bool,
+) -> bool {
+    match from {
+        None => matches!(
+            to,
+            ScoringDecisionState::ModelCandidate
+                | ScoringDecisionState::DeterministicAccepted
+                | ScoringDecisionState::Provisional
+                | ScoringDecisionState::Failed
+        ),
+        Some(ScoringDecisionState::ModelCandidate) => {
+            matches!(
+                to,
+                ScoringDecisionState::Provisional
+                    | ScoringDecisionState::AutoAccepted
+                    | ScoringDecisionState::Rejected
+                    | ScoringDecisionState::Failed
+            ) || (to == ScoringDecisionState::TeacherApproved && teacher_action)
+        }
+        Some(ScoringDecisionState::DeterministicAccepted)
+        | Some(ScoringDecisionState::AutoAccepted)
+        | Some(ScoringDecisionState::Provisional) => {
+            matches!(
+                to,
+                ScoringDecisionState::Provisional | ScoringDecisionState::Rejected
+            ) || (to == ScoringDecisionState::TeacherApproved && teacher_action)
+        }
+        Some(ScoringDecisionState::Failed) => {
+            to == ScoringDecisionState::Rejected
+                || (to == ScoringDecisionState::TeacherApproved && teacher_action)
+        }
+        Some(ScoringDecisionState::TeacherApproved) => {
+            to == ScoringDecisionState::TeacherApproved
+                || (to == ScoringDecisionState::Rejected && teacher_action)
+        }
+        Some(ScoringDecisionState::Rejected) => {
+            to == ScoringDecisionState::Rejected
+                || (to == ScoringDecisionState::TeacherApproved && teacher_action)
+        }
+    }
+}
+
+pub fn next_scoring_decision_version(current: &str) -> String {
+    let number = current
+        .strip_prefix('v')
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    format!("v{number}")
+}
+
+pub fn scoring_record_is_accepted(record: &ScoringRecord) -> bool {
+    matches!(
+        record.decision_state,
+        ScoringDecisionState::DeterministicAccepted
+            | ScoringDecisionState::AutoAccepted
+            | ScoringDecisionState::TeacherApproved
+    ) && record.scoring_applied
+        && !record.needs_review
+        && !matches!(
+            record.teacher_review_status,
+            ScoringReviewStatus::Invalidated
+        )
+        && scoring_record_effective_score(record).is_some()
+}
+
+pub fn scoring_record_is_provisional(record: &ScoringRecord) -> bool {
+    matches!(
+        record.decision_state,
+        ScoringDecisionState::ModelCandidate | ScoringDecisionState::Provisional
+    ) && record.scoring_applied
+        && !matches!(
+            record.teacher_review_status,
+            ScoringReviewStatus::Invalidated
+        )
+        && scoring_record_effective_score(record).is_some()
+}
+
+fn scoring_summary_score(record: &ScoringRecord) -> Option<f32> {
+    scoring_record_effective_score(record)
+        .map(|score| score.max(0.0).min(record.max_score.max(0.0)))
+}
+
+pub fn scoring_summary(project: &Project) -> ScoringSummaryDto {
+    let active_records = scoring_active_records(project);
+    let mut submission_summaries = Vec::with_capacity(project.student_submissions.len());
+
+    for submission in &project.student_submissions {
+        let records: Vec<&ScoringRecord> = active_records
+            .iter()
+            .copied()
+            .filter(|record| record.submission_id == submission.id)
+            .collect();
+        let accepted_records: Vec<&ScoringRecord> = records
+            .iter()
+            .copied()
+            .filter(|record| {
+                scoring_record_is_accepted(record) && scoring_summary_score(record).is_some()
+            })
+            .collect();
+        let provisional_records: Vec<&ScoringRecord> = records
+            .iter()
+            .copied()
+            .filter(|record| {
+                scoring_record_is_provisional(record) && scoring_summary_score(record).is_some()
+            })
+            .collect();
+        let accepted_score = accepted_records
+            .iter()
+            .filter_map(|record| scoring_summary_score(record))
+            .sum::<f32>();
+        let provisional_score = accepted_score
+            + provisional_records
+                .iter()
+                .filter_map(|record| scoring_summary_score(record))
+                .sum::<f32>();
+        let max_score = project
+            .questions
+            .iter()
+            .map(|question| {
+                question
+                    .rubric
+                    .max_score
+                    .unwrap_or(question.max_score)
+                    .max(0.0)
+            })
+            .sum::<f32>();
+        let expected_record_count = project.questions.len() as u32;
+        let final_records: Vec<&ScoringRecord> = records
+            .iter()
+            .copied()
+            .filter(|record| scoring_record_is_final(record))
+            .collect();
+        let final_score = final_records
+            .iter()
+            .filter_map(|record| scoring_summary_score(record))
+            .sum::<f32>();
+        let is_complete = expected_record_count > 0
+            && project.questions.iter().all(|question| {
+                final_records.iter().any(|record| {
+                    record.question_id == question.id && scoring_summary_score(record).is_some()
+                })
+            });
+        let review_required_count = records
+            .iter()
+            .filter(|record| {
+                record.needs_review
+                    || matches!(
+                        record.decision_state,
+                        ScoringDecisionState::Provisional | ScoringDecisionState::Failed
+                    )
+            })
+            .count() as u32;
+
+        submission_summaries.push(ScoringSubmissionSummaryDto {
+            submission_id: submission.id.clone(),
+            provisional_score,
+            accepted_score,
+            final_score: is_complete.then_some(final_score),
+            max_score,
+            is_complete,
+            expected_record_count,
+            accepted_record_count: accepted_records.len() as u32,
+            provisional_record_count: provisional_records.len() as u32,
+            review_required_count,
+        });
+    }
+
+    let provisional_score = submission_summaries
+        .iter()
+        .map(|summary| summary.provisional_score)
+        .sum::<f32>();
+    let accepted_score = submission_summaries
+        .iter()
+        .map(|summary| summary.accepted_score)
+        .sum::<f32>();
+    let is_complete = !submission_summaries.is_empty()
+        && submission_summaries
+            .iter()
+            .all(|summary| summary.is_complete);
+
+    ScoringSummaryDto {
+        provisional_score,
+        accepted_score,
+        final_score: is_complete.then_some(
+            submission_summaries
+                .iter()
+                .filter_map(|summary| summary.final_score)
+                .sum(),
+        ),
+        max_score: submission_summaries
+            .iter()
+            .map(|summary| summary.max_score)
+            .sum(),
+        is_complete,
+        expected_record_count: submission_summaries
+            .iter()
+            .map(|summary| summary.expected_record_count)
+            .sum(),
+        accepted_record_count: submission_summaries
+            .iter()
+            .map(|summary| summary.accepted_record_count)
+            .sum(),
+        provisional_record_count: submission_summaries
+            .iter()
+            .map(|summary| summary.provisional_record_count)
+            .sum(),
+        review_required_count: submission_summaries
+            .iter()
+            .map(|summary| summary.review_required_count)
+            .sum(),
+        submissions: submission_summaries,
+    }
+}
+
 pub fn scoring_record_is_current(record: &ScoringRecord, project: &Project) -> bool {
     record.package_hash == scoring_package_hash(project)
 }
@@ -692,6 +1191,8 @@ mod tests {
                 needs_review: false,
                 review_reasons: vec![],
                 warnings: vec![],
+                review_policy: None,
+                model_provenance: None,
                 model_name: None,
                 prompt_version: "v1".into(),
                 created_at: chrono::Utc::now(),
@@ -758,11 +1259,13 @@ mod tests {
                     source: None,
                     max_score: Some(10.0),
                     expected_answer: Some("Cevap".into()),
+                    key_concepts: vec![],
                     criteria: vec![RubricCriterion {
                         id: "c-1".into(),
                         label: "Kriter".into(),
                         description: "Açıklama".into(),
                         points: 10.0,
+                        levels: vec![],
                     }],
                     partial_credit_hints: vec![],
                     zero_score_conditions: vec![],
@@ -781,6 +1284,7 @@ mod tests {
                 summary: crate::domain::workflow::WorkflowSummary::default(),
             },
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
         }
     }
@@ -792,6 +1296,100 @@ mod tests {
         assert!(readiness.ready);
         assert_eq!(readiness.blockers, Vec::<String>::new());
         assert_eq!(readiness.expected_records, 1);
+    }
+
+    #[test]
+    fn reviewable_score_is_provisional_until_teacher_approval() {
+        let mut project = base_project();
+        let now = chrono::Utc::now();
+        project.scoring_records = vec![ScoringRecord {
+            id: "record-1".into(),
+            run_id: "run-1".into(),
+            submission_id: "submission-1".into(),
+            student_id: "student-1".into(),
+            student_display_name: Some("Ali".into()),
+            student_number: Some("1".into()),
+            student_class_name: Some("A".into()),
+            question_id: "q-1".into(),
+            question_number: 1,
+            max_score: 10.0,
+            awarded_score: Some(7.0),
+            scoring_applied: true,
+            decision_state: ScoringDecisionState::Provisional,
+            decision_version: "v1".into(),
+            criterion_scores: vec![],
+            semantic_decisions: vec![],
+            rationale: "Kontrol gerektiren puan.".into(),
+            confidence: 0.7,
+            needs_review: true,
+            review_reasons: vec!["low_scoring_confidence".into()],
+            warnings: vec![],
+            raw_model_output: "{}".into(),
+            parse_diagnostics: None,
+            reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
+            source_hash: "source".into(),
+            package_hash: "package".into(),
+            ocr_record_hash: "ocr".into(),
+            question_text_hash: "question".into(),
+            rubric_hash: "rubric".into(),
+            teacher_review_status: ScoringReviewStatus::PendingReview,
+            teacher_manual_score: None,
+            teacher_reviewed_at: None,
+            teacher_notes: None,
+            invalidated_at: None,
+            invalidation_reason: None,
+            created_at: now,
+            updated_at: now,
+        }];
+
+        let provisional = scoring_summary(&project);
+        assert_eq!(provisional.provisional_score, 7.0);
+        assert_eq!(provisional.accepted_score, 0.0);
+        assert_eq!(provisional.final_score, None);
+        assert!(!provisional.is_complete);
+
+        let record = &mut project.scoring_records[0];
+        record.decision_state = ScoringDecisionState::TeacherApproved;
+        record.needs_review = false;
+        record.teacher_review_status = ScoringReviewStatus::Approved;
+        let accepted = scoring_summary(&project);
+        assert_eq!(accepted.provisional_score, 7.0);
+        assert_eq!(accepted.accepted_score, 7.0);
+        assert_eq!(accepted.final_score, Some(7.0));
+        assert!(accepted.is_complete);
+    }
+
+    #[test]
+    fn scoring_lifecycle_requires_teacher_action_for_final_state() {
+        assert!(scoring_decision_transition_allowed(
+            Some(ScoringDecisionState::ModelCandidate),
+            ScoringDecisionState::Provisional,
+            false
+        ));
+        assert!(scoring_decision_transition_allowed(
+            Some(ScoringDecisionState::ModelCandidate),
+            ScoringDecisionState::TeacherApproved,
+            true
+        ));
+        assert!(!scoring_decision_transition_allowed(
+            Some(ScoringDecisionState::ModelCandidate),
+            ScoringDecisionState::TeacherApproved,
+            false
+        ));
+        assert!(scoring_decision_transition_allowed(
+            Some(ScoringDecisionState::DeterministicAccepted),
+            ScoringDecisionState::TeacherApproved,
+            true
+        ));
     }
 
     #[test]
@@ -828,7 +1426,10 @@ mod tests {
             max_score: 10.0,
             awarded_score: Some(8.0),
             scoring_applied: true,
+            decision_state: ScoringDecisionState::AutoAccepted,
+            decision_version: "v1".into(),
             criterion_scores: vec![],
+            semantic_decisions: vec![],
             rationale: "İyi".into(),
             confidence: 0.8,
             needs_review: false,
@@ -837,6 +1438,15 @@ mod tests {
             raw_model_output: "{}".into(),
             parse_diagnostics: None,
             reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
             source_hash: scoring_source_hash(&project),
             package_hash: scoring_package_hash(&project),
             ocr_record_hash: scoring_record_hash(&project.student_answer_ocr_records[0]),
@@ -874,7 +1484,10 @@ mod tests {
             max_score: 10.0,
             awarded_score: Some(8.0),
             scoring_applied: true,
+            decision_state: ScoringDecisionState::TeacherApproved,
+            decision_version: "v1".into(),
             criterion_scores: vec![],
+            semantic_decisions: vec![],
             rationale: "İyi".into(),
             confidence: 0.8,
             needs_review: false,
@@ -883,6 +1496,15 @@ mod tests {
             raw_model_output: "{}".into(),
             parse_diagnostics: None,
             reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
             source_hash: scoring_source_hash(&project),
             package_hash: scoring_package_hash(&project),
             ocr_record_hash: scoring_record_hash(&project.student_answer_ocr_records[0]),
@@ -921,7 +1543,10 @@ mod tests {
                 max_score: 10.0,
                 awarded_score: Some(4.0),
                 scoring_applied: true,
+                decision_state: ScoringDecisionState::AutoAccepted,
+                decision_version: "v1".into(),
                 criterion_scores: vec![],
+                semantic_decisions: vec![],
                 rationale: "old".into(),
                 confidence: 0.5,
                 needs_review: false,
@@ -930,6 +1555,15 @@ mod tests {
                 raw_model_output: "{}".into(),
                 parse_diagnostics: None,
                 reconciliation_diagnostics: None,
+                execution_diagnostics: None,
+                cache_provenance: None,
+                reuse_provenance: None,
+                consistency_review: None,
+                scoring_fingerprint: String::new(),
+                policy_version: String::new(),
+                answer_normalized_hash: String::new(),
+                answer_raw_hash: String::new(),
+                ocr_generation: String::new(),
                 source_hash: "s".into(),
                 package_hash: "p".into(),
                 ocr_record_hash: "o".into(),
@@ -957,7 +1591,10 @@ mod tests {
                 max_score: 10.0,
                 awarded_score: Some(8.0),
                 scoring_applied: true,
+                decision_state: ScoringDecisionState::AutoAccepted,
+                decision_version: "v1".into(),
                 criterion_scores: vec![],
+                semantic_decisions: vec![],
                 rationale: "new".into(),
                 confidence: 0.9,
                 needs_review: false,
@@ -966,6 +1603,15 @@ mod tests {
                 raw_model_output: "{}".into(),
                 parse_diagnostics: None,
                 reconciliation_diagnostics: None,
+                execution_diagnostics: None,
+                cache_provenance: None,
+                reuse_provenance: None,
+                consistency_review: None,
+                scoring_fingerprint: String::new(),
+                policy_version: String::new(),
+                answer_normalized_hash: String::new(),
+                answer_raw_hash: String::new(),
+                ocr_generation: String::new(),
                 source_hash: "s".into(),
                 package_hash: "p".into(),
                 ocr_record_hash: "o".into(),
@@ -1006,7 +1652,10 @@ mod tests {
             max_score: 10.0,
             awarded_score: Some(4.0),
             scoring_applied: true,
+            decision_state: ScoringDecisionState::AutoAccepted,
+            decision_version: "v1".into(),
             criterion_scores: vec![],
+            semantic_decisions: vec![],
             rationale: "old".into(),
             confidence: 0.5,
             needs_review: false,
@@ -1015,6 +1664,15 @@ mod tests {
             raw_model_output: "{}".into(),
             parse_diagnostics: None,
             reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
             source_hash: "s".into(),
             package_hash: "p".into(),
             ocr_record_hash: "o".into(),
@@ -1053,7 +1711,10 @@ mod tests {
                 max_score: 10.0,
                 awarded_score: Some(4.0),
                 scoring_applied: true,
+                decision_state: ScoringDecisionState::AutoAccepted,
+                decision_version: "v1".into(),
                 criterion_scores: vec![],
+                semantic_decisions: vec![],
                 rationale: "legacy".into(),
                 confidence: 0.5,
                 needs_review: false,
@@ -1062,6 +1723,15 @@ mod tests {
                 raw_model_output: "{}".into(),
                 parse_diagnostics: None,
                 reconciliation_diagnostics: None,
+                execution_diagnostics: None,
+                cache_provenance: None,
+                reuse_provenance: None,
+                consistency_review: None,
+                scoring_fingerprint: String::new(),
+                policy_version: String::new(),
+                answer_normalized_hash: String::new(),
+                answer_raw_hash: String::new(),
+                ocr_generation: String::new(),
                 source_hash: "s".into(),
                 package_hash: "p".into(),
                 ocr_record_hash: "o".into(),
@@ -1089,7 +1759,10 @@ mod tests {
                 max_score: 10.0,
                 awarded_score: Some(8.0),
                 scoring_applied: true,
+                decision_state: ScoringDecisionState::AutoAccepted,
+                decision_version: "v1".into(),
                 criterion_scores: vec![],
+                semantic_decisions: vec![],
                 rationale: "new".into(),
                 confidence: 0.9,
                 needs_review: false,
@@ -1098,6 +1771,15 @@ mod tests {
                 raw_model_output: "{}".into(),
                 parse_diagnostics: None,
                 reconciliation_diagnostics: None,
+                execution_diagnostics: None,
+                cache_provenance: None,
+                reuse_provenance: None,
+                consistency_review: None,
+                scoring_fingerprint: String::new(),
+                policy_version: String::new(),
+                answer_normalized_hash: String::new(),
+                answer_raw_hash: String::new(),
+                ocr_generation: String::new(),
                 source_hash: "s".into(),
                 package_hash: "p".into(),
                 ocr_record_hash: "o".into(),

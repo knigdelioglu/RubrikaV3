@@ -1,8 +1,8 @@
 use crate::domain::errors::AppError;
 use crate::domain::project::Project;
-use crate::domain::student::{OcrGeneration, OcrImagePreprocessMode};
+use crate::domain::student::{OcrGeneration, OcrImagePreprocessMode, StudentAnswerOcrJobMode};
 use crate::domain::student::{
-    StudentAnswerCropTemplateItem, StudentAnswerOcrRecord, StudentIdentityCropTemplate,
+    QuestionAnswerTemplate, StudentAnswerOcrRecord, StudentIdentityCropTemplate,
 };
 use crate::services::ocr_image_preprocess_service::OcrImagePreprocessResult;
 use crate::services::student_answer_ocr_service::{
@@ -19,6 +19,8 @@ pub struct ProjectIdInput {
     pub project_id: String,
     #[serde(default)]
     pub force_rerun: bool,
+    #[serde(default)]
+    pub mode: StudentAnswerOcrJobMode,
 }
 
 #[derive(serde::Deserialize)]
@@ -49,7 +51,7 @@ pub struct OcrGenerationInput {
 #[serde(rename_all = "camelCase")]
 pub struct SaveStudentAnswerCropTemplateInput {
     pub project_id: String,
-    pub items: Vec<StudentAnswerCropTemplateItem>,
+    pub templates: Vec<QuestionAnswerTemplate>,
 }
 
 #[derive(serde::Deserialize)]
@@ -76,7 +78,7 @@ pub async fn start_student_answer_ocr(
 ) -> Result<StartStudentAnswerOcrOutput, AppError> {
     state
         .student_answer_ocr_service
-        .start(app, input.project_id, input.force_rerun)
+        .start(app, input.project_id, input.force_rerun, input.mode)
         .await
 }
 
@@ -172,7 +174,7 @@ pub async fn save_student_answer_crop_template(
 ) -> Result<Project, AppError> {
     state
         .student_answer_crop_service
-        .save_template(&input.project_id, input.items)
+        .save_template(&input.project_id, input.templates)
 }
 
 #[tauri::command]
@@ -214,7 +216,6 @@ pub struct SuggestOcrIssueCorrectionWithModelInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue_id: Option<String>,
     pub observed_text: String,
-    pub suggested_text_from_analyzer: String,
     pub question_number: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight_region: Option<crate::domain::student::StudentAnswerOcrCropBBox>,
@@ -246,7 +247,6 @@ pub async fn suggest_ocr_issue_correction_with_model(
             input.ocr_record_id,
             input.issue_id,
             input.observed_text,
-            input.suggested_text_from_analyzer,
             input.question_number,
             input.highlight_region,
             input.crop_ref,

@@ -170,6 +170,7 @@ pub struct DataLossPreflightReport {
     pub durability_uncertain_count: u64,
     pub second_writer_detected: bool,
     pub initialization_write_allowed: bool,
+    pub unverified_writes_allowed: bool,
     pub audit: crate::services::audit_service::AuditChainReport,
     pub verified_backup_count: u64,
     pub failed_backup_count: u64,
@@ -1264,7 +1265,7 @@ fn is_pristine_project_for_initialization(project: &Project) -> bool {
         && project.student_submissions.is_empty()
         && project.student_answer_ocr_records.is_empty()
         && project.student_answer_ocr_generations.is_empty()
-        && project.student_answer_crop_template.items.is_empty()
+        && project.student_answer_crop_template.templates.is_empty()
         && project.student_answer_crop_template.updated_at.is_none()
         && project.student_identity_crop_template.is_none()
         && project.student_scan_document_id.is_none()
@@ -1291,6 +1292,40 @@ fn validation_marker_status(path: &str) -> String {
     } else {
         "NOT_VERIFIED".to_string()
     }
+}
+
+fn allow_unverified_project_writes() -> bool {
+    std::env::var("RUBRIKA_ALLOW_UNVERIFIED_PROJECT_WRITES")
+        .ok()
+        .is_some_and(|value| {
+            let value = value.trim();
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        })
+}
+
+fn is_dev_relaxable_preflight_blocker(reason: &str) -> bool {
+    matches!(
+        reason,
+        "verified backup yok"
+            | "verified backup restore doğrulanmadı"
+            | "process-kill proof failure"
+            | "disk fault proof failure"
+            | "destructive race proof failure"
+            | "full validation marker yok"
+    )
+}
+
+fn filter_preflight_blockers(
+    blockers: Vec<String>,
+    unverified_writes_allowed: bool,
+) -> Vec<String> {
+    if !unverified_writes_allowed {
+        return blockers;
+    }
+    blockers
+        .into_iter()
+        .filter(|reason| !is_dev_relaxable_preflight_blocker(reason))
+        .collect()
 }
 
 fn transaction_preflight_counts(root: &Path) -> (u64, u64) {
@@ -1698,6 +1733,7 @@ impl DiagnosticsContext {
             })
             .unwrap_or(0);
         let second_writer_detected = preflight_second_writer_detected(project_path);
+        let unverified_writes_allowed = allow_unverified_project_writes();
         // This marker is deliberately external to the project and is only
         // produced by the release validation procedure; tests cannot opt in
         // through an application environment variable.
@@ -1842,6 +1878,13 @@ impl DiagnosticsContext {
                 blockers.push(reason.to_string());
             }
         }
+        let blockers = filter_preflight_blockers(blockers, unverified_writes_allowed);
+        if unverified_writes_allowed {
+            warnings.push(
+                "Deneme modu etkin; yedek ve release doğrulama marker'ları yazmayı engellemiyor."
+                    .to_string(),
+            );
+        }
         let decision = if !blockers.is_empty() {
             "DO_NOT_OPEN_FOR_WRITING"
         } else if !warnings.is_empty() {
@@ -1898,6 +1941,7 @@ impl DiagnosticsContext {
             durability_uncertain_count,
             second_writer_detected,
             initialization_write_allowed,
+            unverified_writes_allowed,
             audit,
             verified_backup_count,
             failed_backup_count,
@@ -4563,6 +4607,7 @@ fn rubric_source_label(source: &RubricSource) -> String {
         RubricSource::AnswerKeyPdf => "answer_key_pdf",
         RubricSource::Generated => "generated",
         RubricSource::RubricPdf => "rubric_pdf",
+        RubricSource::GemmaDraft => "gemma_draft",
         RubricSource::Unknown => "unknown",
     }
     .to_string()
@@ -4742,6 +4787,7 @@ BAŞARILAR...";
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {
@@ -4815,6 +4861,7 @@ BAŞARILAR...";
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
+            scoring_anchors: vec![],
             speaking_exams: vec![],
             latest_scoring_run_id: None,
             workflow: WorkflowSnapshot {
@@ -5063,6 +5110,7 @@ BAŞARILAR...";
             label: "Doğruluk".to_string(),
             description: "Tam doğru cevap".to_string(),
             points: 5.0,
+            levels: vec![],
         }];
         let mut q2 = default_question(2);
         q2.rubric.status = RubricStatus::Missing;
@@ -5200,11 +5248,13 @@ BAŞARILAR...";
             source: Some(RubricSource::Manual),
             max_score: Some(10.0),
             expected_answer: Some("Gerçek cevap".to_string()),
+            key_concepts: vec![],
             criteria: vec![crate::domain::rubric::RubricCriterion {
                 id: "c1".to_string(),
                 label: "Doğruluk".to_string(),
                 description: "Tam doğru cevap".to_string(),
                 points: 10.0,
+                levels: vec![],
             }],
             partial_credit_hints: vec![],
             zero_score_conditions: vec![],
@@ -5457,6 +5507,22 @@ BAŞARILAR...";
             .iter()
             .any(|reason| reason == "ikinci writer aktif"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn development_write_override_relaxes_only_release_proof_blockers() {
+        let blockers = vec![
+            "verified backup yok".to_string(),
+            "verified backup restore doğrulanmadı".to_string(),
+            "full validation marker yok".to_string(),
+            "missing referenced artifact var".to_string(),
+        ];
+
+        assert_eq!(filter_preflight_blockers(blockers.clone(), false), blockers);
+        assert_eq!(
+            filter_preflight_blockers(blockers, true),
+            vec!["missing referenced artifact var".to_string()]
+        );
     }
 
     #[test]

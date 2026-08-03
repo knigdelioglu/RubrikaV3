@@ -25,6 +25,11 @@ Start the application in development mode:
 npm run tauri:dev
 ```
 
+Development mode allows disposable local projects to continue without a
+verified-backup/release-proof marker. Real project-integrity findings still
+block writes. Set `RUBRIKA_ALLOW_UNVERIFIED_PROJECT_WRITES=0` before the
+command to exercise the strict gate.
+
 Run quality checks (typecheck, lint, formatting, tests):
 ```bash
 npm run quality

@@ -139,8 +139,11 @@ pub fn durable_rename<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 }
 
-/// Publishes a staged directory and then syncs its parent directory. The
-/// target must not already exist; generation directories are immutable once
+/// Publishes a staged directory and then syncs the directory entries affected
+/// by the rename. The staging and target directories may have different
+/// parents as long as the filesystem can perform the rename atomically; this
+/// is used by preview generations (`.staging` -> `generations`). The target
+/// must not already exist; generation directories are immutable once
 /// published and are never replaced in place.
 pub fn durable_rename_directory<P: AsRef<Path>, Q: AsRef<Path>>(
     staging: P,
@@ -148,13 +151,8 @@ pub fn durable_rename_directory<P: AsRef<Path>, Q: AsRef<Path>>(
 ) -> std::io::Result<()> {
     let staging = staging.as_ref();
     let target = target.as_ref();
-    let parent = target.parent().unwrap_or(Path::new(""));
-    if staging.parent() != target.parent() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "Durable directory rename requires a same-directory staging path.",
-        ));
-    }
+    let staging_parent = staging.parent().unwrap_or(Path::new(""));
+    let target_parent = target.parent().unwrap_or(Path::new(""));
     let staging_metadata = fs::symlink_metadata(staging)?;
     if staging_metadata.file_type().is_symlink() || !staging_metadata.is_dir() {
         return Err(std::io::Error::new(
@@ -169,6 +167,14 @@ pub fn durable_rename_directory<P: AsRef<Path>, Q: AsRef<Path>>(
         ));
     }
     fs::rename(staging, target)?;
+    sync_directory_after_rename(target_parent)?;
+    if staging_parent != target_parent {
+        sync_directory_after_rename(staging_parent)?;
+    }
+    Ok(())
+}
+
+fn sync_directory_after_rename(parent: &Path) -> std::io::Result<()> {
     let parent_file = OpenOptions::new()
         .read(true)
         .open(parent)
@@ -341,8 +347,8 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::{
-        atomic_write_bytes, is_durability_uncertain, remove_dir_within, remove_file_within,
-        set_test_failpoint, test_failpoint_guard,
+        atomic_write_bytes, durable_rename_directory, is_durability_uncertain, remove_dir_within,
+        remove_file_within, set_test_failpoint, test_failpoint_guard,
     };
 
     #[test]
@@ -375,6 +381,26 @@ mod tests {
         assert!(remove_dir_within(&allowed, &directory).expect("safe directory removal"));
         assert!(!file.exists());
         assert!(!directory.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_directory_rename_publishes_preview_from_staging_parent() {
+        let root =
+            std::env::temp_dir().join(format!("rubrika-preview-rename-{}", uuid::Uuid::new_v4()));
+        let staging = root.join("outputs/previews/doc-1/.staging/generation-1");
+        let target = root.join("outputs/previews/doc-1/generations/generation-1");
+        std::fs::create_dir_all(&staging).expect("staging directory");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("target parent");
+        std::fs::write(staging.join("manifest.json"), b"preview").expect("manifest");
+
+        durable_rename_directory(&staging, &target).expect("publish preview generation");
+
+        assert!(!staging.exists());
+        assert_eq!(
+            std::fs::read(target.join("manifest.json")).unwrap(),
+            b"preview"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

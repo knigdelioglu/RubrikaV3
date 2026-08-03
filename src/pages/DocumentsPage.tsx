@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { AlertTriangle, CheckCircle2, FileText, Loader2, Upload } from 'lucide-react';
 import { commands } from '../api/commands';
 import type { AppError } from '../api/errors';
-import type { Document, JobSnapshot, PdfPreviewStatusSnapshot, StudentScanBatch } from '../api/types';
+import type { Document, JobSnapshot, StudentScanBatch } from '../api/types';
 import { ErrorBanner } from '../components/common/ErrorBanner';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { LoadingButton } from '../components/common/LoadingButton';
@@ -20,14 +20,16 @@ import { createDocumentRemovalController } from './documentRemoval';
 import {
   buildDocumentWorkspaceItems,
   createDocumentImportController,
-  createPreviewStartController,
   documentTypeParam,
+  getAutomaticPreviewTargets,
   getDocumentWorkspaceSummary,
   getWorkspacePreviewLabel,
   getWorkspacePreviewStatus,
   getWorkspaceRoleDetails,
   importWorkspaceDocument,
   resolveWorkspaceRole,
+  runAutomaticPreviewQueue,
+  shouldShowSelectedDocumentPanel,
   startWorkspacePreview,
   toWorkspacePreviewState,
   type WorkspaceDocumentRole,
@@ -81,6 +83,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
   const [studentBatchClassId, setStudentBatchClassId] = useState(() => searchParams.get('classId') || '');
   const [newClassName, setNewClassName] = useState('');
   const [batchToRemove, setBatchToRemove] = useState<StudentScanBatch | null>(null);
+  const automaticPreviewStartedRef = useRef(new Set<string>());
 
   const documentsQuery = useQuery({
     queryKey: ['documents', projectId],
@@ -177,6 +180,26 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
     }
   }, [projectId, queryClient]);
 
+  useEffect(() => {
+    if (!projectId || documentsQuery.isLoading) return;
+    const targets = getAutomaticPreviewTargets(documents).filter((target) => {
+      if (automaticPreviewStartedRef.current.has(target.documentId)) return false;
+      automaticPreviewStartedRef.current.add(target.documentId);
+      return true;
+    });
+    if (targets.length === 0) return;
+    void runAutomaticPreviewQueue(targets, async (target) => {
+      try {
+        await startWorkspacePreview(commands, target.role, {
+          projectId,
+          documentId: target.documentId,
+        });
+      } finally {
+        invalidateWorkspace(target.documentId);
+      }
+    });
+  }, [documents, documentsQuery.isLoading, invalidateWorkspace, projectId]);
+
   function updateDeepLink(role: WorkspaceDocumentRole, documentId: string | null, page = 1) {
     const next = new URLSearchParams(searchParams);
     next.set('documentType', documentTypeParam(role));
@@ -211,7 +234,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
       setPreferredDocumentId(document.id);
       setCurrentPage(1);
       updateDeepLink(resolveWorkspaceRole(null, document), document.id);
-      setSuccessMessage(`${document.fileName} başarıyla yüklendi.`);
+      setSuccessMessage(`${document.fileName} başarıyla yüklendi; önizleme arka planda hazırlanıyor.`);
     },
     onError: (mutationError) => {
       setError(operationError(
@@ -223,21 +246,13 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
   });
 
   const batchImportMutation = useMutation({
-    mutationFn: async ({ sourcePath, classId }: { sourcePath: string; classId: string }) => {
-      const output = await commands.importStudentScanBatch({
+    mutationFn: ({ sourcePath, classId }: { sourcePath: string; classId: string }) =>
+      commands.importStudentScanBatch({
         projectId,
         classId,
         sourcePath,
         displayName: fileNameFromPath(sourcePath),
-      });
-      let previewError: unknown = null;
-      try {
-        await commands.startStudentScanPreviewRender({ projectId, documentId: output.document.id });
-      } catch (caught) {
-        previewError = caught;
-      }
-      return { ...output, previewError };
-    },
+      }),
     onMutate: () => {
       setError(null);
       setSuccessMessage(null);
@@ -249,16 +264,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
       setPendingStudentScanPath(null);
       setPreferredDocumentId(output.document.id);
       updateDeepLink('student_scan', output.document.id);
-      if (output.previewError) {
-        setError(operationError(
-          output.previewError,
-          'PDF paketi yüklendi ancak önizleme işi başlatılamadı.',
-          'Paketi açıp “Önizlemeyi Hazırla” ile yeniden deneyin.',
-        ));
-      }
-      setSuccessMessage(!output.previewError
-        ? `${output.document.fileName} sınıfa eklendi; önizleme hazırlanıyor.`
-        : `${output.document.fileName} sınıfa eklendi. Önizlemeyi karttan yeniden başlatın.`);
+      setSuccessMessage(`${output.document.fileName} sınıfa eklendi; önizleme arka planda hazırlanıyor.`);
     },
     onError: (mutationError) => setError(operationError(
       mutationError,
@@ -356,62 +362,6 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
     }
   }
 
-  const previewMutation = useMutation({
-    mutationFn: ({ role, documentId }: { role: WorkspaceDocumentRole; documentId: string }) =>
-      startWorkspacePreview(commands, role, { projectId, documentId }),
-    onMutate: () => {
-      setError(null);
-      setSuccessMessage(null);
-    },
-    onSuccess: (output, variables) => {
-      const currentDocument = documents.find((document) => document.id === variables.documentId);
-      queryClient.setQueryData<PdfPreviewStatusSnapshot>(
-        ['document-preview-status', projectId, variables.role, variables.documentId],
-        (current) => ({
-          documentId: variables.documentId,
-          status: output.status,
-          pageCount: current?.pageCount ?? currentDocument?.pageCount ?? 0,
-          renderedAt: current?.renderedAt,
-          jobId: output.jobId,
-          previewCount: current?.previewCount ?? 0,
-          message: output.status === 'running'
-            ? 'Sayfa görüntüleri hazırlanıyor.'
-            : 'Önizleme hazırlama işi sıraya alındı.',
-        }),
-      );
-      invalidateWorkspace(variables.documentId);
-      setSuccessMessage('Önizleme hazırlama işi başlatıldı. İlerlemeyi burada ve işlem merkezinde görebilirsiniz.');
-    },
-    onError: (mutationError) => {
-      setError(operationError(
-        mutationError,
-        'Önizleme hazırlama işi başlatılamadı.',
-        'Belgeyi kontrol edip yeniden deneyin.',
-      ));
-    },
-  });
-  const previewMutationRef = useRef(previewMutation.mutateAsync);
-  previewMutationRef.current = previewMutation.mutateAsync;
-  const previewController = useMemo(
-    () => createPreviewStartController(
-      (role, documentId) => previewMutationRef.current({ role, documentId }),
-    ),
-    [],
-  );
-
-  async function handlePreview() {
-    if (!selectedDocument || effectivePreviewState === 'queued' || effectivePreviewState === 'running') return;
-    try {
-      await previewController.run(selectedRole, selectedDocument.id);
-    } catch (previewError) {
-      setError(operationError(
-        previewError,
-        'Önizleme hazırlama işi başlatılamadı.',
-        'Belgeyi kontrol edip yeniden deneyin.',
-      ));
-    }
-  }
-
   const documentRemoval = useMemo(
     () => createDocumentRemovalController(
       (documentId) => commands.removeDocument({ projectId, documentId }),
@@ -480,7 +430,6 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
     || batchImportMutation.isPending
     || batchRemoveMutation.isPending
     || removeMutation.isPending;
-  const previewActionLabel = effectivePreviewState === 'failed' ? 'Yeniden Dene' : 'Önizlemeyi Hazırla';
 
   return (
     <div className="documents-workspace">
@@ -499,7 +448,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
               <div><dt>Yüklü belge</dt><dd>{summary.uploadedCount} / 3</dd></div>
               <div><dt>Önizleme hazır</dt><dd>{summary.readyPreviewCount} / 3</dd></div>
               <div><dt>Devam eden iş</dt><dd>{summary.activePreviewCount}</dd></div>
-              <div className={summary.failedPreviewCount ? 'has-error' : ''}><dt>Müdahale gerekli</dt><dd>{summary.failedPreviewCount}</dd></div>
+              <div className={summary.failedPreviewCount ? 'has-error' : ''}><dt>Önizleme hatası</dt><dd>{summary.failedPreviewCount}</dd></div>
             </dl>
           </header>
         </>
@@ -524,6 +473,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
             <button
               key={item.role}
               type="button"
+              data-project-write="false"
               className={`document-selector__item ${active ? 'is-active' : ''}`}
               onClick={() => selectRole(item.role)}
               aria-pressed={active}
@@ -551,7 +501,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
               <h3 id="student-batch-title">Öğrenci PDF paketleri</h3>
               <p>Her PDF’yi yüklemeden önce ait olduğu sınıfı doğrulayın. Bu sınıf, paketten oluşan bütün öğrencilere uygulanır.</p>
             </div>
-            <button type="button" className="button button--primary" onClick={() => void handleChooseStudentBatchPdf()} disabled={actionBusy}>
+            <button type="button" data-project-write="false" className="button button--primary" onClick={() => void handleChooseStudentBatchPdf()} disabled={actionBusy}>
               <Upload size={17} aria-hidden="true" /> PDF Paketi Seç
             </button>
           </div>
@@ -585,9 +535,10 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
             <div className="student-batch-intake__pending" role="status">
               <FileText size={20} aria-hidden="true" />
               <div><strong>{fileNameFromPath(pendingStudentScanPath)}</strong><span>Seçilen sınıfı doğruladıktan sonra yükleyin.</span></div>
-              <button type="button" className="button button--secondary" onClick={() => setPendingStudentScanPath(null)} disabled={batchImportMutation.isPending}>İptal</button>
+              <button type="button" data-project-write="false" className="button button--secondary" onClick={() => setPendingStudentScanPath(null)} disabled={batchImportMutation.isPending}>İptal</button>
               <LoadingButton
                 type="button"
+                projectWrite={false}
                 className="button button--primary"
                 onClick={() => batchImportMutation.mutate({ sourcePath: pendingStudentScanPath, classId: studentBatchClassId })}
                 loading={batchImportMutation.isPending}
@@ -620,13 +571,13 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
                       <div><dt>Öğrenci</dt><dd>{submissionCount}</dd></div>
                     </dl>
                     <div className="student-batch-card__actions">
-                      <button type="button" className="button button--secondary" onClick={() => {
+                      <button type="button" data-project-write="false" className="button button--secondary" onClick={() => {
                         setPreferredDocumentId(batch.documentId);
                         setCurrentPage(1);
                         updateDeepLink('student_scan', batch.documentId);
-                      }}>Önizlemeyi Aç</button>
+                      }}>Belgeyi Aç</button>
                       <Link className="button button--secondary" to={projectStudentOperationsPath(projectId, 'grouping', `classId=${encodeURIComponent(batch.classId)}&batchId=${encodeURIComponent(batch.id)}`)}>Gruplamayı Aç</Link>
-                      <button type="button" className="button button--danger-outline" onClick={() => setBatchToRemove(batch)} disabled={actionBusy}>Sil</button>
+                      <button type="button" data-project-write="false" className="button button--danger-outline" onClick={() => setBatchToRemove(batch)} disabled={actionBusy}>Sil</button>
                     </div>
                   </article>
                 );
@@ -637,6 +588,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
         </section>
       )}
 
+      {shouldShowSelectedDocumentPanel(selectedRole, Boolean(selectedDocument)) && (
       <section id="selected-document-workspace" className="selected-document" aria-labelledby="selected-document-title">
         <div className="selected-document__heading">
           <div>
@@ -648,6 +600,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
             <div className="selected-document__actions">
               <LoadingButton
                 type="button"
+                projectWrite={false}
                 className="button button--secondary"
                 onClick={() => void handleImport(selectedRole)}
                 loading={importMutation.isPending && importMutation.variables?.role === selectedRole}
@@ -657,6 +610,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
               </LoadingButton>
               <button
                 type="button"
+                data-project-write="false"
                 className="button button--danger-outline"
                 disabled={actionBusy}
                 onClick={() => {
@@ -677,6 +631,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
             <p>{selectedItem?.purpose}</p>
             <LoadingButton
               type="button"
+              projectWrite={false}
               className="button button--primary document-empty-state__button"
               onClick={() => void handleImport(selectedRole)}
               loading={importMutation.isPending && importMutation.variables?.role === selectedRole}
@@ -727,18 +682,9 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
               <div className={`document-preview-callout ${effectivePreviewState === 'failed' ? 'is-error' : ''}`}>
                 {effectivePreviewState === 'failed' ? <AlertTriangle size={22} aria-hidden="true" /> : <FileText size={22} aria-hidden="true" />}
                 <div>
-                  <strong>{effectivePreviewState === 'failed' ? 'Önizleme oluşturulamadı' : 'Sayfaları incelemek için önizleme hazırlayın'}</strong>
-                  <p>{effectivePreviewState === 'failed' ? 'Belge korunuyor. Önizleme işini yeniden başlatabilirsiniz.' : 'Bu işlem arka planda çalışır; başka bir bölüme geçseniz de devam eder.'}</p>
+                  <strong>{effectivePreviewState === 'failed' ? 'Önizleme oluşturulamadı' : 'Önizleme arka planda hazırlanıyor'}</strong>
+                  <p>{effectivePreviewState === 'failed' ? 'Belge korunuyor. Hata ayrıntılarını işlem merkezinden kontrol edebilirsiniz.' : 'Sayfa görüntüleri hazır olduğunda bu alanda görünecek.'}</p>
                 </div>
-                <LoadingButton
-                  type="button"
-                  className="button button--primary"
-                  onClick={() => void handlePreview()}
-                  loading={previewMutation.isPending}
-                  disabledReason={previewRunning ? 'Önizleme işi zaten devam ediyor.' : undefined}
-                >
-                  {previewActionLabel}
-                </LoadingButton>
               </div>
             )}
 
@@ -748,8 +694,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
             {hasUsablePreview && !pagePreviewsQuery.isLoading && pagePreviews.length === 0 && (
               <div className="document-preview-callout is-error">
                 <AlertTriangle size={22} aria-hidden="true" />
-                <div><strong>Sayfa görüntüsü bulunamadı</strong><p>Belge korunuyor. Önizlemeyi yeniden hazırlayın.</p></div>
-                <LoadingButton type="button" className="button button--primary" onClick={() => void handlePreview()} loading={previewMutation.isPending}>Yeniden Dene</LoadingButton>
+                <div><strong>Sayfa görüntüsü henüz hazır değil</strong><p>Belge korunuyor. Arka plandaki önizleme işi tamamlandığında görüntüler burada görünecek.</p></div>
               </div>
             )}
             {hasUsablePreview && pagePreviews.length > 0 && (
@@ -768,6 +713,7 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
           </>
         )}
       </section>
+      )}
 
       <ConfirmationDialog
         open={documentToRemove !== null}

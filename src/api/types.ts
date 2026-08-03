@@ -424,6 +424,8 @@ export type SpeakingExam = {
 
 export type AssessmentKind = 'written' | 'speaking';
 export type AnalysisStatus = 'generating' | 'ready' | 'partial' | 'failed';
+export type AnalysisMetricUnit = 'count' | 'score' | 'percentage';
+export type AnalysisEvidenceStatus = 'supported' | 'review' | 'unsupported';
 
 export type AnalysisCriterionSummary = {
   id: string;
@@ -449,6 +451,30 @@ export type AnalysisScoreBand = {
   count: number;
 };
 
+export type AnalysisMetric = {
+  id: string;
+  label: string;
+  value: number;
+  unit: AnalysisMetricUnit;
+  description: string;
+};
+
+export type AnalysisMetricRef = {
+  metricId: string;
+  label: string;
+  value: number;
+  unit: AnalysisMetricUnit;
+};
+
+export type AnalysisClaim = {
+  id: string;
+  claim: string;
+  metricRefs: AnalysisMetricRef[];
+  recommendation: string;
+  evidenceStatus: AnalysisEvidenceStatus;
+  teacherVisibleExplanation: string;
+};
+
 export type AssessmentAnalysis = {
   id: string;
   projectId: string;
@@ -461,6 +487,8 @@ export type AssessmentAnalysis = {
   criteria: AnalysisCriterionSummary[];
   students: AnalysisStudentSummary[];
   scoreBands: AnalysisScoreBand[];
+  metrics: AnalysisMetric[];
+  claims: AnalysisClaim[];
   modelReport?: string | null;
   modelReportError?: string | null;
   createdAt: string;
@@ -569,18 +597,38 @@ export type AnswerType =
   | 'sentence_annotation'
   | 'grammar_analysis';
 
-export type RubricSource = 'manual' | 'json' | 'answer_key_pdf' | 'generated' | 'unknown';
+export type RubricSource = 'manual' | 'json' | 'answer_key_pdf' | 'rubric_pdf' | 'generated' | 'gemma_draft' | 'unknown';
 
 export type RubricStatus = 'missing' | 'suggested' | 'imported' | 'manual' | 'confirmed' | 'invalid' | 'legacy';
+
+export type RubricLevel = {
+  id: string;
+  title: string;
+  requiredConditions: string[];
+  disqualifyingConditions: string[];
+  score: number;
+  evidenceRequired: boolean;
+  version: string;
+};
 
 export type RubricCriterion = {
   id: string;
   label: string;
   description: string;
   points: number;
+  /** Optional while opening legacy numeric-only project files. */
+  levels?: RubricLevel[];
 };
 
 export type ScoringReviewStatus = 'pending_review' | 'approved' | 'edited' | 'invalidated';
+export type ScoringDecisionState =
+  | 'provisional'
+  | 'model_candidate'
+  | 'deterministic_accepted'
+  | 'auto_accepted'
+  | 'teacher_approved'
+  | 'rejected'
+  | 'failed';
 
 export type ScoringCriterionScore = {
   criterionId: string;
@@ -589,6 +637,49 @@ export type ScoringCriterionScore = {
   awardedScore: number;
   rationale: string;
   evidenceQuote?: string | null;
+};
+
+export type SemanticCriterionDecision = {
+  criterionId: string;
+  levelId: string;
+  exactEvidence?: string | null;
+  missingRequirements: string[];
+  contradiction: boolean;
+  rationale: string;
+};
+
+export type ScoringExecutionDiagnostics = {
+  kind: 'deterministic' | 'model' | 'candidate_cache' | 'exact_duplicate_reuse';
+  modelCalled: boolean;
+  modelCallCount: number;
+  scorerVersion: string;
+  policyVersion: string;
+  cacheHit: boolean;
+  cacheFingerprint?: string | null;
+  notes: string[];
+};
+
+export type ScoringCacheProvenance = {
+  fingerprint: string;
+  artifactSchemaVersion: string;
+  cacheHit: boolean;
+  source: string;
+  artifactPath?: string | null;
+};
+
+export type ScoringReuseProvenance = {
+  sourceRecordId: string;
+  sourceDecisionVersion: string;
+  targetDecisionVersion: string;
+  matchKey: string;
+  reason: string;
+};
+
+export type ScoringConsistencyReview = {
+  reasonCode: string;
+  teacherMessage: string;
+  clusterKey: string;
+  conflictingRecordIds: string[];
 };
 
 export type ScoringParseDiagnostics = {
@@ -624,7 +715,10 @@ export type ScoringRecord = {
   maxScore: number;
   awardedScore: number | null;
   scoringApplied: boolean;
+  decisionState: ScoringDecisionState;
+  decisionVersion?: string;
   criterionScores: ScoringCriterionScore[];
+  semanticDecisions?: SemanticCriterionDecision[];
   rationale: string;
   confidence: number;
   needsReview: boolean;
@@ -633,6 +727,15 @@ export type ScoringRecord = {
   rawModelOutput: string;
   parseDiagnostics?: ScoringParseDiagnostics | null;
   reconciliationDiagnostics?: ScoringReconciliationDiagnostics | null;
+  executionDiagnostics?: ScoringExecutionDiagnostics | null;
+  cacheProvenance?: ScoringCacheProvenance | null;
+  reuseProvenance?: ScoringReuseProvenance | null;
+  consistencyReview?: ScoringConsistencyReview | null;
+  scoringFingerprint?: string;
+  policyVersion?: string;
+  answerNormalizedHash?: string;
+  answerRawHash?: string;
+  ocrGeneration?: string;
   sourceHash: string;
   packageHash: string;
   ocrRecordHash: string;
@@ -648,10 +751,83 @@ export type ScoringRecord = {
   updatedAt: string;
 };
 
+export type ScoringAnchorStatus = 'active' | 'revoked';
+export type ScoringAnchorEligibility = 'eligible' | 'stale' | 'ineligible' | 'revoked';
+export type ScoringAnchorActionKind = 'created' | 'revoked';
+
+export type ScoringAnchorAction = {
+  action: ScoringAnchorActionKind;
+  actorKind: 'teacher' | string;
+  occurredAt: string;
+  reason?: string | null;
+};
+
+export type ScoringAnchorEvidence = {
+  answerNormalizedHash: string;
+  answerRawHash: string;
+  ocrRecordHash: string;
+  awardedScore: number;
+  maxScore: number;
+  rationale: string;
+  criterionScores: ScoringCriterionScore[];
+  teacherNotes?: string | null;
+};
+
+export type ScoringAnchor = {
+  id: string;
+  version: string;
+  sourceRecordId: string;
+  questionId: string;
+  questionNumber: number;
+  qepFingerprint: string;
+  questionTextHash: string;
+  rubricHash: string;
+  policyVersion: string;
+  scoringFingerprint: string;
+  calibrationVersion: string;
+  finalScore: number;
+  maxScore: number;
+  evidence: ScoringAnchorEvidence;
+  status: ScoringAnchorStatus;
+  actions: ScoringAnchorAction[];
+  createdAt: string;
+  revokedAt?: string | null;
+  revokedReason?: string | null;
+  eligibility: ScoringAnchorEligibility;
+  eligibilityReasons: string[];
+};
+
+export type ScoringSubmissionSummary = {
+  submissionId: string;
+  provisionalScore: number;
+  acceptedScore: number;
+  finalScore: number | null;
+  maxScore: number;
+  isComplete: boolean;
+  expectedRecordCount: number;
+  acceptedRecordCount: number;
+  provisionalRecordCount: number;
+  reviewRequiredCount: number;
+};
+
+export type ScoringSummaryDto = {
+  provisionalScore: number;
+  acceptedScore: number;
+  finalScore: number | null;
+  maxScore: number;
+  isComplete: boolean;
+  expectedRecordCount: number;
+  acceptedRecordCount: number;
+  provisionalRecordCount: number;
+  reviewRequiredCount: number;
+  submissions: ScoringSubmissionSummary[];
+};
+
 export type RubricState = {
   source?: RubricSource | null;
   maxScore?: number | null;
   expectedAnswer?: string | null;
+  keyConcepts: string[];
   criteria: RubricCriterion[];
   partialCreditHints: string[];
   zeroScoreConditions: string[];
@@ -659,6 +835,13 @@ export type RubricState = {
   status: RubricStatus;
   warnings: string[];
   updatedAt?: string;
+};
+
+export type MigrateRubricLevelsOutput = {
+  migratedCount: number;
+  teacherConfirmationRequired: boolean;
+  qepInvalidated: boolean;
+  warnings: string[];
 };
 
 export type RubricValidationIssue = {
@@ -821,6 +1004,7 @@ export type StartStudentAnswerOcrOutput = {
   jobId: string;
   status: 'queued' | 'running';
   rerun: boolean;
+  mode: StudentAnswerOcrJobMode;
 };
 
 export type OcrGenerationStatus =
@@ -850,6 +1034,7 @@ export type OcrGeneration = {
   sourceDocumentId: string;
   sourceStorageRevision: number;
   failureReason?: string | null;
+  jobMode?: StudentAnswerOcrJobMode;
 };
 
 export type StudentAnswerOcrIssueCorrectionDecision =
@@ -876,7 +1061,6 @@ export type SuggestStudentAnswerOcrIssueCorrectionWithModelInput = {
   ocrRecordId: string;
   issueId?: string | null;
   observedText: string;
-  suggestedTextFromAnalyzer: string;
   questionNumber: number;
   highlightRegion?: StudentAnswerOcrCropBBox | null;
   cropRef?: string | null;
@@ -938,6 +1122,7 @@ export type UpdateQuestionRubricInput = {
   answerType: AnswerType;
   maxScore: number | null;
   expectedAnswer: string | null;
+  keyConcepts: string[];
   criteria: RubricCriterion[];
   partialCreditHints: string[];
   zeroScoreConditions: string[];
@@ -1159,6 +1344,7 @@ export type ProjectSnapshot = {
   studentAnswerOcrRecords: StudentAnswerOcrRecord[];
   studentAnswerOcrGenerations?: OcrGeneration[];
   scoringRecords: ScoringRecord[];
+  scoringAnchors: ScoringAnchor[];
   speakingExams: SpeakingExam[];
   studentAnswerCropTemplate: StudentAnswerCropTemplate;
   studentIdentityCropTemplate?: StudentIdentityCropTemplate | null;
@@ -1290,6 +1476,7 @@ export type DataLossPreflightReport = {
   durabilityUncertainCount: number;
   secondWriterDetected: boolean;
   initializationWriteAllowed: boolean;
+  unverifiedWritesAllowed: boolean;
   audit: {
     recordCount: number;
     chainValid: boolean;
@@ -1335,6 +1522,36 @@ export type ModelSuggestedAction = {
   label: string;
 };
 
+export type OcrReviewPolicyDto = {
+  version: string;
+  fingerprint: string;
+  lowConfidenceThreshold: number;
+  criticalConfidenceThreshold: number;
+  reasonLabels: Record<string, string>;
+};
+
+export type SamplingParameters = {
+  temperature: number;
+  topK?: number | null;
+  topP?: number | null;
+  seed?: number | null;
+  maxTokens: number;
+};
+
+export type ModelInvocationContract = {
+  useCase: string;
+  promptVersion: string;
+  schemaVersion: string;
+  policyVersion: string;
+  policyFingerprint?: string | null;
+  modelFingerprint: string;
+  runtimeFingerprint: string;
+  samplingParameters: SamplingParameters;
+  responseFormat?: { type: string; name?: string; schema?: unknown } | null;
+};
+
+export type ModelProvenance = ModelInvocationContract;
+
 export type ModelStatus = {
   profileId: string;
   displayName: string;
@@ -1346,6 +1563,12 @@ export type ModelStatus = {
   serverRunning: boolean;
   healthOk: boolean;
   completionProbeOk: boolean;
+  healthVerifiedAt?: string | null;
+  completionProbeVerifiedAt?: string | null;
+  privacyMode?: 'strict_local' | 'explicit_external';
+  privacyBlocked?: boolean;
+  privacyBlockReason?: string | null;
+  modelFingerprint?: string | null;
   managedProcessPid?: number | null;
   startedByApp: boolean;
   activeLeaseCount: number;
@@ -1359,6 +1582,12 @@ export type ModelStatus = {
   startRequiresModeChange: boolean;
   startDisabledReason?: string | null;
   suggestedActions: ModelSuggestedAction[];
+};
+
+export type EnableExternalModelInput = {
+  profileId?: string;
+  projectRootPath?: string | null;
+  confirmExternalDataTransfer: boolean;
 };
 
 export type ImportDocumentInput = {
@@ -1442,6 +1671,27 @@ export type StudentAnswerOcrCropBBox = {
   pageIndex: number;
 };
 
+export type NormalizedBBox = Omit<StudentAnswerOcrCropBBox, 'pageIndex'>;
+
+export type AnswerRegionRole = 'primary' | 'continuation' | 'supporting';
+export type ContinuationPolicy = 'independent' | 'continues_previous' | 'optional';
+
+export type QuestionAnswerRegion = {
+  regionId: string;
+  pageOffset: number;
+  order: number;
+  normalizedBBox: NormalizedBBox;
+  regionRole: AnswerRegionRole;
+  continuationPolicy: ContinuationPolicy;
+  label?: string | null;
+  note?: string | null;
+};
+
+export type QuestionAnswerTemplate = {
+  questionId: string;
+  regions: QuestionAnswerRegion[];
+};
+
 export type StudentAnswerCropTemplateItem = {
   questionId: string;
   questionNumber: number;
@@ -1452,9 +1702,23 @@ export type StudentAnswerCropTemplateItem = {
 };
 
 export type StudentAnswerCropTemplate = {
-  items: StudentAnswerCropTemplateItem[];
+  templates: QuestionAnswerTemplate[];
   updatedAt?: string | null;
 };
+
+export type StudentAnswerOcrJobMode = 'production' | 'experimental_full_page_review_only';
+
+export type StructuredAnswer =
+  | { kind: 'multiple_choice'; selections: Array<{ option: string; selected: boolean }> }
+  | { kind: 'matching'; pairs: Array<{ left: string; right: string }> }
+  | { kind: 'ordered_slots'; slots: Array<{ index: number; value: string }> }
+  | { kind: 'numeric'; value?: string | null; unit?: string | null }
+  | { kind: 'table'; rows: Array<{ index: number; cells: string[] }> }
+  | { kind: 'correction_table'; rows: Array<{ index: number; original: string; correction: string; explanation?: string | null }> }
+  | { kind: 'sentence_annotation'; annotations: Array<{ text: string; annotation: string; start?: number | null; end?: number | null }> }
+  | { kind: 'grammar_analysis'; items: Array<{ text: string; label: string; explanation?: string | null }> }
+  | { kind: 'open_text'; text: string }
+  | { kind: 'legacy_unparsed'; raw: unknown; reason: string };
 
 export type StudentIdentityCropTemplate = {
   pageIndexWithinSubmission: number;
@@ -1526,6 +1790,7 @@ export type StudentAnswerOcrParseDiagnostics = {
   salvagedAnswerText?: string | null;
   parseStrategy: string;
   modelRequestMetadata?: unknown | null;
+  modelProvenance?: ModelProvenance | null;
 };
 
 export type OcrUncertainSpan = {
@@ -1557,6 +1822,8 @@ export type OcrCriticalTermWarning = {
 
 export type StudentAnswerOcrRenderDiagnostics = {
   cropRefs: string[];
+  regionIds: string[];
+  regionOrders: number[];
   fullPagePreviewRefs: string[];
   cropBBox?: StudentAnswerOcrCropBBox | null;
   cropWidth?: number | null;
@@ -1575,6 +1842,37 @@ export type StudentAnswerOcrRenderDiagnostics = {
   partialAnswerSuspected: boolean;
   printedTextMixed: boolean;
   printedQuestionLeakDetected: boolean;
+};
+
+export type OcrRegionProvenance = { regionId: string; order: number; pageOffset: number };
+export type OcrResizeDimensions = { width: number; height: number };
+export type OcrInputBudget = {
+  maxTokens?: number | null;
+  timeoutSeconds?: number | null;
+  maxImages?: number | null;
+  maxInputBytes?: number | null;
+  actualImageCount: number;
+  actualInputBytes: number;
+};
+export type StudentAnswerOcrProvenance = {
+  schemaVersion: string;
+  sourceChecksum?: string | null;
+  sourcePageNumbers: number[];
+  regionIds: string[];
+  regionOrders: number[];
+  regions: OcrRegionProvenance[];
+  renderDpi?: number | null;
+  renderer?: string | null;
+  preprocessPolicy?: string | null;
+  preprocessVariant?: OcrImagePreprocessMode | null;
+  preprocessVersion?: string | null;
+  resizeDimensions: OcrResizeDimensions[];
+  jpegCacheKeys: string[];
+  invocation?: ModelInvocationContract | null;
+  budget?: OcrInputBudget | null;
+  responseDiagnostics?: unknown | null;
+  approvableForScoring: boolean;
+  provenanceNotes: string[];
 };
 
 export type StudentAnswerOcrRecord = {
@@ -1596,7 +1894,7 @@ export type StudentAnswerOcrRecord = {
   availablePreprocessVariants?: OcrImagePreprocessMode[];
   fullPagePreviewRefs: string[];
   answerText: string;
-  structuredAnswer?: unknown | null;
+  structuredAnswer?: StructuredAnswer | null;
   confidence?: number | null;
   uncertainSpans: OcrUncertainSpan[];
   suggestedCorrections: OcrSuggestedCorrection[];
@@ -1607,6 +1905,9 @@ export type StudentAnswerOcrRecord = {
   needsReview: boolean;
   reviewReasons: string[];
   warnings: string[];
+  reviewPolicy?: OcrReviewPolicyDto | null;
+  modelProvenance?: ModelProvenance | null;
+  ocrProvenance?: StudentAnswerOcrProvenance | null;
   modelName?: string | null;
   promptVersion: string;
   createdAt: string;
@@ -1699,6 +2000,7 @@ export type StudentScanReadinessSnapshot = {
   groupingComplete: boolean;
   warnings: string[];
   message: string;
+  ocrReviewPolicy?: OcrReviewPolicyDto;
 };
 
 

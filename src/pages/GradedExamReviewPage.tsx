@@ -61,9 +61,9 @@ export function GradedExamReviewPage() {
 
         {queue.length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', gap: '0.45rem' }}>
-            <button type="button" onClick={() => goToStudent(selectedIndex - 1)} disabled={selectedIndex <= 0} style={{ ...studentNavButtonStyle, opacity: selectedIndex <= 0 ? 0.4 : 1 }}><ChevronLeft size={17} /> Önceki öğrenci</button>
+            <button type="button" data-project-write="false" onClick={() => goToStudent(selectedIndex - 1)} disabled={selectedIndex <= 0} style={{ ...studentNavButtonStyle, opacity: selectedIndex <= 0 ? 0.4 : 1 }}><ChevronLeft size={17} /> Önceki öğrenci</button>
             <span style={{ minWidth: '4.5rem', textAlign: 'center', fontSize: '0.78rem', fontWeight: 800, color: '#334155' }}>{selectedIndex + 1} / {queue.length}</span>
-            <button type="button" onClick={() => goToStudent(selectedIndex + 1)} disabled={selectedIndex >= queue.length - 1} style={{ ...studentNavButtonStyle, opacity: selectedIndex >= queue.length - 1 ? 0.4 : 1 }}>Sonraki öğrenci <ChevronRight size={17} /></button>
+            <button type="button" data-project-write="false" onClick={() => goToStudent(selectedIndex + 1)} disabled={selectedIndex >= queue.length - 1} style={{ ...studentNavButtonStyle, opacity: selectedIndex >= queue.length - 1 ? 0.4 : 1 }}>Sonraki öğrenci <ChevronRight size={17} /></button>
           </div>
         )}
       </header>

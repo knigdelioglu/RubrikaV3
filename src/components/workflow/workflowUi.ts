@@ -9,7 +9,7 @@ export function describeStudentScanPreview(document: Pick<Document, 'pageCount' 
 
   if (previewStatus === 'missing') {
     if (document.pageCount > 0) {
-      return 'Öğrenci PDF yüklendi, sayfa önizlemesi henüz oluşturulmadı.';
+      return 'Öğrenci PDF yüklendi, sayfa önizlemesi arka planda hazırlanıyor.';
     }
     return 'Öğrenci PDF yüklendi, sayfa sayısı henüz bilinmiyor. Önizleme oluşturulduğunda sayfa sayısı hesaplanacak.';
   }
@@ -25,5 +25,5 @@ export function describeStudentScanPreview(document: Pick<Document, 'pageCount' 
       : 'Öğrenci PDF önizlemesi hazır.';
   }
 
-  return 'Öğrenci PDF önizlemesi başarısız.';
+    return 'Öğrenci PDF önizlemesi hazırlanamadı; hata işlem merkezinde görülebilir.';
 }

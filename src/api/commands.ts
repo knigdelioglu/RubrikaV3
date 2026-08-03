@@ -15,6 +15,7 @@ import type {
   ModelServerArgsPreview,
   StartModelServerOutput,
   StopModelServerOutput,
+  EnableExternalModelInput,
   PdfPagePreview,
   PdfPreviewStatusSnapshot,
   StartPdfPreviewRenderOutput,
@@ -25,6 +26,7 @@ import type {
   ImportRubricJsonOutput,
   RubricStateSnapshot,
   RubricValidationReport,
+  MigrateRubricLevelsOutput,
   UpdateQuestionRubricInput,
   StartRubricPdfImportInput,
   StartExamPackageBuildInput,
@@ -33,13 +35,15 @@ import type {
   StartStudentIdentityOcrOutput,
   RebuildStudentAnswerOcrIssuesOutput,
   StartScoringOutput,
+  ScoringSummaryDto,
   RubricQuestionSnapshot,
   CreateStudentPageGroupsInput,
   CreateStudentPageGroupsOutput,
   DeleteStudentSubmissionInput,
   MarkStudentGroupingCompleteInput,
   StudentSubmission,
-  StudentAnswerCropTemplateItem,
+  QuestionAnswerTemplate,
+  StudentAnswerOcrJobMode,
   StudentIdentityCropTemplate,
   StudentAnswerOcrRecord,
   SuggestStudentAnswerOcrIssueCorrectionWithModelInput,
@@ -48,6 +52,7 @@ import type {
   UpdateStudentIdentityInput,
   UpdateSubmissionPagesInput,
   ScoringRecord,
+  ScoringAnchor,
   OcrImagePreprocessResult,
   PreprocessOcrImageInput,
   GradedExamReview,
@@ -865,7 +870,7 @@ export const commands = {
       handleInvokeError(e);
     }
   },
-  startStudentAnswerOcr: async (input: { projectId: string; forceRerun?: boolean }): Promise<StartStudentAnswerOcrOutput> => {
+  startStudentAnswerOcr: async (input: { projectId: string; forceRerun?: boolean; mode?: StudentAnswerOcrJobMode }): Promise<StartStudentAnswerOcrOutput> => {
     try {
       return await invoke<StartStudentAnswerOcrOutput>('start_student_answer_ocr', { input });
     } catch (e) {
@@ -930,7 +935,7 @@ export const commands = {
       handleInvokeError(e);
     }
   },
-  saveStudentAnswerCropTemplate: async (input: { projectId: string; items: StudentAnswerCropTemplateItem[] }): Promise<ProjectSnapshot> => {
+  saveStudentAnswerCropTemplate: async (input: { projectId: string; templates: QuestionAnswerTemplate[] }): Promise<ProjectSnapshot> => {
     try {
       return await invoke<ProjectSnapshot>('save_student_answer_crop_template', { input });
     } catch (e) {
@@ -954,6 +959,13 @@ export const commands = {
   importRubricJson: async (input: ImportRubricJsonInput): Promise<ImportRubricJsonOutput> => {
     try {
       return await invoke<ImportRubricJsonOutput>('import_rubric_json', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  migrateRubricLevels: async (input: { projectId: string; questionId?: string | null }): Promise<MigrateRubricLevelsOutput> => {
+    try {
+      return await invoke<MigrateRubricLevelsOutput>('migrate_rubric_levels', { input });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -1030,6 +1042,34 @@ export const commands = {
   }): Promise<ScoringRecord> => {
     try {
       return await invoke<ScoringRecord>('update_scoring_record', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  listScoringAnchors: async (projectId: string): Promise<ScoringAnchor[]> => {
+    try {
+      return await invoke<ScoringAnchor[]>('list_scoring_anchors', { input: { projectId } });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  createScoringAnchor: async (input: { projectId: string; sourceRecordId: string }): Promise<ScoringAnchor> => {
+    try {
+      return await invoke<ScoringAnchor>('create_scoring_anchor', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  revokeScoringAnchor: async (input: { projectId: string; anchorId: string; reason?: string | null }): Promise<ScoringAnchor> => {
+    try {
+      return await invoke<ScoringAnchor>('revoke_scoring_anchor', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getScoringSummary: async (projectId: string): Promise<ScoringSummaryDto> => {
+    try {
+      return await invoke<ScoringSummaryDto>('get_scoring_summary', { input: { projectId } });
     } catch (e) {
       handleInvokeError(e);
     }
@@ -1114,6 +1154,13 @@ export const commands = {
       return await invoke<ModelStatus>('set_model_mode', {
         input: { profileId: input.profileId, mode: input.mode },
       });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  enableExternalModel: async (input: EnableExternalModelInput): Promise<ModelStatus> => {
+    try {
+      return await invoke<ModelStatus>('enable_external_model', { input });
     } catch (e) {
       handleInvokeError(e);
     }

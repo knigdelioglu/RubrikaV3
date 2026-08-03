@@ -50,6 +50,9 @@ export type AppErrorCode =
   | 'MODEL_RUNTIME_PORT_OCCUPIED'
   | 'MODEL_STATE_ACCESS_FAILED'
   | 'MODEL_HEALTH_FAILED'
+  | 'MODEL_PRIVACY_BLOCKED'
+  | 'MODEL_EXTERNAL_CONSENT_REQUIRED'
+  | 'MODEL_REDIRECT_REJECTED'
   | 'MODEL_TIMEOUT'
   | 'MODEL_RESPONSE_EMPTY'
   | 'MODEL_RESPONSE_INVALID_JSON'
@@ -57,6 +60,10 @@ export type AppErrorCode =
   | 'MODEL_RESPONSE_REASONING_ONLY'
   | 'OCR_FAILED'
   | 'SCORING_FAILED'
+  | 'SCORING_ANCHOR_NOT_ELIGIBLE'
+  | 'SCORING_ANCHOR_NOT_FOUND'
+  | 'SCORING_ANCHOR_ALREADY_EXISTS'
+  | 'SCORING_ANCHOR_ALREADY_REVOKED'
   | 'QEP_NOT_FROZEN'
   | 'RUBRIC_MISSING'
   | 'QUESTION_TEXT_MISSING'
@@ -102,6 +109,7 @@ export type AppErrorCode =
   | 'PROJECT_ROOT_MISMATCH'
   | 'PROJECT_ALREADY_EXISTS'
   | 'PROJECT_DIRECTORY_NOT_EMPTY'
+  | 'PROJECT_MIGRATION_REQUIRED'
   | 'UNSAFE_MANAGED_PATH'
   | 'MANAGED_PATH_OUTSIDE_PROJECT'
   | 'MANAGED_PATH_SYMLINK_ESCAPE'
@@ -133,4 +141,10 @@ export function isProjectConflictError(
   error: Pick<AppError, 'code'> | null | undefined,
 ): boolean {
   return error ? projectConflictCodes.has(error.code) : false;
+}
+
+export function isProjectMigrationRequiredError(
+  error: Pick<AppError, 'code'> | null | undefined,
+): boolean {
+  return error?.code === 'PROJECT_MIGRATION_REQUIRED';
 }

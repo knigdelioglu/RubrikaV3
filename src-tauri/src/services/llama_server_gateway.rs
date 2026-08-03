@@ -1,20 +1,26 @@
 use async_trait::async_trait;
 use base64::{engine::general_purpose, Engine as _};
+use chrono::Utc;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::timeout;
+use url::Url;
 use uuid::Uuid;
 
+use crate::domain::analysis::AnalysisModelOutput;
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{
     AnalysisReportRequest, AnalysisReportResult, ExtractedQuestionCandidate,
-    ExtractedRubricCandidate, ModelDiagnostics, ModelRequestKind, ModelRequestPayloadSummary,
-    ModelStatus, QuestionTextExtractionOutput, QuestionTextExtractionRequest,
-    QuestionTextExtractionResult, RubricExtractionOutput, RubricExtractionRequest,
-    RubricExtractionResult, ScoringCriterionScore, ScoringOutput, ScoringRequest, ScoringResult,
+    ExtractedRubricCandidate, ModelDiagnostics, ModelProvenance, ModelRequestKind,
+    ModelRequestPayloadSummary, ModelResponseFormat, ModelStatus, PrivacyMode, PromptContract,
+    QuestionTextExtractionOutput, QuestionTextExtractionRequest, QuestionTextExtractionResult,
+    RubricExtractionOutput, RubricExtractionRequest, RubricExtractionResult, ScoringCriterionScore,
+    ScoringOutput, ScoringRequest, ScoringResult, SemanticCriterionDecision,
     SpeakingTranscriptCleanupOutputSegment, SpeakingTranscriptCleanupRequest,
     SpeakingTranscriptCleanupResult, StudentAnswerOcrIssueCorrectionDecision,
     StudentAnswerOcrIssueCorrectionOutput, StudentAnswerOcrIssueCorrectionRequest,
@@ -22,11 +28,16 @@ use crate::domain::model::{
     StudentAnswerOcrRequest, StudentAnswerOcrResult, StudentIdentityOcrOutput,
     StudentIdentityOcrRequest, StudentIdentityOcrResult,
 };
+use crate::domain::question::AnswerType;
 use crate::domain::student::{
-    OcrCriticalTermWarning, OcrImagePreprocessMode, OcrSuggestedCorrection, OcrUncertainSpan,
+    default_ocr_review_policy, OcrCriticalTermWarning, OcrImagePreprocessMode,
+    OcrSuggestedCorrection, OcrUncertainSpan,
 };
 use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_gateway::ModelGateway;
+use crate::services::prompt_contract::{
+    invocation_metadata, legacy_prompt_contract_with_data, response_format_value, user_data_message,
+};
 
 const QUESTION_TEXT_MAX_TOKENS: u32 = 4096;
 const RUBRIC_MAX_TOKENS: u32 = 8192;
@@ -34,7 +45,6 @@ const STUDENT_ANSWER_OCR_MAX_TOKENS: u32 = 4096;
 const STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS: u32 = 512;
 const STUDENT_IDENTITY_OCR_MAX_TOKENS: u32 = 1024;
 const CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING: &str = "critical_keyword_ocr_uncertain";
-const MIN_STUDENT_ANSWER_OCR_CONFIDENCE: f32 = 0.72;
 
 /// Default upper bound for a single model HTTP response body (bytes).
 ///
@@ -50,6 +60,25 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 128 * 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn request_contract(
+    provided: Option<PromptContract>,
+    use_case: ModelRequestKind,
+    prompt: &str,
+    user_data: serde_json::Value,
+    max_tokens: u32,
+    response_format: Option<ModelResponseFormat>,
+) -> PromptContract {
+    provided.unwrap_or_else(|| {
+        legacy_prompt_contract_with_data(
+            use_case.clone(),
+            prompt,
+            user_data,
+            max_tokens,
+            response_format,
+        )
+    })
+}
 
 /// Bounded transport limits for model gateway HTTP calls.
 #[derive(Debug, Clone, Copy)]
@@ -78,27 +107,132 @@ pub struct LlamaServerGateway {
     client: Client,
     base_url: String,
     limits: GatewayLimits,
+    privacy_mode: Arc<RwLock<PrivacyMode>>,
 }
 
 impl LlamaServerGateway {
     pub fn new(base_url: String) -> Self {
-        Self::new_with_limits(base_url, GatewayLimits::default())
+        Self::new_with_limits_and_privacy(
+            base_url,
+            GatewayLimits::default(),
+            PrivacyMode::StrictLocal,
+        )
     }
 
     pub fn new_with_limits(base_url: String, limits: GatewayLimits) -> Self {
+        Self::new_with_limits_and_privacy(base_url, limits, PrivacyMode::StrictLocal)
+    }
+
+    pub fn new_with_privacy(base_url: String, privacy_mode: PrivacyMode) -> Self {
+        Self::new_with_limits_and_privacy(base_url, GatewayLimits::default(), privacy_mode)
+    }
+
+    fn new_with_limits_and_privacy(
+        base_url: String,
+        limits: GatewayLimits,
+        privacy_mode: PrivacyMode,
+    ) -> Self {
         let client = Client::builder()
             .connect_timeout(limits.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| {
+                Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap_or_else(|_| Client::new())
+            });
         Self {
             client,
             base_url,
             limits,
+            privacy_mode: Arc::new(RwLock::new(privacy_mode)),
         }
     }
 
     pub fn limits(&self) -> GatewayLimits {
         self.limits
+    }
+
+    pub fn configure_privacy(&self, privacy_mode: PrivacyMode) -> Result<(), AppError> {
+        let mut current = self.privacy_mode.write().map_err(|error| {
+            app_error(
+                AppErrorCode::ModelStateAccessFailed,
+                "Model gizlilik ayarı okunamadı.",
+                Some(format!("privacy mode lock failed: {error}")),
+                Some("Uygulamayı yeniden başlatıp tekrar deneyin.".to_string()),
+            )
+        })?;
+        *current = privacy_mode;
+        Ok(())
+    }
+
+    fn privacy_mode(&self) -> Result<PrivacyMode, AppError> {
+        self.privacy_mode.read().map(|mode| *mode).map_err(|error| {
+            app_error(
+                AppErrorCode::ModelStateAccessFailed,
+                "Model gizlilik ayarı okunamadı.",
+                Some(format!("privacy mode lock failed: {error}")),
+                Some("Uygulamayı yeniden başlatıp tekrar deneyin.".to_string()),
+            )
+        })
+    }
+
+    fn client_for_url(&self, base_url: &str) -> Result<Client, AppError> {
+        let privacy_mode = self.privacy_mode()?;
+        if privacy_mode == PrivacyMode::ExplicitExternal {
+            return Ok(self.client.clone());
+        }
+        let parsed = Url::parse(base_url).map_err(|error| {
+            app_error(
+                AppErrorCode::ModelPrivacyBlocked,
+                "Model adresi güvenli bir URL değil.",
+                Some(format!("model URL parse failed while pinning DNS: {error}")),
+                Some("Model adresini güvenli bir yerel adresle güncelleyin.".to_string()),
+            )
+        })?;
+        let host = parsed.host_str().unwrap_or_default();
+        if host.parse::<IpAddr>().is_ok() {
+            return Ok(self.client.clone());
+        }
+        let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addresses: Vec<SocketAddr> = (normalized_host, port)
+            .to_socket_addrs()
+            .map_err(|error| {
+                app_error(
+                    AppErrorCode::ModelPrivacyBlocked,
+                    "Strict local model adresi çözümlenemedi.",
+                    Some(format!("localhost resolution failed: {error}")),
+                    Some("127.0.0.1 veya [::1] model adresini seçin.".to_string()),
+                )
+            })?
+            .filter(|address| address.ip().is_loopback())
+            .collect();
+        if addresses.is_empty() {
+            return Err(app_error(
+                AppErrorCode::ModelPrivacyBlocked,
+                "Strict local model adresi loopback olarak doğrulanamadı.",
+                Some("localhost resolution produced no loopback address".to_string()),
+                Some("127.0.0.1 veya [::1] model adresini seçin.".to_string()),
+            ));
+        }
+        Client::builder()
+            .connect_timeout(self.limits.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(normalized_host, &addresses)
+            .build()
+            .map_err(|error| {
+                app_error(
+                    AppErrorCode::ModelStateAccessFailed,
+                    "Model bağlantısı hazırlanamadı.",
+                    Some(format!("pinned localhost client build failed: {error}")),
+                    Some("Uygulamayı yeniden başlatıp tekrar deneyin.".to_string()),
+                )
+            })
     }
 
     fn health_url(&self, base_url: &str) -> String {
@@ -137,11 +271,16 @@ impl LlamaServerGateway {
                 Some("Daha az sayıda belge veya görselle yeniden deneyin.".to_string()),
             ));
         }
+        // Validate immediately before the network operation. Local request
+        // validation (including size limits) remains deterministic even when
+        // a legacy profile has an invalid external endpoint.
+        validate_base_url_for_privacy(base_url, self.privacy_mode()?)?;
+        let client = self.client_for_url(base_url)?;
 
         let start = std::time::Instant::now();
         let response = timeout(
             std::time::Duration::from_secs(timeout_seconds),
-            self.client.post(&url).body(body_bytes).send(),
+            client.post(&url).body(body_bytes).send(),
         )
         .await
         .map_err(|_| {
@@ -152,7 +291,18 @@ impl LlamaServerGateway {
                 Some("Model server çalışıyor ancak zamanında yanıt vermedi. Tekrar deneyebilir veya model loglarını kontrol edebilirsiniz.".to_string()),
             )
         })?
-        .map_err(|error| map_transport_error(error, &url))?;
+        .map_err(|error| {
+            if error.is_redirect() {
+                app_error(
+                    AppErrorCode::ModelRedirectRejected,
+                    "Model sunucusu güvenli olmayan bir yönlendirme yaptı.",
+                    Some(format!("redirect rejected for request_kind={request_kind}")),
+                    Some("Model adresini ve sunucu yönlendirme ayarlarını kontrol edin.".to_string()),
+                )
+            } else {
+                map_transport_error(error, &url)
+            }
+        })?;
 
         let status = response.status().as_u16();
 
@@ -189,6 +339,87 @@ impl LlamaServerGateway {
     }
 }
 
+/// Validates a model endpoint before any network operation. Strict local mode
+/// accepts only literal loopback addresses or `localhost`, and every resolved
+/// localhost address must itself be loopback. Redirects are disabled on the
+/// client, so a public/DNS-rebinding hop cannot silently widen this boundary.
+pub fn validate_base_url_for_privacy(
+    base_url: &str,
+    privacy_mode: PrivacyMode,
+) -> Result<(), AppError> {
+    let parsed = Url::parse(base_url).map_err(|error| {
+        app_error(
+            AppErrorCode::ModelPrivacyBlocked,
+            "Model adresi güvenli bir URL değil.",
+            Some(format!("model URL parse failed: {error}")),
+            Some("Model adresini http://127.0.0.1:8080 biçiminde kontrol edin.".to_string()),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(app_error(
+            AppErrorCode::ModelPrivacyBlocked,
+            "Model adresi güvenli bir URL değil.",
+            Some(
+                "model URL must use http/https without credentials, query, or fragment".to_string(),
+            ),
+            Some("Model adresini güvenli bir yerel adresle güncelleyin.".to_string()),
+        ));
+    }
+    if privacy_mode == PrivacyMode::ExplicitExternal {
+        return Ok(());
+    }
+
+    let host = parsed.host_str().unwrap_or_default();
+    let normalized_host = host.trim_start_matches('[').trim_end_matches(']');
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let loopback = if let Ok(address) = normalized_host.parse::<IpAddr>() {
+        address.is_loopback()
+    } else if normalized_host.eq_ignore_ascii_case("localhost") {
+        match (normalized_host, port).to_socket_addrs() {
+            Ok(addresses) => {
+                let addresses: Vec<_> = addresses.collect();
+                !addresses.is_empty() && addresses.iter().all(|address| address.ip().is_loopback())
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+    if !loopback {
+        return Err(app_error(
+            AppErrorCode::ModelPrivacyBlocked,
+            "Strict local gizlilik politikası yalnızca loopback model sunucusuna izin veriyor.",
+            Some("non_loopback_model_endpoint_rejected".to_string()),
+            Some("127.0.0.1 veya [::1] üzerindeki yönetilen model profilini seçin.".to_string()),
+        ));
+    }
+    Ok(())
+}
+
+fn build_scoring_request_body(contract: &PromptContract) -> serde_json::Value {
+    json!({
+        "model": "gemma",
+        "messages": [
+            { "role": "system", "content": contract.system_policy.clone() },
+            { "role": "user", "content": user_data_message(contract) }
+        ],
+        "chat_template_kwargs": { "enable_thinking": false },
+        "temperature": contract.invocation.sampling_parameters.temperature,
+        "top_k": contract.invocation.sampling_parameters.top_k,
+        "top_p": contract.invocation.sampling_parameters.top_p,
+        "seed": contract.invocation.sampling_parameters.seed,
+        "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+        "response_format": response_format_value(contract),
+        "stream": false
+    })
+}
+
 impl Default for LlamaServerGateway {
     fn default() -> Self {
         Self::new("http://127.0.0.1:8080".to_string())
@@ -198,7 +429,7 @@ impl Default for LlamaServerGateway {
 #[async_trait]
 impl ModelGateway for LlamaServerGateway {
     async fn get_status(&self) -> Result<ModelStatus, AppError> {
-        self.probe_status(&self.base_url).await
+        self.health_status(&self.base_url).await
     }
 
     async fn probe_server(&self) -> Result<ModelStatus, AppError> {
@@ -206,6 +437,8 @@ impl ModelGateway for LlamaServerGateway {
     }
 
     async fn health_status(&self, base_url: &str) -> Result<ModelStatus, AppError> {
+        validate_base_url_for_privacy(base_url, self.privacy_mode()?)?;
+        let client = self.client_for_url(base_url)?;
         let mut status = ModelStatus {
             base_url: base_url.to_string(),
             ..Default::default()
@@ -213,13 +446,16 @@ impl ModelGateway for LlamaServerGateway {
 
         match timeout(
             std::time::Duration::from_secs(5),
-            self.client.get(self.health_url(base_url)).send(),
+            client.get(self.health_url(base_url)).send(),
         )
         .await
         {
             Ok(Ok(response)) => {
                 status.server_running = true;
                 status.health_ok = response.status().is_success();
+                if status.health_ok {
+                    status.health_verified_at = Some(Utc::now());
+                }
                 if !status.health_ok {
                     status.last_error = Some(app_error(
                         AppErrorCode::ModelHealthFailed,
@@ -230,7 +466,19 @@ impl ModelGateway for LlamaServerGateway {
                 }
             }
             Ok(Err(error)) => {
-                status.last_error = Some(map_transport_error(error, &self.health_url(base_url)));
+                status.last_error = Some(if error.is_redirect() {
+                    app_error(
+                        AppErrorCode::ModelRedirectRejected,
+                        "Model sunucusu güvenli olmayan bir yönlendirme yaptı.",
+                        Some("redirect rejected for health request".to_string()),
+                        Some(
+                            "Model adresini ve sunucu yönlendirme ayarlarını kontrol edin."
+                                .to_string(),
+                        ),
+                    )
+                } else {
+                    map_transport_error(error, &self.health_url(base_url))
+                });
             }
             Err(_) => {
                 status.last_error = Some(app_error(
@@ -269,6 +517,9 @@ impl ModelGateway for LlamaServerGateway {
                     match extract_assistant_content(&body_text) {
                         Ok(content) => {
                             status.completion_probe_ok = !content.trim().is_empty();
+                            if status.completion_probe_ok {
+                                status.completion_probe_verified_at = Some(Utc::now());
+                            }
                             if !status.completion_probe_ok {
                                 status.last_error = Some(app_error(
                                     AppErrorCode::ModelResponseEmpty,
@@ -319,26 +570,37 @@ impl ModelGateway for LlamaServerGateway {
             "İşlenmiş PDF sayfası okunamadı.",
         )?;
 
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::QuestionText,
+            &input.prompt,
+            json!({
+                "targetQuestionNumber": input.target_question_number,
+                "pageIndex": input.page_index,
+                "pageCount": input.page_count,
+            }),
+            QUESTION_TEXT_MAX_TOKENS,
+            Some(ModelResponseFormat::JsonObject),
+        );
+
         let request_body = json!({
             "model": "gemma",
             "messages": [
                 {
                     "role": "system",
-                    "content": input.prompt
+                    "content": contract.system_policy.clone()
                 },
                 {
                     "role": "user",
-                    "content": build_image_content(
-                        format!(
-                            "Sadece {} numaralı sorunun metnini çıkar. Toplam soru sayısı bu istekte dışarıdan verildi; başka soru döndürme.",
-                            input.target_question_number
-                        ),
-                        &images
-                    )
+                    "content": build_image_content(user_data_message(&contract), &images)
                 }
             ],
-            "temperature": 0.0,
-            "max_tokens": QUESTION_TEXT_MAX_TOKENS,
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
 
@@ -372,7 +634,7 @@ impl ModelGateway for LlamaServerGateway {
         }
 
         let payload_summary = build_payload_summary(
-            input.prompt.len() as u32,
+            contract.system_policy.len() as u32,
             600,
             Some(&input.model_input_images),
             images.first().map(|image| image.bytes_len),
@@ -401,6 +663,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: None,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
         })
     }
@@ -419,9 +682,25 @@ impl ModelGateway for LlamaServerGateway {
             ));
         }
 
-        let prompt = build_rubric_prompt(&input.prompt, input.strict_json_only);
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::RubricDraft,
+            &input.prompt,
+            json!({
+                "rawText": input.raw_text,
+                "targetQuestionNumber": input.target_question_number,
+                "strictJsonOnly": input.strict_json_only,
+                "attempt": input.attempt,
+            }),
+            RUBRIC_MAX_TOKENS,
+            Some(ModelResponseFormat::JsonSchema {
+                name: "rubric_extraction_suggestion".to_string(),
+                schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
+            }),
+        );
+        let prompt = contract.system_policy.clone();
 
-        let messages = if let Some(text) = &input.raw_text {
+        let messages = if input.raw_text.is_some() {
             json!([
                 {
                     "role": "system",
@@ -429,7 +708,7 @@ impl ModelGateway for LlamaServerGateway {
                 },
                 {
                     "role": "user",
-                    "content": text
+                    "content": user_data_message(&contract)
                 }
             ])
         } else if input.image_path.is_some() || !input.model_input_images.is_empty() {
@@ -445,13 +724,7 @@ impl ModelGateway for LlamaServerGateway {
                 },
                 {
                     "role": "user",
-                    "content": build_image_content(
-                        format!(
-                            "Bu rubrik/cevap anahtarı görsellerinden sadece {} numaralı sorunun puanlama kriterlerini çıkarın. Başka soru döndürmeyin.",
-                            input.target_question_number
-                        ),
-                        &images
-                    )
+                    "content": build_image_content(user_data_message(&contract), &images)
                 }
             ])
         } else {
@@ -466,8 +739,12 @@ impl ModelGateway for LlamaServerGateway {
         let request_body = json!({
             "model": "gemma",
             "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": RUBRIC_MAX_TOKENS,
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
 
@@ -584,6 +861,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: raw_response_path,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
         })
     }
@@ -611,30 +889,47 @@ impl ModelGateway for LlamaServerGateway {
             "Öğrenci cevap görselleri okunamadı.",
         )?;
 
+        let review_policy = default_ocr_review_policy();
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::Ocr,
+            &input.prompt,
+            json!({
+                "submissionId": input.submission_id,
+                "questionId": input.question_id,
+                "questionNumber": input.question_number,
+                "questionText": input.question_text,
+                "answerType": input.answer_type,
+                "preprocessMode": preprocess_mode,
+                "preprocessVersion": preprocess_version,
+                "modelInputCropRef": model_input_crop_ref,
+                "sourcePageNumbers": input.source_page_numbers,
+                "regionIds": input.region_ids,
+                "regionOrders": input.region_orders,
+                "regionPageOffsets": input.region_page_offsets,
+            }),
+            STUDENT_ANSWER_OCR_MAX_TOKENS,
+            Some(ModelResponseFormat::JsonObject),
+        );
+
         let request_body = json!({
             "model": "gemma",
             "messages": [
                 {
                     "role": "system",
-                    "content": input.prompt
+                    "content": contract.system_policy.clone()
                 },
                 {
                     "role": "user",
-                    "content": build_image_content(
-                        format!(
-                            "Soru {} için yalnızca öğrencinin verdiği cevabı çıkar. Başka soru ekleme. Görsel ön işleme profili: {}.",
-                            input.question_number,
-                            preprocess_mode
-                                .map(|mode| preprocess_mode_label(&mode).to_string())
-                                .unwrap_or_else(|| "bilinmiyor".to_string())
-                        ),
-                        &images
-                    )
+                    "content": build_image_content(user_data_message(&contract), &images)
                 }
             ],
-            "temperature": 0.0,
-            "max_tokens": STUDENT_ANSWER_OCR_MAX_TOKENS,
-            "response_format": { "type": "json_object" },
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
 
@@ -668,14 +963,18 @@ impl ModelGateway for LlamaServerGateway {
         }
 
         let payload_summary = build_payload_summary(
-            input.prompt.len() as u32,
+            contract.system_policy.len() as u32,
             600,
             Some(&input.model_input_images),
             images.first().map(|image| image.bytes_len),
             Some(STUDENT_ANSWER_OCR_MAX_TOKENS),
         );
-        let parse_outcome =
-            parse_student_answer_ocr_output(&assistant_content, &input.question_text);
+        let parse_outcome = parse_student_answer_ocr_output_with_policy(
+            &assistant_content,
+            &input.question_text,
+            &input.answer_type,
+            &review_policy,
+        );
         let StudentAnswerOcrParseOutcome {
             output,
             parsed_json,
@@ -707,6 +1006,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: raw_response_path,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
             parse_error,
             parsed_json,
@@ -763,26 +1063,41 @@ impl ModelGateway for LlamaServerGateway {
             None,
             "OCR sorun görseli okunamadı.",
         )?;
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::OcrIssueCorrection,
+            &input.prompt,
+            json!({
+                "observedText": input.observed_text,
+                "highlightRegion": input.highlight_region,
+                "modelInputCropRef": input.model_input_crop_ref,
+                "sourceImageRef": input.source_image_ref,
+                "imageQuality": {
+                    "hasHighlightRegion": input.highlight_region.is_some(),
+                    "imageCount": input.model_input_images.len(),
+                },
+            }),
+            STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS,
+            Some(ModelResponseFormat::JsonObject),
+        );
         let request_body = json!({
             "model": "gemma",
             "messages": [
                 {
                     "role": "system",
-                    "content": input.prompt
+                    "content": contract.system_policy.clone()
                 },
                 {
                     "role": "user",
-                    "content": build_image_content(
-                        format!(
-                            "Yalnızca işaretli veya belirtilen sorunlu kelimeyi oku. Tüm cevabı yeniden yazma. Eksik cevabı tamamlamaya çalışma. Soru {} için sadece aynı kapsamda düzeltme öner. İlk olarak görsel okuma yap, sonra yakın OCR bağlamıyla ikinci kez kontrol et.",
-                            input.question_number
-                        ),
-                        &images
-                    )
+                    "content": build_image_content(user_data_message(&contract), &images)
                 }
             ],
-            "temperature": 0.0,
-            "max_tokens": STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS,
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
 
@@ -820,9 +1135,11 @@ impl ModelGateway for LlamaServerGateway {
             ));
         }
 
-        let parsed = parse_student_answer_issue_correction_output(&cleaned)?;
+        let correction_policy = default_ocr_review_policy();
+        let parsed =
+            parse_student_answer_issue_correction_output_with_policy(&cleaned, &correction_policy)?;
         let payload_summary = build_payload_summary(
-            input.prompt.len() as u32,
+            contract.system_policy.len() as u32,
             300,
             Some(&input.model_input_images),
             images.first().map(|image| image.bytes_len),
@@ -851,6 +1168,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: raw_response_path,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
             parse_error: parsed.parse_error,
             parsed_json: parsed.parsed_json,
@@ -859,8 +1177,8 @@ impl ModelGateway for LlamaServerGateway {
                 "ocrRecordId": input.ocr_record_id,
                 "issueId": input.issue_id,
                 "observedText": input.observed_text,
-                "suggestedTextFromAnalyzer": input.suggested_text_from_analyzer,
                 "questionNumber": input.question_number,
+                "promptContract": invocation_metadata(&contract),
                 "promptLength": payload_summary.prompt_length,
                 "imageCount": payload_summary.image_count,
                 "imageTotalBytes": payload_summary.image_total_bytes,
@@ -901,26 +1219,35 @@ impl ModelGateway for LlamaServerGateway {
             None,
             "Öğrenci kimlik crop görseli okunamadı.",
         )?;
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::Ocr,
+            &input.prompt,
+            json!({
+                "submissionId": input.submission_id,
+                "preprocessMode": preprocess_mode,
+                "preprocessVersion": preprocess_version,
+                "modelInputCropRef": model_input_crop_ref,
+                "sourcePageNumbers": input.source_page_numbers,
+            }),
+            STUDENT_IDENTITY_OCR_MAX_TOKENS,
+            Some(ModelResponseFormat::JsonObject),
+        );
         let request_body = json!({
             "model": "gemma",
             "messages": [
-                { "role": "system", "content": input.prompt },
+                { "role": "system", "content": contract.system_policy.clone() },
                 {
                     "role": "user",
-                    "content": build_image_content(
-                        format!(
-                            "Yalnızca bu görseldeki öğrenci kimlik alanını oku. Görsel ön işleme profili: {}.",
-                            input
-                                .preprocess_mode
-                                .map(|mode| preprocess_mode_label(&mode).to_string())
-                                .unwrap_or_else(|| "bilinmiyor".to_string())
-                        ),
-                        &images
-                    )
+                    "content": build_image_content(user_data_message(&contract), &images)
                 }
             ],
-            "temperature": 0.0,
-            "max_tokens": STUDENT_IDENTITY_OCR_MAX_TOKENS,
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
         let (http_status, response_body, duration_ms) = self
@@ -953,7 +1280,7 @@ impl ModelGateway for LlamaServerGateway {
         }
 
         let payload_summary = build_payload_summary(
-            input.prompt.len() as u32,
+            contract.system_policy.len() as u32,
             300,
             Some(&input.model_input_images),
             images.first().map(|image| image.bytes_len),
@@ -982,6 +1309,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: raw_response_path,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
             parse_error: parse_outcome.parse_error,
             parsed_json: parse_outcome.parsed_json,
@@ -1019,31 +1347,30 @@ impl ModelGateway for LlamaServerGateway {
             ));
         }
 
-        let user_content = if input.segments.is_empty() {
-            format!(
-                "{}\n\nHAM TRANSKRİPT:\n{}",
-                input.prompt, input.raw_transcript
-            )
-        } else {
-            format!(
-                "{}\n\nSEGMENTLER (JSON):\n{}",
-                input.prompt,
-                serde_json::to_string(&input.segments).unwrap_or_default()
-            )
-        };
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::SpeakingTranscriptCleanup,
+            &input.prompt,
+            json!({
+                "rawTranscript": input.raw_transcript,
+                "segments": input.segments,
+            }),
+            input.max_tokens,
+            Some(ModelResponseFormat::JsonObject),
+        );
         let request_body = json!({
             "model": "gemma-4-12b",
             "messages": [
-                { "role": "system", "content": input.prompt },
-                { "role": "user", "content": user_content }
+                { "role": "system", "content": contract.system_policy.clone() },
+                { "role": "user", "content": user_data_message(&contract) }
             ],
             "chat_template_kwargs": { "enable_thinking": false },
-            "temperature": 0.0,
-            "top_k": 1,
-            "top_p": 1.0,
-            "seed": 42,
-            "max_tokens": input.max_tokens,
-            "response_format": { "type": "json_object" },
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
         let (http_status, response_body, duration_ms) = self
@@ -1080,7 +1407,7 @@ impl ModelGateway for LlamaServerGateway {
                 request_kind: ModelRequestKind::SpeakingTranscriptCleanup,
                 http_status: Some(http_status),
                 duration_ms,
-                prompt_length: Some(input.prompt.len() as u32),
+                prompt_length: Some(contract.system_policy.len() as u32),
                 image_count: Some(0),
                 image_total_bytes: Some(0),
                 base64_approx_total_bytes: Some(0),
@@ -1092,6 +1419,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: extract_reasoning_length(&response_body),
                 raw_text_stored_path: None,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
         })
     }
@@ -1110,19 +1438,33 @@ impl ModelGateway for LlamaServerGateway {
             ));
         }
 
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::AnalysisReport,
+            &input.prompt,
+            json!({ "analysisData": input.prompt }),
+            900,
+            Some(ModelResponseFormat::JsonSchema {
+                name: "analysis_report_v1".to_string(),
+                schema: analysis_report_json_schema(),
+            }),
+        );
         let request_body = json!({
             "model": "gemma-4-12b",
             "messages": [
-                { "role": "system", "content": input.prompt },
+                { "role": "system", "content": contract.system_policy.clone() },
                 {
                     "role": "user",
-                    "content": "Yalnızca öğretmene sunulacak Türkçe analiz raporunu yaz."
+                    "content": user_data_message(&contract)
                 }
             ],
             "chat_template_kwargs": { "enable_thinking": false },
-            "temperature": 0.1,
-            "top_p": 0.9,
-            "max_tokens": 900,
+            "temperature": contract.invocation.sampling_parameters.temperature,
+            "top_k": contract.invocation.sampling_parameters.top_k,
+            "top_p": contract.invocation.sampling_parameters.top_p,
+            "seed": contract.invocation.sampling_parameters.seed,
+            "max_tokens": contract.invocation.sampling_parameters.max_tokens,
+            "response_format": response_format_value(&contract),
             "stream": false
         });
         let (http_status, response_body, duration_ms) = self
@@ -1139,24 +1481,18 @@ impl ModelGateway for LlamaServerGateway {
 
         let assistant_content = extract_assistant_content(&response_body)?;
         let report = strip_reasoning_and_fences(&assistant_content);
-        if report.trim().is_empty() {
-            return Err(app_error(
-                AppErrorCode::ModelResponseEmpty,
-                "Gemma boş bir analiz raporu döndürdü.",
-                Some(assistant_content),
-                Some("Grafikler korunmuştur; raporu yeniden oluşturabilirsiniz.".to_string()),
-            ));
-        }
+        let parsed = parse_analysis_model_output(&report)?;
 
         Ok(AnalysisReportResult {
             report: report.clone(),
+            claims: parsed.claims,
             raw_response: assistant_content,
             diagnostics: ModelDiagnostics {
                 endpoint: self.chat_url(&self.base_url),
                 request_kind: ModelRequestKind::AnalysisReport,
                 http_status: Some(http_status),
                 duration_ms,
-                prompt_length: Some(input.prompt.len() as u32),
+                prompt_length: Some(contract.system_policy.len() as u32),
                 image_count: Some(0),
                 image_total_bytes: Some(0),
                 base64_approx_total_bytes: Some(0),
@@ -1168,6 +1504,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: extract_reasoning_length(&response_body),
                 raw_text_stored_path: None,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
         })
     }
@@ -1186,33 +1523,35 @@ impl ModelGateway for LlamaServerGateway {
 
         let max_tokens = if speaking_request { 3072 } else { 2048 };
         let timeout_seconds = if speaking_request { 300 } else { 600 };
-        let user_instruction = if speaking_request {
-            "Doğrulanmış konuşma transkriptini ve konuşma rubriğini kullanarak yalnızca JSON döndür."
-                .to_string()
-        } else {
-            format!(
-                "Öğrenci cevabı, rubrik ve onaylı OCR verisini kullanarak yalnızca JSON döndür. Soru {}.",
-                input.question_number
-            )
-        };
-        let request_body = json!({
-            "model": "gemma",
-            "messages": [
-                { "role": "system", "content": input.prompt },
-                {
-                    "role": "user",
-                    "content": user_instruction
-                }
-            ],
-            "chat_template_kwargs": { "enable_thinking": false },
-            "temperature": 0.0,
-            "top_k": 1,
-            "top_p": 1.0,
-            "seed": 42,
-            "max_tokens": max_tokens,
-            "response_format": { "type": "json_object" },
-            "stream": false
-        });
+        let contract = request_contract(
+            input.prompt_contract.clone(),
+            ModelRequestKind::Scoring,
+            &input.prompt,
+            json!({
+                "submissionId": input.submission_id,
+                "questionId": input.question_id,
+                "questionNumber": input.question_number,
+                "studentDisplayName": input.student_display_name,
+                "studentNumber": input.student_number,
+                "studentClassName": input.student_class_name,
+                "questionText": input.question_text,
+                "expectedAnswer": input.expected_answer,
+                "answerType": input.answer_type,
+                "answerText": input.answer_text,
+                "rubric": input.rubric_json,
+                "criterionScoresSeed": input.criterion_scores_seed,
+                "partialCreditHints": input.partial_credit_hints,
+                "zeroScoreConditions": input.zero_score_conditions,
+                "commonMistakes": input.common_mistakes,
+                "maxScore": input.max_score,
+                "sourceHash": input.source_hash,
+                "packageHash": input.package_hash,
+                "ocrRecordHash": input.ocr_record_hash,
+            }),
+            max_tokens,
+            Some(ModelResponseFormat::JsonObject),
+        );
+        let request_body = build_scoring_request_body(&contract);
 
         let (http_status, response_body, duration_ms) = self
             .send_chat_request(&self.base_url, request_body, timeout_seconds, "Scoring")
@@ -1244,7 +1583,7 @@ impl ModelGateway for LlamaServerGateway {
         }
 
         let payload_summary = build_payload_summary(
-            input.prompt.len() as u32,
+            contract.system_policy.len() as u32,
             timeout_seconds,
             None,
             None,
@@ -1271,6 +1610,7 @@ impl ModelGateway for LlamaServerGateway {
                 reasoning_content_length: reasoning_length,
                 raw_text_stored_path: None,
                 error_code: None,
+                provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
             parse_error: parse_outcome.parse_error,
             parsed_json: parse_outcome.parsed_json,
@@ -1290,6 +1630,7 @@ impl ModelGateway for LlamaServerGateway {
                 "sourceHash": input.source_hash,
                 "packageHash": input.package_hash,
                 "ocrRecordHash": input.ocr_record_hash,
+                "promptContract": invocation_metadata(&contract),
             })),
         })
     }
@@ -1425,17 +1766,6 @@ fn strip_reasoning_and_fences(text: &str) -> String {
     }
 
     trimmed.to_string()
-}
-
-fn build_rubric_prompt(base_prompt: &str, strict_json_only: bool) -> String {
-    if !strict_json_only {
-        return base_prompt.to_string();
-    }
-
-    format!(
-        "{}\n\nÖnceki cevabın geçerli JSON değildi. Sadece aşağıdaki schema'ya uygun JSON döndür. Markdown, açıklama, code fence kullanma. Sadece JSON.",
-        base_prompt.trim()
-    )
 }
 
 struct RequestImage {
@@ -1783,6 +2113,82 @@ fn parse_speaking_transcript_cleanup_output(
     ))
 }
 
+fn analysis_report_json_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claims"],
+        "properties": {
+            "claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["claim", "metricRefs", "recommendation"],
+                    "properties": {
+                        "claim": { "type": "string", "minLength": 1 },
+                        "metricRefs": {
+                            "type": "array",
+                            "items": {
+                                "oneOf": [
+                                    { "type": "string", "minLength": 1 },
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "required": ["metricId"],
+                                        "properties": {
+                                            "metricId": { "type": "string", "minLength": 1 },
+                                            "value": { "type": ["number", "null"] }
+                                        }
+                                    }
+                                ]
+                            }
+                        },
+                        "recommendation": { "type": "string" }
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn parse_analysis_model_output(report: &str) -> Result<AnalysisModelOutput, AppError> {
+    if report.trim().is_empty() {
+        return Err(app_error(
+            AppErrorCode::ModelResponseEmpty,
+            "Gemma boş bir analiz raporu döndürdü.",
+            None,
+            Some("Grafikler korunmuştur; analizi yeniden oluşturabilirsiniz.".to_string()),
+        ));
+    }
+    let candidate =
+        extract_first_balanced_json_candidate(report).unwrap_or_else(|| report.to_string());
+    let parsed: AnalysisModelOutput = serde_json::from_str(candidate.trim()).map_err(|error| {
+        app_error(
+            AppErrorCode::ModelResponseInvalidJson,
+            "Gemma analiz raporu beklenen yapılandırılmış biçimde değil.",
+            Some(format!(
+                "analysis_report_parse_error={error}; raw_model_output={report}"
+            )),
+            Some("Grafikler korunmuştur; analizi yeniden oluşturabilirsiniz.".to_string()),
+        )
+    })?;
+    if parsed.claims.is_empty()
+        || parsed
+            .claims
+            .iter()
+            .any(|claim| claim.claim.trim().is_empty())
+    {
+        return Err(app_error(
+            AppErrorCode::ModelResponseInvalidSchema,
+            "Gemma analiz raporu geçerli bir iddia listesi içermiyor.",
+            Some(format!("claim_count={}", parsed.claims.len())),
+            Some("Grafikler korunmuştur; analizi yeniden oluşturabilirsiniz.".to_string()),
+        ));
+    }
+    Ok(parsed)
+}
+
 fn request_metadata(
     request: &RubricExtractionRequest,
     extraction_method: &str,
@@ -1978,6 +2384,9 @@ fn save_student_answer_ocr_artifacts(
         "preprocessVersion": request.preprocess_version,
         "modelInputCropRef": request.model_input_crop_ref,
         "pageNumbers": request.source_page_numbers,
+        "regionIds": request.region_ids,
+        "regionOrders": request.region_orders,
+        "regionPageOffsets": request.region_page_offsets,
         "promptLength": request.prompt.len(),
         "imageCount": request.model_input_images.len(),
         "projectRootPath": request.project_root_path,
@@ -2037,13 +2446,10 @@ fn save_student_answer_issue_correction_artifacts(
         "ocrRecordId": request.ocr_record_id,
         "issueId": request.issue_id,
         "observedText": request.observed_text,
-        "suggestedTextFromAnalyzer": request.suggested_text_from_analyzer,
         "questionNumber": request.question_number,
         "highlightRegion": request.highlight_region,
         "modelInputCropRef": request.model_input_crop_ref,
         "sourceImageRef": request.source_image_ref,
-        "nearbyContext": request.nearby_context,
-        "contextHints": request.context_hints,
         "promptLength": request.prompt.len(),
         "imageCount": request.model_input_images.len(),
         "projectRootPath": request.project_root_path,
@@ -2182,6 +2588,7 @@ fn normalize_rubric_criteria(
                 label,
                 description,
                 points,
+                levels: vec![],
             })
         })
         .collect();
@@ -2567,7 +2974,18 @@ fn highlight_region_field(
     })
 }
 
+#[cfg(test)]
 fn parse_student_answer_ocr_output(raw: &str, question_text: &str) -> StudentAnswerOcrParseOutcome {
+    let policy = default_ocr_review_policy();
+    parse_student_answer_ocr_output_with_policy(raw, question_text, "general_text", &policy)
+}
+
+fn parse_student_answer_ocr_output_with_policy(
+    raw: &str,
+    question_text: &str,
+    answer_type: &str,
+    policy: &crate::domain::student::OcrReviewPolicy,
+) -> StudentAnswerOcrParseOutcome {
     let raw_text = raw.trim().to_string();
     let cleaned = strip_reasoning_and_fences(raw);
     let fenced_candidate = extract_fenced_json_candidate(raw);
@@ -2591,6 +3009,8 @@ fn parse_student_answer_ocr_output(raw: &str, question_text: &str) -> StudentAns
                 None,
                 question_text,
                 raw,
+                answer_type,
+                policy,
             ) {
                 return output;
             }
@@ -2617,6 +3037,7 @@ fn parse_student_answer_ocr_output(raw: &str, question_text: &str) -> StudentAns
             needs_review: true,
             review_reasons: vec!["parse_failed".to_string()],
             warnings,
+            review_policy: Some(policy.clone()),
         },
         parsed_json: None,
         parse_error: Some("Öğrenci OCR JSON çıktısı çözülemedi.".to_string()),
@@ -2641,6 +3062,7 @@ fn extract_fenced_json_candidate(raw: &str) -> Option<String> {
     Some(content_after[..end_idx].trim().to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_student_answer_ocr_value(
     value: serde_json::Value,
     candidate: &str,
@@ -2648,6 +3070,8 @@ fn parse_student_answer_ocr_value(
     parse_error: Option<String>,
     question_text: &str,
     raw: &str,
+    answer_type: &str,
+    policy: &crate::domain::student::OcrReviewPolicy,
 ) -> Option<StudentAnswerOcrParseOutcome> {
     let object = value.as_object()?;
     let has_answer_field = object.contains_key("answerText")
@@ -2667,11 +3091,46 @@ fn parse_student_answer_ocr_value(
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| salvage_student_answer_text(candidate, raw));
-    let structured_answer = object
+    let structured_value = object
         .get("structuredAnswer")
         .or_else(|| object.get("structured_answer"))
         .cloned()
         .and_then(|value| if value.is_null() { None } else { Some(value) });
+    let (structured_answer, structured_answer_error) = match structured_value {
+        Some(value) => match answer_type_from_label(answer_type) {
+            None => (
+                Some(
+                    crate::domain::structured_answer::StructuredAnswer::LegacyUnparsed {
+                        raw: value,
+                        reason: "structured_answer_unknown_answer_type".to_string(),
+                    },
+                ),
+                Some("structured_answer_unknown_answer_type".to_string()),
+            ),
+            Some(answer_type) => {
+                match crate::domain::structured_answer::parse_for_answer_type(
+                    &answer_type,
+                    value.clone(),
+                ) {
+                    Ok(answer) => (Some(answer), None),
+                    Err(error) => {
+                        let review_answer =
+                            crate::domain::structured_answer::parse_legacy_for_review(
+                                value.clone(),
+                            )
+                            .unwrap_or_else(|parse_error| {
+                                crate::domain::structured_answer::StructuredAnswer::LegacyUnparsed {
+                                    raw: value,
+                                    reason: parse_error.message,
+                                }
+                            });
+                        (Some(review_answer), Some(error.message))
+                    }
+                }
+            }
+        },
+        None => (None, None),
+    };
     let confidence = object
         .get("confidence")
         .and_then(|value| value.as_f64())
@@ -2745,6 +3204,11 @@ fn parse_student_answer_ocr_value(
         review_reasons.push("ocr_schema_incomplete".to_string());
         needs_review = true;
     }
+    if structured_answer_error.is_some() {
+        warnings.push("structured_answer_invalid".to_string());
+        review_reasons.push("structured_answer_invalid".to_string());
+        needs_review = true;
+    }
 
     let printed_question_leak_detected = detect_printed_question_leak(&answer_text, question_text);
     let printed_text_mixed = printed_question_leak_detected || answer_text.trim().is_empty();
@@ -2758,9 +3222,7 @@ fn parse_student_answer_ocr_value(
         warnings.push("ocr_answer_empty".to_string());
         needs_review = true;
     }
-    if answer_text.to_lowercase().contains("[okunamadı]")
-        || answer_text.to_lowercase().contains("[okunamadi]")
-    {
+    if normalize_for_similarity(&answer_text).contains("okunamadi") {
         review_reasons.push("ocr_unreadable_span".to_string());
         warnings.push("ocr_unreadable_span".to_string());
         needs_review = true;
@@ -2783,7 +3245,7 @@ fn parse_student_answer_ocr_value(
         warnings.push("ocr_parse_failed".to_string());
         needs_review = true;
     }
-    if confidence < MIN_STUDENT_ANSWER_OCR_CONFIDENCE {
+    if policy.should_review_confidence(confidence) {
         review_reasons.push("ocr_low_confidence".to_string());
         warnings.push("ocr_low_confidence".to_string());
         needs_review = true;
@@ -2807,6 +3269,7 @@ fn parse_student_answer_ocr_value(
             needs_review,
             review_reasons,
             warnings,
+            review_policy: Some(policy.clone()),
         },
         parsed_json: Some(value),
         parse_error,
@@ -2817,24 +3280,53 @@ fn parse_student_answer_ocr_value(
     })
 }
 
+fn answer_type_from_label(label: &str) -> Option<AnswerType> {
+    Some(match label.trim().to_ascii_lowercase().as_str() {
+        "general_text" => AnswerType::GeneralText,
+        "short_text" => AnswerType::ShortText,
+        "essay" => AnswerType::Essay,
+        "table" => AnswerType::Table,
+        "correction_table" => AnswerType::CorrectionTable,
+        "fill_blank" => AnswerType::FillBlank,
+        "matching" => AnswerType::Matching,
+        "multiple_choice" => AnswerType::MultipleChoice,
+        "true_false" => AnswerType::TrueFalse,
+        "ordering" => AnswerType::Ordering,
+        "numeric" => AnswerType::Numeric,
+        "diagram_labeling" => AnswerType::DiagramLabeling,
+        "sentence_annotation" => AnswerType::SentenceAnnotation,
+        "grammar_analysis" => AnswerType::GrammarAnalysis,
+        _ => return None,
+    })
+}
+
 fn contains_ocr_commentary(answer_text: &str) -> bool {
-    let normalized = answer_text.trim().to_lowercase();
+    let normalized = normalize_for_similarity(answer_text);
     [
-        "öğrenci burada",
-        "öğrenci şunu",
-        "öğrencinin cevabı",
-        "cevap şu şekildedir",
-        "cevap şudur",
-        "görselde öğrencinin",
-        "buradan anlaşılmaktadır",
-        "demek istemiştir",
+        "ogrenci burada",
+        "ogrenci sunu",
+        "ogrencinin cevabi",
+        "cevap su sekildedir",
+        "cevap sudur",
+        "gorselde ogrencinin",
+        "buradan anlasilmaktadir",
+        "demek istemistir",
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
 }
 
+#[cfg(test)]
 fn parse_student_answer_issue_correction_output(
     raw: &str,
+) -> Result<StudentAnswerOcrIssueCorrectionParseOutcome, AppError> {
+    let policy = default_ocr_review_policy();
+    parse_student_answer_issue_correction_output_with_policy(raw, &policy)
+}
+
+fn parse_student_answer_issue_correction_output_with_policy(
+    raw: &str,
+    policy: &crate::domain::student::OcrReviewPolicy,
 ) -> Result<StudentAnswerOcrIssueCorrectionParseOutcome, AppError> {
     let cleaned = strip_reasoning_and_fences(raw);
     let candidate = extract_first_balanced_json_candidate(&cleaned).unwrap_or(cleaned.clone());
@@ -2922,7 +3414,7 @@ fn parse_student_answer_issue_correction_output(
         output.decision = StudentAnswerOcrIssueCorrectionDecision::NeedsTeacherReview;
     }
 
-    if output.confidence < 0.3 {
+    if output.confidence < policy.critical_confidence_threshold {
         output
             .warnings
             .push("suggestion_confidence_low".to_string());
@@ -2979,15 +3471,7 @@ fn detect_printed_question_leak(answer_text: &str, question_text: &str) -> bool 
 }
 
 fn normalize_for_similarity(text: &str) -> String {
-    text.chars()
-        .map(|ch| {
-            if ch.is_alphanumeric() || ch.is_whitespace() {
-                ch.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
+    crate::services::text_normalization::normalize_for_comparison(text)
 }
 
 fn token_set(text: &str) -> std::collections::BTreeSet<String> {
@@ -3067,7 +3551,8 @@ fn parse_rubric_question_item(
         })? as u32;
 
     let max_points_value = object
-        .get("maxPoints")
+        .get("maxScore")
+        .or_else(|| object.get("maxPoints"))
         .or_else(|| object.get("max_points"))
         .or_else(|| object.get("maxPoint"))
         .or_else(|| object.get("max_score"))
@@ -3118,6 +3603,19 @@ fn parse_rubric_question_item(
     if object.contains_key("model_answer") {
         warnings.push(normalize_alias_warning("expectedAnswer", "model_answer"));
     }
+
+    let key_concepts = rubric_string_array(object, &["keyConcepts", "key_concepts", "keywords"]);
+    let partial_credit_hints = rubric_string_array(
+        object,
+        &[
+            "partialCreditHints",
+            "partial_credit_hints",
+            "partialCreditNotes",
+        ],
+    );
+    let zero_score_conditions =
+        rubric_string_array(object, &["zeroScoreConditions", "zero_score_conditions"]);
+    let common_mistakes = rubric_string_array(object, &["commonMistakes", "common_mistakes"]);
     if object.contains_key("rubric") {
         warnings.push(normalize_alias_warning("criteria", "rubric"));
     }
@@ -3157,6 +3655,7 @@ fn parse_rubric_question_item(
         || expected_answer
             .as_ref()
             .is_some_and(|text| !text.trim().is_empty())
+        || !key_concepts.is_empty()
         || !criteria.is_empty();
     if !has_meaningful_content {
         warnings.push("rubric_empty_content".to_string());
@@ -3166,6 +3665,7 @@ fn parse_rubric_question_item(
         question_number,
         max_points,
         expected_answer,
+        key_concepts,
         criteria: criteria
             .into_iter()
             .map(|criterion| crate::domain::model::RubricImportCriterion {
@@ -3174,8 +3674,29 @@ fn parse_rubric_question_item(
                 description: criterion.description,
             })
             .collect(),
+        partial_credit_hints,
+        zero_score_conditions,
+        common_mistakes,
         warnings,
     })
+}
+
+fn rubric_string_array(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Vec<String> {
+    names
+        .iter()
+        .find_map(|name| object.get(*name).and_then(|value| value.as_array()))
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_partial_rubric_questions(raw: &str) -> Option<crate::domain::model::RubricImportPayload> {
@@ -3257,6 +3778,7 @@ fn rubric_payload_to_output(
                     label: criterion.label,
                     description: criterion.description,
                     points: criterion.points,
+                    levels: vec![],
                 })
                 .collect();
 
@@ -3264,7 +3786,11 @@ fn rubric_payload_to_output(
                 number: question.question_number,
                 max_points: question.max_points,
                 expected_answer: question.expected_answer,
+                key_concepts: question.key_concepts,
                 criteria,
+                partial_credit_hints: question.partial_credit_hints,
+                zero_score_conditions: question.zero_score_conditions,
+                common_mistakes: question.common_mistakes,
                 confidence: 1.0,
                 warnings: question.warnings,
             }
@@ -3660,6 +4186,8 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                 .as_object()
                 .map(|object| object_number(object, &["awardedScore", "awarded_score", "score"]))
                 .unwrap_or(0.0);
+            let direct_score_fields = direct_scoring_fields(&value);
+            let criterion_decisions = parse_semantic_criterion_decisions(&value);
             let confidence = value
                 .get("confidence")
                 .and_then(|value| value.as_f64())
@@ -3676,17 +4204,8 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                         .iter()
                         .filter_map(|item| {
                             let object = item.as_object()?;
-                            let criterion_id = object_text(
-                                object,
-                                &[
-                                    "criterionId",
-                                    "criterion_id",
-                                    "id",
-                                    "criterion",
-                                    "criterionName",
-                                    "criterion_name",
-                                ],
-                            );
+                            let criterion_id =
+                                object_text(object, &["criterionId", "criterion_id"]);
                             let criterion_title = object_text(
                                 object,
                                 &[
@@ -3719,9 +4238,6 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                                 &["rationale", "reason", "explanation", "feedback"],
                             );
                             let evidence_quote = object_evidence(object);
-                            if criterion_id.is_empty() && criterion_title.is_empty() {
-                                return None;
-                            }
                             Some(ScoringCriterionScore {
                                 criterion_id,
                                 criterion_title,
@@ -3744,7 +4260,9 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                 .trim()
                 .to_string();
             let warnings = string_array_field(&value, "warnings");
-            let parse_strategy = if value.get("criterionScores").is_some() {
+            let parse_strategy = if !criterion_decisions.is_empty() {
+                "semantic_criterion_levels"
+            } else if value.get("criterionScores").is_some() {
                 "criterion_scores"
             } else if value.get("criteria").is_some() {
                 "criteria"
@@ -3755,7 +4273,13 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
             }
             .to_string();
 
-            let schema_error = scoring_schema_error(&value, max_score);
+            let direct_score_rejected =
+                !criterion_decisions.is_empty() && !direct_score_fields.is_empty();
+            let schema_error = if !criterion_decisions.is_empty() {
+                semantic_scoring_schema_error(&value)
+            } else {
+                scoring_schema_error(&value, max_score)
+            };
             ScoringParseOutcome {
                 output: ScoringOutput {
                     awarded_score,
@@ -3768,10 +4292,14 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false)
                         || rationale.is_empty()
-                        || criterion_scores.is_empty()
+                        || (criterion_scores.is_empty() && criterion_decisions.is_empty())
+                        || direct_score_rejected
                         || schema_error.is_some(),
                     warnings,
                     criterion_scores,
+                    criterion_decisions,
+                    direct_score_fields,
+                    direct_score_rejected,
                 },
                 parsed_json: Some(value),
                 parse_error: schema_error,
@@ -3792,6 +4320,9 @@ fn parse_scoring_output(raw: &str, max_score: f32) -> ScoringParseOutcome {
                 needs_review: true,
                 warnings: vec!["scoring_json_parse_failed".to_string()],
                 criterion_scores: vec![],
+                criterion_decisions: vec![],
+                direct_score_fields: vec![],
+                direct_score_rejected: false,
             },
             parsed_json: None,
             parse_error: Some(error.to_string()),
@@ -3869,17 +4400,7 @@ fn scoring_schema_error(value: &serde_json::Value, max_score: f32) -> Option<Str
                 return Some(format!("Notlandırma kriteri {index} JSON nesnesi değil."));
             };
             for (field, aliases) in [
-                (
-                    "criterionId",
-                    &[
-                        "criterionId",
-                        "criterion_id",
-                        "id",
-                        "criterion",
-                        "criterionName",
-                        "criterion_name",
-                    ][..],
-                ),
+                ("criterionId", &["criterionId", "criterion_id"][..]),
                 (
                     "criterionTitle",
                     &[
@@ -3927,9 +4448,184 @@ fn scoring_schema_error(value: &serde_json::Value, max_score: f32) -> Option<Str
     None
 }
 
+fn direct_scoring_fields(value: &serde_json::Value) -> Vec<String> {
+    let mut fields = Vec::new();
+    if let Some(object) = value.as_object() {
+        for field in [
+            "awardedScore",
+            "awarded_score",
+            "score",
+            "totalScore",
+            "total_score",
+        ] {
+            if object.contains_key(field) {
+                fields.push(field.to_string());
+            }
+        }
+        if let Some(criteria) = object
+            .get("criterionDecisions")
+            .or_else(|| object.get("criteria"))
+            .or_else(|| object.get("decisions"))
+            .or_else(|| object.get("criterionScores"))
+            .and_then(|value| value.as_array())
+        {
+            for criterion in criteria.iter().filter_map(|value| value.as_object()) {
+                for field in ["awardedScore", "awarded_score", "score", "points"] {
+                    if criterion.contains_key(field) {
+                        fields.push(format!("criterion.{field}"));
+                    }
+                }
+            }
+        }
+    }
+    fields.sort();
+    fields.dedup();
+    fields
+}
+
+fn parse_semantic_criterion_decisions(value: &serde_json::Value) -> Vec<SemanticCriterionDecision> {
+    let Some(items) = value
+        .get("criterionDecisions")
+        .or_else(|| value.get("decisions"))
+        .or_else(|| value.get("criteria"))
+        .and_then(|value| value.as_array())
+    else {
+        return vec![];
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let criterion_id = object_text(object, &["criterionId", "criterion_id"]);
+            let level_id = object_text(
+                object,
+                &[
+                    "levelId",
+                    "level_id",
+                    "selectedLevelId",
+                    "selected_level_id",
+                ],
+            );
+            if criterion_id.is_empty() || level_id.is_empty() {
+                return None;
+            }
+            let exact_evidence = object_text(
+                object,
+                &[
+                    "exactEvidence",
+                    "exact_evidence",
+                    "evidenceQuote",
+                    "evidence_quote",
+                    "quote",
+                ],
+            );
+            let missing_requirements = object
+                .get("missingRequirements")
+                .or_else(|| object.get("missing_requirements"))
+                .and_then(|value| value.as_array())
+                .map(|items| items.iter().filter_map(json_text).collect())
+                .unwrap_or_default();
+            Some(SemanticCriterionDecision {
+                criterion_id,
+                level_id,
+                exact_evidence: (!exact_evidence.is_empty()).then_some(exact_evidence),
+                missing_requirements,
+                contradiction: object
+                    .get("contradiction")
+                    .or_else(|| object.get("hasContradiction"))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+                rationale: object_text(object, &["rationale", "reason", "explanation"]),
+            })
+        })
+        .collect()
+}
+
+fn semantic_scoring_schema_error(value: &serde_json::Value) -> Option<String> {
+    let Some(object) = value.as_object() else {
+        return Some("Semantik notlandırma çıktısı JSON nesnesi değil.".to_string());
+    };
+    let confidence = object.get("confidence").and_then(|value| value.as_f64());
+    if confidence.map_or(true, |value| {
+        !value.is_finite() || !(0.0..=1.0).contains(&value)
+    }) {
+        return Some("Semantik notlandırma güven değeri 0..1 aralığında değil.".to_string());
+    }
+    if !object
+        .get("criterionDecisions")
+        .or_else(|| object.get("decisions"))
+        .or_else(|| object.get("criteria"))
+        .is_some_and(|value| value.is_array())
+    {
+        return Some("Semantik notlandırma criterionDecisions alanı dizi değil.".to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speaking_scoring_request_is_text_only() {
+        let contract = legacy_prompt_contract_with_data(
+            ModelRequestKind::Scoring,
+            "speaking policy",
+            json!({
+                "answerType": "speaking",
+                "transcriptForScoring": "Öğrenci metni"
+            }),
+            3072,
+            Some(ModelResponseFormat::JsonObject),
+        );
+        let body = build_scoring_request_body(&contract);
+        let messages = body["messages"]
+            .as_array()
+            .expect("scoring request must have messages");
+        assert!(messages[0]["content"].is_string());
+        assert!(messages[1]["content"].is_string());
+        assert!(!body.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn analysis_output_parser_rejects_invalid_json_as_a_structured_model_error() {
+        let error = parse_analysis_model_output("Bu bir serbest metin raporudur.")
+            .expect_err("free text must not pass the structured analysis gate");
+        assert_eq!(error.code, AppErrorCode::ModelResponseInvalidJson);
+        assert!(error.message.contains("yapılandırılmış"));
+        assert!(error.suggested_action.is_some());
+    }
+
+    #[test]
+    fn analysis_schema_requires_claim_metric_references() {
+        let schema = analysis_report_json_schema();
+        assert_eq!(schema["required"], json!(["claims"]));
+        assert_eq!(
+            schema["properties"]["claims"]["items"]["required"],
+            json!(["claim", "metricRefs", "recommendation"])
+        );
+    }
+
+    #[test]
+    fn strict_local_rejects_public_endpoints_but_accepts_ipv4_and_ipv6_loopback() {
+        assert!(
+            validate_base_url_for_privacy("http://127.0.0.1:8080", PrivacyMode::StrictLocal)
+                .is_ok()
+        );
+        assert!(
+            validate_base_url_for_privacy("http://[::1]:8080", PrivacyMode::StrictLocal).is_ok()
+        );
+        assert!(validate_base_url_for_privacy(
+            "https://model.example.test:443",
+            PrivacyMode::StrictLocal
+        )
+        .is_err());
+        assert!(validate_base_url_for_privacy(
+            "https://model.example.test:443",
+            PrivacyMode::ExplicitExternal
+        )
+        .is_ok());
+    }
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -3997,10 +4693,18 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let gateway = LlamaServerGateway::new(base_url);
+            let health_only = gateway.get_status().await.unwrap();
+            assert!(health_only.server_running);
+            assert!(health_only.health_ok);
+            assert!(!health_only.completion_probe_ok);
+            assert!(health_only.health_verified_at.is_some());
+            assert!(health_only.completion_probe_verified_at.is_none());
             let status = gateway.probe_server().await.unwrap();
             assert!(status.server_running);
             assert!(status.health_ok);
             assert!(status.completion_probe_ok);
+            assert!(status.health_verified_at.is_some());
+            assert!(status.completion_probe_verified_at.is_some());
         });
     }
 
@@ -4136,6 +4840,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_scoring_output_rejects_title_as_criterion_id() {
+        let outcome = parse_scoring_output(
+            r#"{"awardedScore":1,"confidence":0.8,"needsReview":false,"rationale":"Yeterli gerekçe.","criterionScores":[{"criterionTitle":"Kriter","criterionMaxScore":2,"awardedScore":1,"rationale":"Kanıt var.","evidenceQuote":"kanıt"}]}"#,
+            2.0,
+        );
+        assert!(outcome.parse_error.is_some());
+        assert_eq!(outcome.output.criterion_scores[0].criterion_id, "");
+        assert!(outcome.output.needs_review);
+    }
+
+    #[test]
     fn test_parse_student_answer_ocr_output_parses_uncertainty_metadata() {
         let outcome = parse_student_answer_ocr_output(
             r#"{"answerText":"çelişen sözcük kullanımı","confidence":0.73,"uncertainSpans":[{"text":"çelişen","start":0,"end":8,"alternatives":["gelişen"],"confidence":0.41,"reason":"handwriting_ambiguity","highlightRegion":{"x":0.1,"y":0.2,"width":0.3,"height":0.1,"pageIndex":0}}],"suggestedCorrections":[{"originalText":"çelişen","suggestedText":"gelişen","reason":"near_match","confidence":0.41,"applied":false,"highlightRegion":{"x":0.2,"y":0.3,"width":0.2,"height":0.1,"pageIndex":0}}],"criticalTermWarnings":[{"observedText":"çelişen sözcük kullanımı","expectedOrRelatedTerm":"gelişen sözcük kullanımı","reason":"semantic_confusion","warningCode":"critical_keyword_ocr_uncertain","highlightRegion":{"x":0.15,"y":0.35,"width":0.4,"height":0.12,"pageIndex":0}}],"ocrSemanticWarnings":["critical_keyword_ocr_uncertain"],"criticalKeywordUncertain":true,"reviewReasons":[],"warnings":[]}"#,
@@ -4167,7 +4882,7 @@ mod tests {
     #[test]
     fn test_parse_student_answer_ocr_output_forces_review_below_confidence_threshold() {
         let outcome = parse_student_answer_ocr_output(
-            r#"{"answerText":"Belirsiz el yazısı","confidence":0.41,"needsReview":false,"reviewReasons":[],"warnings":[]}"#,
+            r#"{"answerText":"Belirsiz el yazısı","confidence":0.65,"needsReview":false,"reviewReasons":[],"warnings":[]}"#,
             "Soru metni",
         );
 
@@ -4274,6 +4989,20 @@ mod tests {
         assert_eq!(payload.questions.len(), 1);
         assert_eq!(payload.questions[0].question_number, 1);
         assert_eq!(payload.questions[0].max_points, Some(10.0));
+    }
+
+    #[test]
+    fn test_parse_rubric_model_response_accepts_canonical_rubric_fields() {
+        let payload = parse_rubric_model_response(
+            r#"{"questions":[{"questionNumber":1,"maxScore":10,"expectedAnswer":"A","keyConcepts":["A"],"criteria":[{"label":"L","points":10,"description":"D"}],"partialCreditHints":["Kısmi"],"zeroScoreConditions":["Boş"],"commonMistakes":["Hata"],"warnings":[]}],"documentWarnings":[]}"#,
+        )
+        .expect("payload");
+        let question = &payload.questions[0];
+        assert_eq!(question.max_points, Some(10.0));
+        assert_eq!(question.key_concepts, vec!["A"]);
+        assert_eq!(question.partial_credit_hints, vec!["Kısmi"]);
+        assert_eq!(question.zero_score_conditions, vec!["Boş"]);
+        assert_eq!(question.common_mistakes, vec!["Hata"]);
     }
 
     #[test]
@@ -4393,6 +5122,43 @@ mod tests {
             Some("Aras'ı bu ara rahat bırak.")
         );
         assert_eq!(outcome.output.awarded_score, 10.0);
+    }
+
+    #[test]
+    fn test_parse_semantic_scoring_output_extracts_level_evidence_and_rejects_direct_score() {
+        let outcome = parse_scoring_output(
+            r#"{
+              "criterionDecisions": [{
+                "criterionId": "c1",
+                "levelId": "full",
+                "exactEvidence": "Doğru cevap",
+                "missingRequirements": [],
+                "contradiction": false,
+                "rationale": "Kriter karşılandı.",
+                "awardedScore": 99
+              }],
+              "awardedScore": 99,
+              "confidence": 0.94,
+              "needsReview": false,
+              "rationale": "Seviye kanıtla seçildi."
+            }"#,
+            10.0,
+        );
+
+        assert_eq!(outcome.output.criterion_decisions.len(), 1);
+        assert_eq!(outcome.output.criterion_decisions[0].level_id, "full");
+        assert_eq!(
+            outcome.output.criterion_decisions[0]
+                .exact_evidence
+                .as_deref(),
+            Some("Doğru cevap")
+        );
+        assert!(outcome.output.direct_score_rejected);
+        assert!(outcome
+            .output
+            .direct_score_fields
+            .contains(&"awardedScore".to_string()));
+        assert!(outcome.output.needs_review);
     }
 
     #[test]

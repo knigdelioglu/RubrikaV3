@@ -16,6 +16,86 @@ pub enum AnalysisStatus {
     Failed,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisMetricUnit {
+    Count,
+    Score,
+    Percentage,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisEvidenceStatus {
+    Supported,
+    Review,
+    Unsupported,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisMetric {
+    pub id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: AnalysisMetricUnit,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisMetricRef {
+    pub metric_id: String,
+    pub label: String,
+    pub value: f32,
+    pub unit: AnalysisMetricUnit,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisClaim {
+    pub id: String,
+    pub claim: String,
+    #[serde(default)]
+    pub metric_refs: Vec<AnalysisMetricRef>,
+    #[serde(default)]
+    pub recommendation: String,
+    pub evidence_status: AnalysisEvidenceStatus,
+    pub teacher_visible_explanation: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisMetricRefInputObject {
+    pub metric_id: String,
+    #[serde(default, alias = "reportedValue")]
+    pub value: Option<f32>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(untagged)]
+pub enum AnalysisMetricRefInput {
+    Id(String),
+    Object(AnalysisMetricRefInputObject),
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisModelClaim {
+    pub claim: String,
+    #[serde(default)]
+    pub metric_refs: Vec<AnalysisMetricRefInput>,
+    #[serde(default)]
+    pub recommendation: String,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisModelOutput {
+    #[serde(default)]
+    pub claims: Vec<AnalysisModelClaim>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisCriterionSummary {
@@ -62,6 +142,13 @@ pub struct AssessmentAnalysis {
     pub criteria: Vec<AnalysisCriterionSummary>,
     pub students: Vec<AnalysisStudentSummary>,
     pub score_bands: Vec<AnalysisScoreBand>,
+    /// Canonical aggregate registry used to validate every model claim.
+    #[serde(default)]
+    pub metrics: Vec<AnalysisMetric>,
+    /// Structured model claims. Legacy `modelReport` is retained below only
+    /// so older analysis files remain readable.
+    #[serde(default)]
+    pub claims: Vec<AnalysisClaim>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_report: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

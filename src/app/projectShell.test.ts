@@ -23,7 +23,7 @@ import {
   resolveLegacyProjectDestination,
   resolveLegacyProjectPath,
 } from './projectRoutes.ts';
-import { isProjectWriteBlocked } from './projectSafety.ts';
+import { isProjectWriteBlocked, isProjectWriteControl } from './projectSafety.ts';
 
 const job = (overrides: Partial<JobSnapshot> = {}): JobSnapshot => ({
   id: 'internal-job-id',
@@ -175,4 +175,10 @@ test('project writes stay blocked until backend preflight explicitly allows them
     isProjectWriteBlocked({ decision: 'SAFE_TO_OPEN_WITH_BACKUP', initializationWriteAllowed: false }, { isLoading: false, isError: false }),
     false,
   );
+});
+
+test('read-only project controls bypass the write gate', () => {
+  assert.equal(isProjectWriteControl('false'), false);
+  assert.equal(isProjectWriteControl(null), true);
+  assert.equal(isProjectWriteControl('true'), true);
 });
