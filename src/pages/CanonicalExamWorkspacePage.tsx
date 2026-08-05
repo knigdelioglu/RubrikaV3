@@ -15,6 +15,8 @@ import { StudentAnswerOcrPage } from './StudentAnswerOcrPage';
 import { ScoringPage } from './ScoringPage';
 import { AnalysisPage } from './AnalysisPage';
 import { SpeechExamPage } from './SpeechExamPage';
+import { PerformanceOrganizationPage } from './PerformanceOrganizationPage';
+import { PerformanceResultsView, PerformanceScoringPage } from './PerformanceScoringPage';
 
 const EMPTY_CLASSES: SchoolClass[] = [];
 
@@ -194,6 +196,17 @@ export function CanonicalExamWorkspacePage() {
           case 'results':
           default:
             return <AnalysisPage kind="speaking" />;
+        }
+
+      case 'performance':
+        switch (activeStepId) {
+          case 'task':
+            return <PerformanceOrganizationPage activityId={activityId} />;
+          case 'assessment':
+            return <PerformanceScoringPage />;
+          case 'results':
+          default:
+            return <PerformanceResultsView projectId={projectId} activityId={activityId} />;
         }
 
       default:

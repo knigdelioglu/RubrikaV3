@@ -23,9 +23,9 @@ The canonical UI ownership is `/project/:projectId/classes` for `create_teaching
 
 Commands: `list_assessment_activities`, `get_assessment_sequence_options`, `get_assessment_activity`, `list_assessment_classes`, `create_assessment_activity`, `update_assessment_activity`, `get_assessment_class_applications`, `get_class_application_students`, `add_assessment_class_application`, `archive_assessment_class_application`, `remove_assessment_class_application`, `attach_assessment_document`, `list_teaching_assignments`, `create_teaching_assignment`, `archive_teaching_assignment`.
 
-`assessment_type` values are `written`, `listening`, `speaking`; workflow families are derived as `written`, `written`, `speaking` respectively. All organization errors are structured `AppError` values.
+`assessment_type` values are `written`, `listening`, `speaking`, `performance`; workflow families are derived as `written`, `written`, `speaking`, `performance` respectively. All organization errors are structured `AppError` values.
 
-Canonical Assessment Workspace routes are `/project/:projectId/activities/:assessmentActivityId/:step`. Canonical steps for `written` (`prep`, `students`, `ocr`, `scoring`, `results`), `listening` (`listening_content`, `questions`, `students`, `ocr_scoring`, `results`), and `speaking` (`settings`, `students`, `transcript`, `evaluation`, `results`) present type-specific steps in the main workspace content shell without changing the global navigation. Step readiness is calculated exclusively from backend `WorkflowSnapshot` and attempt states.
+Canonical Assessment Workspace routes are `/project/:projectId/activities/:assessmentActivityId/:step`. Canonical steps for `written` (`prep`, `students`, `ocr`, `scoring`, `results`), `listening` (`listening_content`, `questions`, `students`, `ocr_scoring`, `results`), `speaking` (`settings`, `students`, `transcript`, `evaluation`, `results`), and `performance` (`task`, `assessment`, `results`) present type-specific steps in the main workspace content shell without changing the global navigation. Step readiness is calculated exclusively from backend `WorkflowSnapshot` and attempt states.
 
 Canonical speaking execution commands are `start_speaking_exam_attempt`, `toggle_speaking_capture`, `select_speaking_exam_class`, `select_speaking_exam_student` and `get_speaking_exam`. Canonical input carries `assessmentActivityId` and `classApplicationId`; `classId` alone is only a legacy adapter input and is not used by the new UI. `start_speaking_exam_attempt` rejects missing activity/application, unrelated applications, archived applications and students outside the selected SchoolClass roster.
 
@@ -38,6 +38,35 @@ Speaking attempts persist `rawTranscript`, segment-preserving cleanup candidate/
 `SpeakingSubindicatorScore` exposes `selectedLevelId`, `appliedLevelId`, `points`, positive/counter evidence IDs, missing requirements and optional ceiling reason/explanation. `selectedLevelId` is immutable model provenance; UI uses `appliedLevelId` for the effective contribution.
 
 `SpeakingMetrics` exposes recording/active speech durations, words per minute, silence/long pause/filler/repetition counts, duration tier, expected minimum duration, `sampleDurationSufficient` and `measurementConfidence`. A low-confidence short sample requires teacher review and is not automatic zero.
+
+### Performance değerlendirme sözleşmesi
+
+Performans görevi, yazılı sınav akışından (PDF/OCR/QEP) bağımsız ayrı bir akıştır. `ScoringRecord` ve yazılı sınav puanlama/rapor kayıtları kullanılmaz. Organizasyon (`academicYearId + courseId + gradeLevel + term + assessmentType + sequenceNumber`), sınıf uygulaması ve öğrenci doğrulaması ortak `AssessmentOrganizationService`/`SchoolClassService` üzerinden yapılır.
+
+Görev ve rubrik:
+
+- `create_performance_task`: input `CreatePerformanceTaskInput { projectId, academicYearId, courseId, courseName, gradeLevel, term, sequenceNumber, schoolClassIds, title?, performanceDetails, initialRubric? }`. `initialRubric` sürüm 0 taslak olarak kaydedilir; yoksa boş taslak oluşturulur. Output `AssessmentActivity`. Errors: `ASSESSMENT_ACTIVITY_ALREADY_EXISTS`, `ASSESSMENT_CLASS_NOT_ELIGIBLE`, `ASSESSMENT_CLASS_LEVEL_MISMATCH`, `PROJECT_NOT_FOUND`.
+- `update_performance_task`: input `UpdatePerformanceTaskInput { projectId, activityId, title?, performanceDetails? }`. Yalnız görev bilgilerini günceller; rubrik sürümlerine dokunmaz.
+- `list_performance_tasks`: input `{ projectId, courseId?, term?, schoolClassId? }`. Output `AssessmentActivity[]` (yalnız `performance` türü).
+- `get_performance_task`: input `{ projectId, activityId }`. Output `AssessmentActivity`.
+
+Rubrik sürümleme (K8):
+
+- `publish_performance_rubric`: input `PublishPerformanceRubricInput { projectId, activityId, rubric }`. Doğrulama: 3-6 ölçüt, 3 veya 5 düzey, her ölçüt adı/açıklaması, her düzeyde gözlenebilir tanım, düzey puanları azalan ve benzersiz. Yayın = yeni sürüm (>= 1); onaylı değerlendirmesi olan rubrik kilitlidir (yeni sürüm bile yayınlanamaz). Output yayınlanan `PerformanceRubric`.
+- `get_performance_rubric_history`: input `{ projectId, activityId }`. Output `PerformanceRubric[]` (sürüm 0 dahil tüm sürümler).
+
+Değerlendirme (K3/K9):
+
+- `save_performance_assessment`: input `SavePerformanceAssessmentInput { projectId, activityId, applicationId, studentId, assessmentId?, ratings?, feedback? }`. Kayıt `ClassApplication.performanceAssessments` altında canonical saklanır. Geçici toplam (`provisionalTotal`) yalnız servis tarafından hesaplanır; istemci girdisine güvenilmez. Yayınlanmış rubrik yoksa reddedilir. Onaylanmış kayıt düzenlenemez.
+- `approve_performance_assessment`: input `{ projectId, activityId, applicationId, assessmentId }`. Tüm ölçütler değerlendirilmeden onay reddedilir; onay tarihi ve rubrik sürümü kayda sabitlenir. Onay sonrası düzenleme reddedilir.
+- `set_performance_assessment_status`: input `{ projectId, activityId, applicationId, studentId, assessmentId?, status }`; `status` yalnız `missing` veya `not_performed` olabilir. Bu kayıtlara sıfır puan yazılmaz, toplam hesabına girmez; raporda ayrı gösterilir. Onaylanmış kaydın durumu değiştirilemez.
+- `list_performance_assessments`: input `{ projectId, activityId, applicationId? }`. Output `PerformanceAssessment[]`.
+
+Sonuç raporu (Faz C):
+
+- `get_performance_report`: input `{ projectId, activityId, applicationId }`. Output `PerformanceReportDto`: görev metadata'sı (başlık, ders, sınıf adı, dönem/sıra, tema, beceri alanı, çalışma biçimi, öğretmen kimliği, rubrik adı/sürümü), `criteria`/`levels` (görüntü rubriği = yayınlanmış en yeni sürüm), `maxPoints`, `generatedAt`, `summary` (öğrenci/değerlendirilen/onaylı/eksik/gösterilmedi/değerlendirilmeyen sayaçları) ve `rows`. Her satır öğrencinin kendi sabitlediği rubrik sürümüyle çözülür; `Missing`/`NotPerformed`/değerlendirilmeyen öğrencilerde ölçüt puanları ve toplam `null` kalır — sıfırla karıştırılmaz. Errors: `ASSESSMENT_ACTIVITY_NOT_FOUND`, `ASSESSMENT_CLASS_APPLICATION_NOT_FOUND`, `RUBRIC_MISSING`, `STUDENT_NOT_FOUND`. Job-based: Hayır (salt-okunur).
+
+PDF/Excel çıktıları bu DTO üzerinden `PerformanceResultsView`'da üretilir: PDF için yazdırma görünümü (`window.print()`), Excel için noktalı virgül ayraçlı UTF-8 CSV (BOM ile). AI hiçbir noktada puan üretmez; rapordaki veriler öğretmen kararlarından gelir.
 
 ### Job commands contract
 - `list_jobs`: Inputs `{ projectId: String, projectRootPath: Option<String> }`. Rehydrates persisted jobs and returns list of jobs.

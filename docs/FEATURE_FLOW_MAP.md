@@ -739,3 +739,30 @@ The 11_46 flow currently ends with a verified backup, PASS restore equality and
 PASS real destructive proofs, but `RECOVERED_COPY_NOT_SAFE` because the full
 Cargo/check:all marker is not verified. The source path always ends at
 `DO_NOT_OPEN_FOR_WRITING`.
+
+## Performance değerlendirme akışı (TYMM, Faz B/C)
+
+Görev → Rubrik → Değerlendirme → Onay → Rapor. Performans görevi, yazılı sınav
+akışından (PDF/OCR/QEP) bağımsızdır; mevcut ders/sınıf/öğrenci organizasyonu
+yeniden kullanılır.
+
+### Akış
+1. `/project/:projectId/performance` → `PerformanceOrganizationPage` görev listesi (tür filtresi: performans).
+2. Yeni görev: ders/dönem/sıra/sınıf seçimi + tema, öğrenme çıktıları, beceri alanı, yönerge, bireysel/grup, teslim tarihi, kanıt türleri.
+3. Rubrik taslağı: `RubricTemplateCatalog`’dan salt-okunur TDE 9. sınıf şablonu (Metin Tahlili: okuma/dinleme-izleme; Edebiyat Atölyesi: konuşma/yazma) seçilir → rubrik taslağına (sürüm 0) yüklenir → öğretmen `RubricDraftEditor` ile düzenler. Şablonlar zümre kararını kısıtlamaz.
+4. `create_performance_task` → `initialRubric` sürüm 0 olarak kaydedilir; `publish_performance_rubric` doğrulama (3-6 ölçüt, 3/5 düzey, gözlenebilir tanımlar) sonrası yeni sürüm üretir. Onaylı değerlendirmesi olan rubrik kilitlidir.
+5. `/activities/:id/assessment` → `PerformanceScoringPage`: sınıf uygulaması → öğrenci → ölçüt bazında düzey işaretleme → geçici toplam + eksik ölçüt/öğrenci uyarıları → taslak kaydet → tüm ölçütler tamamlanınca onay. `Missing`/`NotPerformed` sıfırdan ayrı işaretlenir.
+6. `/activities/:id/results` → `PerformanceResultsView`: sınıf düzeyi sonuç tablosu + `get_performance_report` → PDF (yazdırma görünümü, `window.print()`) / Excel (noktalı virgül ayraçlı UTF-8 CSV).
+
+### Kritik invariants
+- `ScoringRecord` ve yazılı sınav puanlama/rapor akışı kullanılmaz/değiştirilmez.
+- `Missing` ≠ `NotPerformed` ≠ sıfır: raporda boş hücre/etiketle ayrı gösterilir; geçici toplama girmez.
+- Yapay zekâ puan vermez; nihai karar öğretmenindir.
+- Rubrik değişikliği eski puanları sessizce yeniden hesaplamaz; her kayıt kendi sabitlediği sürümle çözülür (`get_performance_report` bunu sunucu tarafında yapar).
+- Onay, tüm zorunlu ölçütler değerlendirilmeden verilemez; onay sonrası düzenleme reddedilir.
+
+### Dosyalar
+`PerformanceOrganizationPage.tsx`, `PerformanceScoringPage.tsx`, `performanceOrganizationUi.ts`, `performanceReportUi.ts`, `api/commands.ts`, `api/types.ts`, `performance_commands.rs`, `performance_service.rs`, `domain/performance.rs`, `domain/assessment.rs`, `lib.rs`.
+
+### Hata kodları
+`ASSESSMENT_ACTIVITY_NOT_FOUND`, `ASSESSMENT_CLASS_APPLICATION_NOT_FOUND`, `ASSESSMENT_ACTIVITY_IN_USE`, `ASSESSMENT_INVALID_INPUT`, `RUBRIC_MISSING`, `STUDENT_NOT_FOUND`.

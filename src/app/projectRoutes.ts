@@ -94,7 +94,7 @@ export function getProjectArea(pathname: string): ProjectArea | null {
   if (/^\/project\/[^/]+\/classes(?:\/|$)/.test(pathname)) return 'classes';
   if (/^\/project\/[^/]+\/analysis(?:\/|$)/.test(pathname)) return 'analysis';
   if (/^\/project\/[^/]+\/settings(?:\/|$)/.test(pathname)) return 'settings';
-  if (/^\/project\/[^/]+\/(?:exam|grading|speaking|ocr|students)(?:\/|$)/.test(pathname)) return 'activities';
+  if (/^\/project\/[^/]+\/(?:exam|grading|speaking|performance|ocr|students)(?:\/|$)/.test(pathname)) return 'activities';
   return legacyProjectRouteAreas[pathname] ?? null;
 }
 

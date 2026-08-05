@@ -35,8 +35,11 @@ Konuşma motorunun mevcut runtime aggregate’ı (`SpeakingExam`) yalnız compat
 - `written` → `written`
 - `listening` → `written`
 - `speaking` → `speaking`
+- `performance` → `performance`
 
 Dinleme ayrı görünen tür ve bağımsız sıra alanıdır; yazılı soru/belge workflow altyapısını yeniden kullanır. Dinleme metadata’sı ses belgesi, metin, dinletme sayısı, süre ve yönergeyle sınırlıdır; medya oynatıcı, soru çıkarma ve puanlama bu organizasyon değişikliğinin kapsamında değildir.
+
+Performans görevi (`performance`) de ayrı tür ve bağımsız sıra alanıdır; yazılı sınavın PDF/OCR/QEP akışını kullanmaz. Performans metadata’sı (`PerformanceDetails`) tema, öğrenme çıktıları, beceri alanı, görev yönergesi, bireysel/grup, teslim tarihi, kanıt türleri ve rubrik sürüm geçmişini (`rubricVersions`) taşır. Değerlendirme kayıtları yazılı sınav `ScoringRecord`’undan bağımsız olarak `ClassApplication.performanceAssessments` altında canonical saklanır.
 
 Sıra numarası yıllık toplam değildir. Dönem, tür ve sınıf düzeyi kapsamında ilerler; UI varsayılan yuvaları önerir, üçüncü yazılı gerçek ihtiyaç olduğunda ayrıca kaydedilir.
 
@@ -49,6 +52,15 @@ Activity-level belgeler `commonDocumentIds` altında ortak sınava bağlanır. C
 Eski `SpeakingExam.assignedClassIds`/`classId` alanları deserialize edilebilir ancak yeni production write yolunda yazılmaz. `ProjectStore` açılışında yalnız unambiguous speaking kayıtları uygun `AssessmentActivity` ve `SchoolClass` ile bir defa `ClassApplication`’a dönüştürülür; duplicate application üretilmez. Birden fazla uygun activity, eksik sınıf veya eksik kimlik varsa ilişki unresolved bırakılır ve migration warning üretilir; yanlış activity seçilmez. Migration idempotenttir, atomik JSON yazımı ve timestamp’li backup kullanır.
 
 Bu checkout’ta SQL migration veya veritabanı foreign key’i yoktur. Integrity kuralları `AssessmentOrganizationService`, `SpeakingExamService` ve `ProjectStore` seviyesinde merkezi olarak uygulanır: activity/application tekilliği, workflow uyumu, geçerli sınıf, attempt üyeliği ve attempt içeren uygulamanın silinememesi.
+
+## Performans değerlendirme (TYMM)
+
+Performans görevi, aynı teklik anahtarı ve sınıf uygulaması deseniyle `AssessmentType::Performance` olarak organize edilir; kendi sıra alanında ilerler. `AssessmentActivity.performance_details` görev metadata’sını ve rubrik sürüm geçmişini taşır. `PerformanceService` rubrik sürümleme, değerlendirme kaydı ve onay kurallarının tek sahibidir; kayıtlar yazılı sınav `ScoringRecord`’undan bağımsızdır.
+
+- **Rubrik:** 3-6 ölçüt, 3 veya 5 düzey, her düzeyde gözlenebilir tanım. Yayın = yeni sürüm; onaylı değerlendirmesi olan rubrik kilitlidir. Yerleşik TDE 9. sınıf şablonları (`PERFORMANCE_TEMPLATES`) salt-okunur katalogdur; seçilince taslağa (sürüm 0) yüklenir ve zümre düzenleyebilir.
+- **Değerlendirme:** ölçüt bazında düzey seçimi; geçici toplamı servis hesaplar. Onay yalnız tüm ölçütler değerlendirildiğinde verilir; onay sonrası düzenleme reddedilir.
+- **Eksik durumlar:** `Missing` (teslim edilmedi) ve `NotPerformed` (gösterilmedi) sıfır puanla karıştırılmaz; toplam hesaplarına girmez ve raporda boş hücre/etiketle ayrı gösterilir.
+- **Rapor:** `get_performance_report` sınıf düzeyi sonuç DTO’sunu üretir; PDF (yazdırma görünümü) ve Excel (CSV) çıktıları `PerformanceResultsView`’dan üretilir.
 
 ## RubrikaV3 sınırı
 

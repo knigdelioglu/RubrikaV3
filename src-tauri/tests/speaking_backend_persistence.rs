@@ -83,6 +83,7 @@ fn speaking_start_is_backend_persisted_and_duplicate_safe() {
             frozen_model_file_hash: None,
             rubric_snapshot: serde_json::json!({}),
         }),
+        performance_details: None,
         class_applications: vec![AssessmentClassApplication {
             id: "app-1".to_string(),
             activity_id: "activity-1".to_string(),
@@ -94,6 +95,7 @@ fn speaking_start_is_backend_persisted_and_duplicate_safe() {
             document_ids: vec![],
             student_scope_ids: vec![],
             speaking_attempts: vec![],
+            performance_assessments: vec![],
             created_at: String::new(),
             updated_at: String::new(),
         }],

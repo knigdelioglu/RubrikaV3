@@ -21,6 +21,7 @@ use services::model_runtime_service::ModelRuntimeService;
 use services::ocr_image_preprocess_service::OcrImagePreprocessService;
 use services::pdf_preview_service::PdfPreviewService;
 use services::pdf_service::{PdfService, SystemPdfService};
+use services::performance_service::PerformanceService;
 use services::project_store::ProjectStore;
 use services::question_text_service::QuestionTextService;
 use services::rubric_extraction_service::RubricExtractionService;
@@ -61,6 +62,7 @@ pub struct AppState {
     pub scoring_anchor_service: Arc<ScoringAnchorService>,
     pub school_class_service: Arc<SchoolClassService>,
     pub assessment_organization_service: Arc<AssessmentOrganizationService>,
+    pub performance_service: Arc<PerformanceService>,
     pub student_answer_crop_service: Arc<StudentAnswerCropService>,
     pub student_answer_ocr_service: Arc<StudentAnswerOcrService>,
     pub speaking_exam_service: SpeakingExamService,
@@ -169,6 +171,10 @@ pub fn run() {
                 project_store.clone(),
                 school_class_service.clone(),
             ));
+            let performance_service = Arc::new(PerformanceService::new(
+                project_store.clone(),
+                assessment_organization_service.clone(),
+            ));
             let rubric_service = Arc::new(RubricService::new(project_store.clone()));
             let scoring_service = Arc::new(
                 ScoringService::new(
@@ -224,6 +230,7 @@ pub fn run() {
                 scoring_anchor_service,
                 school_class_service,
                 assessment_organization_service,
+                performance_service,
                 student_answer_crop_service,
                 student_answer_ocr_service,
                 speaking_exam_service: SpeakingExamService::new(
@@ -380,6 +387,17 @@ pub fn run() {
             commands::assessment_organization_commands::get_class_application_students,
             commands::assessment_organization_commands::update_assessment_activity,
             commands::assessment_organization_commands::remove_assessment_class_application,
+            commands::performance_commands::create_performance_task,
+            commands::performance_commands::update_performance_task,
+            commands::performance_commands::list_performance_tasks,
+            commands::performance_commands::get_performance_task,
+            commands::performance_commands::publish_performance_rubric,
+            commands::performance_commands::get_performance_rubric_history,
+            commands::performance_commands::save_performance_assessment,
+            commands::performance_commands::approve_performance_assessment,
+            commands::performance_commands::set_performance_assessment_status,
+            commands::performance_commands::list_performance_assessments,
+            commands::performance_commands::get_performance_report,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error while building tauri application: {error}"))

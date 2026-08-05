@@ -50,6 +50,12 @@ export const SPEAKING_EXAM_STEPS: ExamStepDefinition[] = [
   { id: 'results', index: 5, label: 'Sonuçlar', description: 'Konuşma performansı analizleri ve raporları' },
 ];
 
+export const PERFORMANCE_EXAM_STEPS: ExamStepDefinition[] = [
+  { id: 'task', index: 1, label: 'Görev ve Rubrik', description: 'Görev bilgileri, öğrenme çıktıları ve rubrik düzenleyici' },
+  { id: 'assessment', index: 2, label: 'Değerlendirme', description: 'Öğrenci başına ölçüt düzeyi seçimi, geçici toplam ve onay' },
+  { id: 'results', index: 3, label: 'Sonuçlar', description: 'Performans değerlendirme sonuçları ve durum özeti' },
+];
+
 export const EXAM_STEP_STATUS_LABELS: Record<ExamStepStatus, string> = {
   not_started: 'Başlamadı',
   ready: 'Hazır',
@@ -65,6 +71,8 @@ export function getExamStepDefinitions(type: AssessmentType): ExamStepDefinition
       return LISTENING_EXAM_STEPS;
     case 'speaking':
       return SPEAKING_EXAM_STEPS;
+    case 'performance':
+      return PERFORMANCE_EXAM_STEPS;
     case 'written':
     default:
       return WRITTEN_EXAM_STEPS;
@@ -78,6 +86,10 @@ export function deriveExamStepStatuses(
 ): ExamStepState[] {
   const type = activity.assessmentType;
   const definitions = getExamStepDefinitions(type);
+
+  if (type === 'performance') {
+    return derivePerformanceStepStatuses(activity, definitions);
+  }
 
   if (type === 'speaking') {
     return deriveSpeakingStepStatuses(activity, definitions, classApplicationId);
@@ -372,6 +384,82 @@ function deriveSpeakingStepStatuses(
           status: 'blocked',
           statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
           blockerMessage: 'Konuşma sınavı sonuçları değerlendirme tamamlandıktan sonra izlenebilir.',
+        };
+      }
+
+      default:
+        return { definition: def, status: 'not_started', statusLabel: EXAM_STEP_STATUS_LABELS.not_started };
+    }
+  });
+}
+
+function derivePerformanceStepStatuses(
+  activity: AssessmentActivity,
+  definitions: ExamStepDefinition[],
+): ExamStepState[] {
+  const details = activity.performanceDetails;
+  const hasTaskDetails = Boolean(
+    details && (details.theme.trim() !== '' || details.taskInstruction.trim() !== ''),
+  );
+  const versions = details?.rubricVersions ?? [];
+  const hasPublishedRubric = versions.some((rubric) => rubric.version >= 1);
+  const hasDraftRubric = versions.some((rubric) => rubric.version === 0);
+  const applications = activity.classApplications.filter(
+    (application) => application.status !== 'archived',
+  );
+  const assessments = applications.flatMap(
+    (application) => application.performanceAssessments ?? [],
+  );
+  const approvedCount = assessments.filter(
+    (assessment) => assessment.status === 'approved',
+  ).length;
+  const startedCount = assessments.filter(
+    (assessment) => assessment.status !== 'approved',
+  ).length;
+  const totalStudents = applications.reduce(
+    (sum, application) => sum + application.studentScopeIds.length,
+    0,
+  );
+
+  return definitions.map((def) => {
+    switch (def.id) {
+      case 'task': {
+        if (hasPublishedRubric) {
+          return { definition: def, status: 'completed', statusLabel: EXAM_STEP_STATUS_LABELS.completed };
+        }
+        if (hasTaskDetails || hasDraftRubric) {
+          return { definition: def, status: 'in_progress', statusLabel: EXAM_STEP_STATUS_LABELS.in_progress };
+        }
+        return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
+      }
+
+      case 'assessment': {
+        if (!hasPublishedRubric) {
+          return {
+            definition: def,
+            status: 'blocked',
+            statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
+            blockerMessage: 'Rubrik yayınlanmadan değerlendirme yapılamaz.',
+          };
+        }
+        if (totalStudents > 0 && approvedCount >= totalStudents) {
+          return { definition: def, status: 'completed', statusLabel: EXAM_STEP_STATUS_LABELS.completed };
+        }
+        if (startedCount > 0) {
+          return { definition: def, status: 'in_progress', statusLabel: EXAM_STEP_STATUS_LABELS.in_progress };
+        }
+        return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
+      }
+
+      case 'results': {
+        if (approvedCount > 0) {
+          return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
+        }
+        return {
+          definition: def,
+          status: 'blocked',
+          statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
+          blockerMessage: 'Sonuçlar en az bir değerlendirme onaylandıktan sonra gösterilir.',
         };
       }
 

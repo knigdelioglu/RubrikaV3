@@ -1749,11 +1749,12 @@ fn normalize_assessment_organization(
             let assessment_type = activity
                 .get("assessmentType")
                 .and_then(Value::as_str)
-                .unwrap_or("written");
-            let workflow_family = if assessment_type == "speaking" {
-                "speaking"
-            } else {
-                "written"
+                .unwrap_or("written")
+                .to_string();
+            let workflow_family = match assessment_type.as_str() {
+                "speaking" => "speaking",
+                "performance" => "performance",
+                _ => "written",
             };
             if activity.get("workflowFamily").and_then(Value::as_str) != Some(workflow_family) {
                 activity.insert(
@@ -1764,6 +1765,10 @@ fn normalize_assessment_organization(
             }
             if activity.get("title").is_none() {
                 activity.insert("title".to_string(), Value::String(String::new()));
+                changed = true;
+            }
+            if assessment_type == "performance" && activity.get("performanceDetails").is_none() {
+                activity.insert("performanceDetails".to_string(), Value::Object(Map::new()));
                 changed = true;
             }
             if let Some(applications) = activity
@@ -1786,6 +1791,13 @@ fn normalize_assessment_organization(
                     }
                     if application.get("speakingAttempts").is_none() {
                         application.insert("speakingAttempts".to_string(), Value::Array(vec![]));
+                        changed = true;
+                    }
+                    if assessment_type == "performance"
+                        && application.get("performanceAssessments").is_none()
+                    {
+                        application
+                            .insert("performanceAssessments".to_string(), Value::Array(vec![]));
                         changed = true;
                     }
                 }
@@ -3159,6 +3171,7 @@ mod tests {
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: Some(speaking_configuration(task_text)),
+            performance_details: None,
             class_applications,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -3181,6 +3194,7 @@ mod tests {
             document_ids: vec![],
             student_scope_ids: vec![],
             speaking_attempts: vec![],
+            performance_assessments: vec![],
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -4289,6 +4303,7 @@ mod tests {
                             common_document_ids: vec![],
                             listening_details: None,
                             speaking_configuration: None,
+                            performance_details: None,
                             class_applications: vec![],
                             created_at: "now".to_string(),
                             updated_at: "now".to_string(),
@@ -4361,6 +4376,7 @@ mod tests {
                 common_document_ids: vec![],
                 listening_details: None,
                 speaking_configuration: None,
+                performance_details: None,
                 class_applications: vec![],
                 created_at: "now".to_string(),
                 updated_at: "now".to_string(),
@@ -4708,6 +4724,7 @@ mod tests {
                                     common_document_ids: vec![],
                                     listening_details: None,
                                     speaking_configuration: None,
+                                    performance_details: None,
                                     class_applications: vec![],
                                     created_at: "now".to_string(),
                                     updated_at: "now".to_string(),
@@ -5022,5 +5039,102 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("review-only salvage")));
+    }
+
+    #[test]
+    fn performance_activity_legacy_json_opens_with_defaults_idempotently() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "Performance legacy", "2026-01-01T00:00:00Z");
+        project.school_classes.push(SchoolClass {
+            id: "class-9-a".to_string(),
+            name: "9-A".to_string(),
+            display_name: "9-A".to_string(),
+            normalized_name: "9-A".to_string(),
+            academic_year: Some("2026-2027".to_string()),
+            academic_year_id: Some("2026-2027".to_string()),
+            grade_level: Some(9),
+            section: Some("A".to_string()),
+            display_order: 0,
+            status: SchoolClassStatus::Active,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        project.assessment_activities.push(AssessmentActivity {
+            id: "perf-1".to_string(),
+            academic_year_id: "2026-2027".to_string(),
+            course_id: "tde".to_string(),
+            course_name: "Türk Dili ve Edebiyatı".to_string(),
+            title: "1. Performans".to_string(),
+            grade_level: 9,
+            term: 1,
+            assessment_type: AssessmentType::Performance,
+            workflow_family: WorkflowFamily::Performance,
+            sequence_number: 1,
+            status: AssessmentStatus::Draft,
+            common_document_ids: vec![],
+            listening_details: None,
+            speaking_configuration: None,
+            performance_details: Some(crate::domain::performance::PerformanceDetails::default()),
+            class_applications: vec![class_application("perf-1", "app-perf", "class-9-a")],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        });
+        let mut value = serde_json::to_value(&project).unwrap();
+        let activity = value["assessmentActivities"][0].as_object_mut().unwrap();
+        activity.remove("performanceDetails");
+        activity.insert(
+            "workflowFamily".to_string(),
+            Value::String("written".to_string()),
+        );
+        activity["classApplications"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("performanceAssessments");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let (first, warnings) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("legacy performance project must remain loadable");
+        assert_eq!(
+            first.assessment_activities[0].assessment_type,
+            AssessmentType::Performance
+        );
+        assert_eq!(
+            first.assessment_activities[0].workflow_family,
+            WorkflowFamily::Performance
+        );
+        assert!(first.assessment_activities[0].performance_details.is_some());
+        assert!(first.assessment_activities[0].class_applications[0]
+            .performance_assessments
+            .is_empty());
+        assert!(warnings.iter().any(|warning| warning.contains("backup")));
+
+        let (second, _) = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect("migrated project should reload idempotently");
+        assert_eq!(second.assessment_activities.len(), 1);
+        assert_eq!(
+            second.assessment_activities[0].workflow_family,
+            WorkflowFamily::Performance
+        );
+        assert!(second.assessment_activities[0]
+            .performance_details
+            .is_some());
+
+        let reopened = ProjectStore::open_project_at_path(&root).unwrap();
+        assert!(reopened.assessment_activities[0]
+            .performance_details
+            .is_some());
+        assert_eq!(
+            reopened.assessment_activities[0].class_applications[0]
+                .performance_assessments
+                .len(),
+            0
+        );
     }
 }
