@@ -49,3 +49,56 @@ Doğrulama sonucu ve gerçek UI smoke sonucu teslim raporunda güncellenecektir.
   lib 362 PASS / 6 environment-blocked (loopback TCP, sandbox);
   integration proof'ları PASS; `.app` üretildi; DMG hdiutil sandbox'ta
   engellendi (environment-blocked).
+
+## TYMM Performans Değerlendirme — Faz A (Rust backend)
+
+- `AssessmentType::Performance` / `WorkflowFamily::Performance` eklendi;
+  `AssessmentActivity.performanceDetails` ve
+  `ClassApplication.performanceAssessments` serde default ile açıldı.
+- `domain/performance.rs`: `PerformanceDetails` (rubrik sürüm geçmişi dahil),
+  `PerformanceRubric`, `PerformanceCriterion`, `PerformanceLevel`,
+  `CriterionRating`, `PerformanceAssessment`, `PerformanceAssessmentStatus`.
+- `PerformanceService`: görev CRUD (teklik anahtarı korunur), rubrik
+  doğrulama (3-6 ölçüt, 3/5 düzey, gözlenebilir tanım, azalan/benzersiz
+  puan), yayın = yeni sürüm, onaylı rubrik kilidi, geçici toplam hesabı
+  (servis), onay kuralları, `Missing`/`NotPerformed` (sıfır puan yazılmaz).
+- ProjectStore migration: `performance` workflow family türetimi +
+  `performanceDetails`/`performanceAssessments` idempotent default backfill.
+- 10 Tauri komutu `performance_commands.rs` + `AppState.performance_service`.
+- Frontend: `performance` türüne tip uyumu + Performance DTO'ları + client
+  invoke sarmalayıcıları; UI sayfaları Faz B kapsamında yazılmadı.
+
+Doğrulama: fmt/clippy PASS; cargo test 494 lib + integration PASS;
+`npm run build` + `npm run typecheck` PASS. UI smoke Faz B sonunda.
+
+## TYMM Performans Değerlendirme — Faz B (frontend iş akışı)
+
+- Tür yönlendirmesi: `examWorkspace.ts`'e `PERFORMANCE_EXAM_STEPS`
+  (task / assessment / results) + `derivePerformanceStepStatuses`; `assessmentMode.ts`
+  ve `AssessmentModeSelector`'a `performance` modu.
+- `PerformanceOrganizationPage.tsx` (yeni): görev listesi (ders/dönem/sınıf
+  filtresi), `/performance/new` oluşturma akışı (ders/sınıf/sıra + PerformanceDetails
+  formu + rubrik taslağı), `/performance/:id` düzenleme akışı (görev bilgileri
+  kaydı + rubrik düzenleyici + yayın akışı + sürüm geçmişi + onaylı rubrik kilidi).
+- `PerformanceScoringPage.tsx` (yeni): sınıf öğrenci listesi + durum rozetleri,
+  ölçüt bazında düzey seçimi, geçici toplam (yalnız seçili düzeyler), eksik ölçüt /
+  eksik öğrenci uyarıları, `Missing`/`NotPerformed` işaretleme (sıfırdan ayrı
+  görsel, puan kolonu boş), onay akışı (eksik ölçütte kapalı, onay sonrası kilit).
+  `PerformanceResultsView` sonuç özeti (PDF/Excel Faz C).
+- `performanceOrganizationUi.ts` (yeni): beceri alanı / çalışma biçimi / durum
+  etiketleri, rubrik doğrulama (3-6 ölçüt, 3/5 düzey, gözlenebilir tanım), geçici
+  toplam ve eksik ölçüt yardımcıları.
+- Entegrasyon: `CanonicalExamWorkspacePage` performans adımlarını yönlendiriyor;
+  `AssessmentOrganizationPage` tür filtresine `performance`, header'a giriş
+  butonu ve performans kartı meta satırı eklendi; `App.tsx`'te
+  `/performance`, `/performance/new`, `/performance/:id` rotaları; `projectRoutes`
+  performans alanı eşlemesi; `index.css` performans stilleri.
+
+Kullanılan komutlar: `create_performance_task`, `update_performance_task`,
+`list_performance_tasks`, `get_performance_task`, `publish_performance_rubric`,
+`get_performance_rubric_history`, `save_performance_assessment`,
+`approve_performance_assessment`, `set_performance_assessment_status`,
+`list_performance_assessments`.
+
+Doğrulama: `npm run typecheck` PASS (~7.0s); `npm run build` PASS (~7.1s).
+Kural gereği test/lint tam suite koşulmadı; UI smoke kullanıcı tarafından yapılacak.

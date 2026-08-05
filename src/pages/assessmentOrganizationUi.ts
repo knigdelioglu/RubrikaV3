@@ -4,6 +4,7 @@ export const assessmentTypeLabels: Record<AssessmentType, string> = {
   written: 'Yazılı Sınav',
   listening: 'Dinleme Sınavı',
   speaking: 'Konuşma Sınavı',
+  performance: 'Performans Görevi',
 };
 
 export function recommendedAssessmentSlots(type: AssessmentType): number[] {
@@ -35,7 +36,14 @@ export function formatDurationRange(minSeconds: number, maxSeconds: number): str
 }
 
 export function workflowFamilyLabel(type: AssessmentType): string {
-  return type === 'speaking' ? 'konuşma' : 'yazılı';
+  switch (type) {
+    case 'speaking':
+      return 'konuşma';
+    case 'performance':
+      return 'performans';
+    default:
+      return 'yazılı';
+  }
 }
 
 export function canonicalClassApplicationIds(activity: AssessmentActivity): string[] {

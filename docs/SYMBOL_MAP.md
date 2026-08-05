@@ -17,6 +17,11 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | `getAssessmentSequenceOptions` | `src/api/commands.ts` | Func | Eğitim yılı, ders, dönem ve tür için backend’in hesapladığı kullanılabilir sınav sıralarını döndürür. | `AssessmentOrganizationPage` |
 | `startSpeakingExamAttempt` | `src/api/commands.ts` | Func | Activity + class application + student referanslarıyla attempt başlatır. | `SpeechExamPage` |
 | `ClassesPage` | `src/pages/ClassesPage.tsx` | Page | Canonical proje kurulumu; sınıfları ve ders–sınıf görevlendirmelerini yönetir, sınav organizasyonuna geçiş sunar. | Router |
+| `PerformanceOrganizationPage` | `src/pages/PerformanceOrganizationPage.tsx` | Page | Performans görevi listesi/oluşturma/düzenleme; `RubricTemplateCatalog` ile TDE şablonlarını rubrik taslağına (sürüm 0) yükler, `RubricDraftEditor` ile 3-6 ölçüt / 3-5 düzey rubrik düzenler ve yayınlar. | Router |
+| `RubricTemplateCatalog` | `src/pages/PerformanceOrganizationPage.tsx` | Component | Salt-okunur TDE 9. sınıf pilot şablon kataloğunu (Metin Tahlili: okuma/dinleme-izleme, Edebiyat Atölyesi: konuşma/yazma) seçerek rubrik taslağına yükler. | `PerformanceOrganizationPage` |
+| `PerformanceScoringPage` | `src/pages/PerformanceScoringPage.tsx` | Page | Sınıf uygulaması seçimi → öğrenci listesi → ölçüt bazında düzey işaretleme, geçici toplam + eksik uyarıları, onay ve Missing/NotPerformed işaretleme. | Router |
+| `PerformanceResultsView` | `src/pages/PerformanceScoringPage.tsx` | Component | Sınıf düzeyi sonuç tablosu ve `get_performance_report` üzerinden PDF (yazdırma) / Excel (CSV) rapor çıktıları. | Router (results adımı) |
+| `performanceReportUi.ts` | `src/pages/performanceReportUi.ts` | Module | `buildPerformanceCsv` (noktalı virgül ayraçlı, UTF-8 BOM), `downloadTextFile`, `performanceReportStatusLabel` — rapor hücrelerinde Missing/NotPerformed boş bırakılır, sıfırla karışmaz. | `PerformanceResultsView` |
 | Sembol | Dosya | Tür | Ne yapar? | Öğrenilecek Konu |
 |---|---|---|---|---|
 | `openProject` | `src/api/commands.ts` | Func | Projeyi açmak için Tauri komutunu çağırır. | Tauri invoke sarmalayıcı (Wrapper) |
@@ -42,6 +47,10 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | `get_assessment_activity` / `get_assessment_class_applications` / `get_class_application_students` | `assessment_organization_commands.rs` | Commands | Activity’ye bağlı canonical class application ve merkezi roster read modelini döndürür. | `SpeechExamPage` |
 | `add_assessment_class_application` / `remove_assessment_class_application` | `assessment_organization_commands.rs` | Commands | Sınıf uygulaması ekler veya attempt varsa servis blocker’ı döndürür. | Organization UI |
 | `start_speaking_exam_attempt` | `speaking_exam_commands.rs` | Command | Activity/application ownership ve student/class membership doğrulamasıyla capture başlatır. | `SpeechExamPage` |
+| `create_performance_task` / `update_performance_task` / `list_performance_tasks` / `get_performance_task` | `performance_commands.rs` | Commands | Performans görevi CRUD; `initialRubric` sürüm 0 taslak olarak kaydedilir. | `PerformanceOrganizationPage` |
+| `publish_performance_rubric` / `get_performance_rubric_history` | `performance_commands.rs` | Commands | Rubrik doğrulama + yeni sürüm yayınlama (onaylıysa kilit) ve sürüm geçmişi. | `PerformanceOrganizationPage` |
+| `save_performance_assessment` / `approve_performance_assessment` / `set_performance_assessment_status` / `list_performance_assessments` | `performance_commands.rs` | Commands | Ölçüt düzeyi kaydı (geçici toplam servis tarafı), onay, Missing/NotPerformed işaretleme, sınıf bazlı listeleme. | `PerformanceScoringPage` |
+| `get_performance_report` | `performance_commands.rs` | Command | Salt-okunur sınıf düzeyi sonuç raporu DTO’sunu üretir; öğrenci puanlarını kendi sabitlediği rubrik sürümüyle çözer, Missing/NotPerformed null puanla ayrılır. | `PerformanceResultsView` |
 | Sembol | Dosya | Tür | Ne yapar? | Kim çağırır? | Neyi çağırır? |
 |---|---|---|---|---|---|
 | `start_student_answer_ocr` | `student_answer_ocr_commands.rs` | Command | Frontend'in OCR başlatma isteğini karşılar. | UI (`commands.ts`) | `StudentAnswerOcrService::start` |
@@ -56,6 +65,8 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | Sembol | Dosya | Tür | Ne yapar? | Kim çağırır? | Neyi çağırır? |
 |---|---|---|---|---|---|
 | `ProjectStore` | `project_store.rs` | Struct | JSON projesini okur ve diske yazar; legacy schema uyumluluğu için normalize+deserialize yapar ve serde path diagnostics üretir. | Tüm komutlar | OS (File System), `workflow_engine` |
+| `PerformanceService` | `performance_service.rs` | Struct | Performans görevi CRUD, rubrik sürümleme, değerlendirme kaydı (tek sahip), onay kuralları, Missing/NotPerformed yönetimi ve `get_performance_report`. | Komutlar | `ProjectStore`, `AssessmentOrganizationService`, `SchoolClassService` |
+| `get_performance_report` | `performance_service.rs` | Func | Yayınlanmış en yeni rubriği görüntü rubriği yapar; her öğrencinin ölçüt puanlarını sabitlediği sürümle çözer; eksik/gösterilmedi/değerlendirilmeyen öğrencilerde puan null kalır. | `get_performance_report` komutu | `students_for_class`, `Project` |
 | `WorkflowEngine` | `workflow_engine.rs` | Module/Func | Projenin hangi aşamada olduğunu hesaplar (Deterministic). | `ProjectStore` | - |
 | `StudentAnswerCropService` | `student_answer_crop_service.rs` | Struct | Öğrenci cevap crop artifact'larını üretir, crop bbox ve render diagnostics döndürür. | `StudentAnswerOcrService` | `PdfPreviewService`, `ProjectStore` |
 | `OcrImagePreprocessService` | `ocr_image_preprocess_service.rs` | Struct | OCR/crop image'larını `original`, `clean_grayscale`, `handwriting_enhanced`, `high_contrast`, `high_contrast_bw` profilleriyle preprocess eder; ayrı cache ve versioned output üretir. | `StudentAnswerOcrService`, `preprocess_ocr_image` | `image`, project cache |
@@ -79,6 +90,8 @@ Bu doküman, projede önemli işlevleri yerine getiren Rust ve TypeScript sembol
 | Sembol | Dosya | Tür | Ne yapar? | Öğrenilecek Konu |
 |---|---|---|---|---|
 | `Project` | `project.rs` | Struct | Merkezi proje (Aggregrate root) verisi. Her şey buna bağlıdır. | Serde Serialize/Deserialize, `mut` (mutable) referanslar |
+| `PerformanceDetails` / `PerformanceRubric` / `PerformanceCriterion` / `PerformanceLevel` / `LevelDescription` | `performance.rs` | Structs | Performans görevi metadata’sı ve rubrik sürüm geçmişi (sürüm 0 taslak, >= 1 yayın). | Serde camelCase |
+| `PerformanceAssessment` / `CriterionRating` / `PerformanceAssessmentStatus` | `performance.rs` | Struct/Enum | `ClassApplication.performanceAssessments` altında canonical değerlendirme kaydı; durum `in_progress | approved | not_performed | missing`. | `ScoringRecord` ile karıştırılmaz |
 | `WorkflowSnapshot` | `workflow.rs` | Struct | Frontend'e giden iş akışı DTO'su (Durum, engeller, butonlar). | - |
 | `WorkflowStage` | `workflow.rs` | Enum | Olası tüm proje aşamaları (Örn: `ScoringDone`). | Enum Pattern Matching |
 | `BlockingReason` | `workflow.rs` | Enum | Geçişi engelleyen nedenler (Örn: `QuestionTextMissing`). | - |

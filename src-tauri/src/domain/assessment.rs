@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use super::performance::{PerformanceAssessment, PerformanceDetails};
 use super::speaking::SpeakingAttempt;
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -8,12 +9,14 @@ pub enum AssessmentType {
     Written,
     Listening,
     Speaking,
+    Performance,
 }
 
 impl AssessmentType {
     pub fn workflow_family(self) -> WorkflowFamily {
         match self {
             Self::Speaking => WorkflowFamily::Speaking,
+            Self::Performance => WorkflowFamily::Performance,
             Self::Written | Self::Listening => WorkflowFamily::Written,
         }
     }
@@ -25,6 +28,7 @@ pub enum WorkflowFamily {
     #[default]
     Written,
     Speaking,
+    Performance,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
@@ -114,6 +118,9 @@ pub struct ClassApplication {
     /// Canonical speaking attempt storage for newly created attempts.
     #[serde(default)]
     pub speaking_attempts: Vec<SpeakingAttempt>,
+    /// Canonical performance assessment storage (K3).
+    #[serde(default)]
+    pub performance_assessments: Vec<PerformanceAssessment>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -145,6 +152,8 @@ pub struct AssessmentActivity {
     pub listening_details: Option<ListeningDetails>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaking_configuration: Option<SpeakingConfigurationSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performance_details: Option<PerformanceDetails>,
     #[serde(default)]
     pub class_applications: Vec<AssessmentClassApplication>,
     pub created_at: String,
@@ -157,6 +166,7 @@ impl AssessmentActivity {
             AssessmentType::Written => "Yazılı Sınav",
             AssessmentType::Listening => "Dinleme Sınavı",
             AssessmentType::Speaking => "Konuşma Sınavı",
+            AssessmentType::Performance => "Performans Görevi",
         };
         format!(
             "{}. Sınıf · {}. Dönem · {}",
@@ -212,6 +222,10 @@ mod tests {
             AssessmentType::Speaking.workflow_family(),
             WorkflowFamily::Speaking
         );
+        assert_eq!(
+            AssessmentType::Performance.workflow_family(),
+            WorkflowFamily::Performance
+        );
     }
 
     #[test]
@@ -231,6 +245,7 @@ mod tests {
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: None,
+            performance_details: None,
             class_applications: vec![],
             created_at: String::new(),
             updated_at: String::new(),
