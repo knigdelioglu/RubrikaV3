@@ -243,6 +243,9 @@ mod tests {
     use crate::domain::scoring::{ScoringFingerprintComponents, ScoringReviewStatus};
 
     fn fingerprint(seed: &str) -> ScoringFingerprint {
+        use crate::services::prompt_contract::{
+            SCORING_ANCHOR_SET_VERSION, SCORING_CALIBRATION_VERSION,
+        };
         ScoringFingerprint::from_components(ScoringFingerprintComponents {
             qep_fingerprint: format!("qep-{seed}"),
             question_id: "q1".to_string(),
@@ -261,8 +264,8 @@ mod tests {
                 seed: Some(1),
                 max_tokens: 128,
             },
-            calibration_version: "none".to_string(),
-            anchor_version: "none".to_string(),
+            calibration_version: SCORING_CALIBRATION_VERSION.to_string(),
+            anchor_version: SCORING_ANCHOR_SET_VERSION.to_string(),
         })
     }
 
@@ -313,6 +316,70 @@ mod tests {
     }
 
     #[test]
+    fn calibration_and_anchor_versions_participate_in_the_cache_key_and_invalidate_old_caches() {
+        use crate::services::prompt_contract::{
+            SCORING_ANCHOR_SET_VERSION, SCORING_CALIBRATION_VERSION,
+        };
+
+        // The real fingerprint carries the calibration/anchor policy values,
+        // never a "none" placeholder.
+        let real = fingerprint("policy");
+        assert_eq!(
+            real.components.calibration_version,
+            SCORING_CALIBRATION_VERSION
+        );
+        assert_eq!(real.components.anchor_version, SCORING_ANCHOR_SET_VERSION);
+
+        let root =
+            std::env::temp_dir().join(format!("rubrika-score-cache-{}", uuid::Uuid::new_v4()));
+        let service = ScoringCacheService::new();
+        let proposal = ScoringCandidateProposal {
+            awarded_score: Some(3.0),
+            criterion_scores: vec![],
+            semantic_decisions: vec![],
+            rationale: "aday".to_string(),
+            confidence: 0.8,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            raw_model_output: "{}".to_string(),
+        };
+
+        // Write under the current calibration policy, then prove that bumping
+        // either the calibration or the anchor version changes the fingerprint
+        // value and makes the previously cached candidate a miss. Because the
+        // artifact is keyed by the fingerprint value (a hash over the
+        // components), bumping the version constant alone invalidates all old
+        // caches without any migration.
+        service
+            .write_candidate(&root, &real, proposal.clone())
+            .unwrap();
+        assert!(service.lookup_candidate(&root, &real).unwrap().is_some());
+
+        let mut bumped_calibration = real.clone();
+        bumped_calibration.components.calibration_version = "scoring_calibration_v2".to_string();
+        bumped_calibration.value =
+            ScoringFingerprint::from_components(bumped_calibration.components.clone()).value;
+        assert_ne!(bumped_calibration.value, real.value);
+        assert!(service
+            .lookup_candidate(&root, &bumped_calibration)
+            .unwrap()
+            .is_none());
+
+        let mut bumped_anchor = real.clone();
+        bumped_anchor.components.anchor_version = "scoring_anchor_set_v2".to_string();
+        bumped_anchor.value =
+            ScoringFingerprint::from_components(bumped_anchor.components.clone()).value;
+        assert_ne!(bumped_anchor.value, real.value);
+        assert!(service
+            .lookup_candidate(&root, &bumped_anchor)
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn turkish_whitespace_matches_but_numeric_unit_and_negation_remain_in_key() {
         let service = ScoringCacheService::new();
         let first = service.answer_hashes(&AnswerType::GeneralText, " İyi   cevap ");
@@ -332,6 +399,7 @@ mod tests {
         let hashes = service.answer_hashes(&AnswerType::GeneralText, "İyi cevap");
         let now = chrono::Utc::now();
         let record = ScoringRecord {
+            assessment_activity_id: None,
             id: "source".to_string(),
             run_id: "run".to_string(),
             submission_id: "submission".to_string(),

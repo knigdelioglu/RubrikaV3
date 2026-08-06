@@ -322,6 +322,7 @@ mod tests {
     fn record(id: &str, score: f32, state: ScoringDecisionState) -> ScoringRecord {
         let now = chrono::Utc::now();
         ScoringRecord {
+            assessment_activity_id: None,
             id: id.to_string(),
             run_id: "run".to_string(),
             submission_id: id.to_string(),

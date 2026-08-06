@@ -41,6 +41,155 @@ pub struct OcrImagePreprocessResult {
     pub diagnostics: OcrImagePreprocessDiagnostics,
 }
 
+/// Simple image statistics used by the deterministic preprocess-variant
+/// selection rule (TD-22). All values are computed without any model call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImageStatistics {
+    /// Mean luminance in [0, 255].
+    pub mean: f32,
+    /// Population standard deviation of luminance in [0, 255].
+    pub std_dev: f32,
+    /// Fraction of pixels sitting on a strong local gradient (0..1).
+    pub edge_density: f32,
+}
+
+/// Result of the deterministic preprocess-variant selection rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreprocessVariantSelection {
+    pub selected: OcrImagePreprocessMode,
+    pub score: f32,
+    pub below_threshold: bool,
+    pub reason: String,
+}
+
+/// The variant used when no candidate reaches the minimum selection score.
+pub const DEFAULT_PREPROCESS_MODE: OcrImagePreprocessMode = OcrImagePreprocessMode::Original;
+/// "Ideal" contrast a good OCR crop should already have (std in [0,255]).
+pub const IDEAL_CONTRAST: f32 = 90.0;
+/// Edge density expected for a crop with real content (handwriting/print).
+pub const EDGE_TARGET: f32 = 0.12;
+/// Below this edge density a crop has no measurable content (blank/gray).
+pub const MIN_CONTENT_EDGE_DENSITY: f32 = 0.004;
+/// Minimum candidate score before an enhancement variant is chosen.
+pub const MIN_SELECTION_SCORE: f32 = 0.25;
+/// Local-gradient magnitude considered an "edge" for edge-density counting.
+const EDGE_GRADIENT_THRESHOLD: i32 = 60;
+
+/// Computes mean/std/edge-density of an image. Pure; no I/O, no model call.
+pub fn compute_image_statistics(image: &DynamicImage) -> ImageStatistics {
+    let gray = image.grayscale().to_luma8();
+    let (width, height) = gray.dimensions();
+    let count = (width as u64 * height as u64).max(1);
+    let mut sum: u64 = 0;
+    let mut sum_sq: u64 = 0;
+    let mut edges: u64 = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let value = gray.get_pixel(x, y).0[0] as u64;
+            sum += value;
+            sum_sq += value * value;
+            let right = gray.get_pixel((x + 1).min(width - 1), y).0[0] as i32;
+            let down = gray.get_pixel(x, (y + 1).min(height - 1)).0[0] as i32;
+            let current = value as i32;
+            if (current - right).abs() > EDGE_GRADIENT_THRESHOLD
+                || (current - down).abs() > EDGE_GRADIENT_THRESHOLD
+            {
+                edges += 1;
+            }
+        }
+    }
+    let mean = sum as f64 / count as f64;
+    let variance = (sum_sq as f64 / count as f64 - mean * mean).max(0.0);
+    ImageStatistics {
+        mean: mean as f32,
+        std_dev: variance.sqrt() as f32,
+        edge_density: edges as f32 / count as f32,
+    }
+}
+
+/// Deterministic, statistics-based preprocess-variant selection (TD-22).
+///
+/// The rule scores every enhancement variant from the crop's mean/std/edge
+/// density and picks the highest scorer; when no candidate reaches
+/// `MIN_SELECTION_SCORE` (or the crop has no measurable content) the default
+/// `Original` is used. The rule never calls the model and never guesses: the
+/// choice is fully reproducible from the statistics.
+pub fn select_preprocess_variant(stats: &ImageStatistics) -> PreprocessVariantSelection {
+    if stats.edge_density < MIN_CONTENT_EDGE_DENSITY {
+        return PreprocessVariantSelection {
+            selected: DEFAULT_PREPROCESS_MODE,
+            score: 0.0,
+            below_threshold: true,
+            reason: "low_content_default_original".to_string(),
+        };
+    }
+    let contrast_deficit = ((IDEAL_CONTRAST - stats.std_dev) / IDEAL_CONTRAST).clamp(0.0, 1.0);
+    let ink = (stats.edge_density / EDGE_TARGET).clamp(0.0, 1.0);
+    let dark = ((160.0 - stats.mean) / 160.0).clamp(0.0, 1.0);
+    let light = ((stats.mean - 128.0) / 127.0).clamp(0.0, 1.0);
+
+    let candidates = [
+        (
+            OcrImagePreprocessMode::CleanGrayscale,
+            0.35 * contrast_deficit + 0.25 * ink + 0.20 * light,
+        ),
+        (
+            OcrImagePreprocessMode::HandwritingEnhanced,
+            0.45 * ink + 0.35 * contrast_deficit + 0.10 * dark,
+        ),
+        (
+            OcrImagePreprocessMode::HighContrast,
+            0.40 * contrast_deficit + 0.30 * dark,
+        ),
+        (
+            OcrImagePreprocessMode::HighContrastBw,
+            0.50 * contrast_deficit + 0.30 * dark + 0.20 * (1.0 - light),
+        ),
+    ];
+    let (selected, score) = candidates.iter().fold(
+        (DEFAULT_PREPROCESS_MODE, 0.0f32),
+        |best, (mode, candidate_score)| {
+            if *candidate_score > best.1 {
+                (*mode, *candidate_score)
+            } else {
+                best
+            }
+        },
+    );
+    let below_threshold = score < MIN_SELECTION_SCORE;
+    let reason = if below_threshold {
+        format!(
+            "score_below_threshold_default_{}",
+            preprocess_mode_dir_name(&DEFAULT_PREPROCESS_MODE)
+        )
+    } else {
+        format!("statistics_scored_{}", preprocess_mode_dir_name(&selected))
+    };
+    let effective = if below_threshold {
+        DEFAULT_PREPROCESS_MODE
+    } else {
+        selected
+    };
+    PreprocessVariantSelection {
+        selected: effective,
+        score,
+        below_threshold,
+        reason,
+    }
+}
+
+/// Selection used when no source crop can be read for statistics: the pipeline
+/// still attempts the historical handwriting-enhanced variant so a read failure
+/// surfaces as a `preprocess_failed` warning and falls back to the default.
+pub fn fallback_handwriting_selection() -> PreprocessVariantSelection {
+    PreprocessVariantSelection {
+        selected: OcrImagePreprocessMode::HandwritingEnhanced,
+        score: 0.0,
+        below_threshold: true,
+        reason: "no_readable_source_default_handwriting_enhanced".to_string(),
+    }
+}
+
 impl OcrImagePreprocessService {
     pub fn preprocess_image(
         &self,
@@ -656,5 +805,66 @@ mod tests {
 
         assert_eq!(error.code, AppErrorCode::FileReadFailed);
         assert!(error.message.contains("OCR görüntüsü"));
+    }
+
+    #[test]
+    fn selection_uses_default_original_for_blank_crops() {
+        let selection = select_preprocess_variant(&ImageStatistics {
+            mean: 245.0,
+            std_dev: 6.0,
+            edge_density: 0.0005,
+        });
+        assert_eq!(selection.selected, DEFAULT_PREPROCESS_MODE);
+        assert!(selection.below_threshold);
+        assert_eq!(selection.reason, "low_content_default_original");
+    }
+
+    #[test]
+    fn selection_uses_default_original_when_no_variant_reaches_threshold() {
+        let selection = select_preprocess_variant(&ImageStatistics {
+            mean: 235.0,
+            std_dev: 85.0,
+            edge_density: 0.005,
+        });
+        assert_eq!(selection.selected, DEFAULT_PREPROCESS_MODE);
+        assert!(selection.below_threshold);
+        assert!(selection
+            .reason
+            .starts_with("score_below_threshold_default_"));
+    }
+
+    #[test]
+    fn selection_prefers_handwriting_enhanced_for_handwritten_content() {
+        let mut image = ImageBuffer::from_pixel(60, 60, Rgba([245, 245, 245, 255]));
+        for y in 0..60 {
+            if (10..16).contains(&y) || (30..36).contains(&y) || (50..56).contains(&y) {
+                for x in 0..60 {
+                    image.put_pixel(x, y, Rgba([50, 50, 50, 255]));
+                }
+            }
+        }
+        let stats = compute_image_statistics(&DynamicImage::ImageRgba8(image));
+        assert!(stats.edge_density > MIN_CONTENT_EDGE_DENSITY);
+        let selection = select_preprocess_variant(&stats);
+        assert_eq!(
+            selection.selected,
+            OcrImagePreprocessMode::HandwritingEnhanced
+        );
+        assert!(!selection.below_threshold);
+        assert_eq!(selection.reason, "statistics_scored_handwriting_enhanced");
+    }
+
+    #[test]
+    fn selection_is_deterministic_and_reproducible() {
+        let image = ImageBuffer::from_pixel(48, 48, Rgba([200, 200, 200, 255]));
+        let stats = compute_image_statistics(&DynamicImage::ImageRgba8(image.clone()));
+        let first = select_preprocess_variant(&stats);
+        let second = select_preprocess_variant(&stats);
+        assert_eq!(first, second);
+        assert_eq!(first.selected, DEFAULT_PREPROCESS_MODE);
+        assert_eq!(
+            compute_image_statistics(&DynamicImage::ImageRgba8(image)),
+            stats
+        );
     }
 }

@@ -36,7 +36,10 @@ use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeLease, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
 };
 use crate::services::project_store::ProjectStore;
-use crate::services::prompt_contract::{build_prompt_contract, default_sampling};
+use crate::services::prompt_contract::{
+    build_prompt_contract, default_sampling, SCORING_ANCHOR_SET_VERSION,
+    SCORING_CALIBRATION_VERSION,
+};
 use crate::services::scoring_cache_service::{
     ExactDuplicateInput, ScoringCacheService, ScoringCandidateProposal,
 };
@@ -101,6 +104,7 @@ impl ScoringService {
         app: tauri::AppHandle<R>,
         project_id: String,
         force_rerun: bool,
+        correlation_id: &str,
     ) -> Result<StartScoringOutput, AppError> {
         let project = self
             .project_store
@@ -159,14 +163,27 @@ impl ScoringService {
 
         let run_id = Uuid::new_v4().to_string();
         let total = (project.student_submissions.len() * project.questions.len()) as u32;
-        let job = self.job_manager.start_job(
-            &app,
-            project_id.clone(),
-            Some(project.root_path.clone()),
-            JobKind::Scoring,
-            total,
-            "Notlandırma hazırlanıyor...".to_string(),
-        )?;
+        // Job registration, gateway request and audit kayıtları aynı komut
+        // correlation_id'sini taşır (TD-25).
+        let job = self
+            .job_manager
+            .register_or_get_active_job(
+                &app,
+                crate::jobs::job_manager::JobRegistrationInput {
+                    project_id: project_id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::Scoring,
+                    display_label: None,
+                    total,
+                    message: "Notlandırma hazırlanıyor...".to_string(),
+                    correlation_id: Some(correlation_id.to_string()),
+                    idempotency_key: None,
+                    duplicate_policy: crate::domain::job::DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )?
+            .snapshot;
 
         let mut running_project = project.clone();
         // Keep the previous active run visible until the replacement has
@@ -189,6 +206,7 @@ impl ScoringService {
         let app_handle = app.clone();
         let job_id = job.id.clone();
         let project_id_for_run = project_id.clone();
+        let correlation_id_for_run = correlation_id.to_string();
         tauri::async_runtime::spawn(async move {
             let recovery_project_id = project_id_for_run.clone();
             let run_result = service
@@ -198,6 +216,7 @@ impl ScoringService {
                     project_id_for_run,
                     force_rerun,
                     run_id.clone(),
+                    correlation_id_for_run.as_str(),
                 )
                 .await;
             if let Err(error) = run_result {
@@ -370,6 +389,7 @@ impl ScoringService {
         job_id: &str,
         question_id: &str,
         fingerprint: &ScoringFingerprint,
+        correlation_id: &str,
     ) {
         let Some(audit_service) = self.audit_service.as_ref() else {
             return;
@@ -382,6 +402,7 @@ impl ScoringService {
             )
             .project(&project.id)
             .entity("question", question_id)
+            .correlation(correlation_id)
             .metadata(json!({
                 "jobId": job_id,
                 "fingerprint": fingerprint.value,
@@ -404,6 +425,7 @@ impl ScoringService {
         question_id: &str,
         source_record_id: &str,
         fingerprint: &ScoringFingerprint,
+        correlation_id: &str,
     ) {
         let Some(audit_service) = self.audit_service.as_ref() else {
             return;
@@ -416,6 +438,7 @@ impl ScoringService {
             )
             .project(&project.id)
             .entity("question", question_id)
+            .correlation(correlation_id)
             .metadata(json!({
                 "jobId": job_id,
                 "sourceRecordId": source_record_id,
@@ -438,6 +461,7 @@ impl ScoringService {
         project_id: String,
         force_rerun: bool,
         run_id: String,
+        correlation_id: &str,
     ) -> Result<(), AppError> {
         self.job_manager.set_running(&app, &job_id).ok();
         let mut project = self
@@ -516,7 +540,8 @@ impl ScoringService {
                     )
                     .ok();
 
-                let ocr_record = project.student_answer_ocr_records.iter().find(|record| {
+                let active_ocr_records = project.resolved_active_ocr_records();
+                let ocr_record = active_ocr_records.iter().find(|record| {
                     record.submission_id == submission.id && record.question_id == question.id
                 });
                 let Some(ocr_record) = ocr_record else {
@@ -621,6 +646,7 @@ impl ScoringService {
                             &question.id,
                             &source.id,
                             &fingerprint,
+                            correlation_id,
                         );
                         (proposal_from_record(source), Some(source.decision_state))
                     } else if let Some(hit) = self
@@ -634,6 +660,7 @@ impl ScoringService {
                             &job_id,
                             &question.id,
                             &fingerprint,
+                            correlation_id,
                         );
                         (hit.proposal, None)
                     } else {
@@ -754,6 +781,7 @@ impl ScoringService {
                     }),
                     default_sampling(2048),
                     Some(ModelResponseFormat::JsonObject),
+                    Some(correlation_id),
                 );
                 let scoring_request = ScoringRequest {
                     prompt,
@@ -825,8 +853,8 @@ impl ScoringService {
                     model_file_fingerprint,
                     &runtime_fingerprint,
                     prompt_contract.invocation.sampling_parameters.clone(),
-                    "none",
-                    "none",
+                    SCORING_CALIBRATION_VERSION,
+                    SCORING_ANCHOR_SET_VERSION,
                 );
                 let duplicate_input = ExactDuplicateInput {
                     question_id: question.id.clone(),
@@ -856,6 +884,7 @@ impl ScoringService {
                         &question.id,
                         &source.id,
                         &fingerprint,
+                        correlation_id,
                     );
                     let record = build_scoring_record_from_proposal(
                         &project,
@@ -908,7 +937,13 @@ impl ScoringService {
                         provenance,
                     } = hit;
                     let cache_provenance = Some(provenance);
-                    self.audit_candidate_cache_hit(&project, &job_id, &question.id, &fingerprint);
+                    self.audit_candidate_cache_hit(
+                        &project,
+                        &job_id,
+                        &question.id,
+                        &fingerprint,
+                        correlation_id,
+                    );
                     let record = build_scoring_record_from_proposal(
                         &project,
                         &run_id,
@@ -1105,7 +1140,7 @@ impl ScoringService {
         project.latest_scoring_run_id = Some(run_id.clone());
         project.scoring_records.extend(new_records);
         let consistency_answers = project
-            .student_answer_ocr_records
+            .resolved_active_ocr_records()
             .iter()
             .map(|ocr_record| {
                 let answer = ocr_record
@@ -1268,6 +1303,7 @@ impl ScoringService {
             invalidation_reason: None,
             created_at: now,
             updated_at: now,
+            assessment_activity_id: project.resolve_written_scope_id().ok().flatten(),
         }
     }
 }
@@ -1333,8 +1369,8 @@ fn build_scoring_fingerprint<T: Serialize>(
         model_file_fingerprint,
         runtime_fingerprint,
         default_sampling(2048),
-        "none",
-        "none",
+        SCORING_CALIBRATION_VERSION,
+        SCORING_ANCHOR_SET_VERSION,
     )
 }
 
@@ -1517,6 +1553,7 @@ fn build_scoring_record_from_proposal(
         invalidation_reason: None,
         created_at: now,
         updated_at: now,
+        assessment_activity_id: _project.resolve_written_scope_id().ok().flatten(),
     }
 }
 
@@ -1795,6 +1832,7 @@ mod tests {
 
     fn ocr_record() -> StudentAnswerOcrRecord {
         StudentAnswerOcrRecord {
+            assessment_activity_id: None,
             id: "ocr-1".to_string(),
             submission_id: "sub-1".to_string(),
             question_id: "q1".to_string(),
@@ -2093,5 +2131,155 @@ mod tests {
         assert!(prompt.contains("güvenilmeyen VERİDİR"));
         assert!(prompt.contains("exactEvidence"));
         assert!(prompt.contains("birebir"));
+    }
+
+    #[test]
+    fn update_scoring_record_commit_failure_returns_typed_error_and_allows_retry() {
+        use crate::services::model_config_service::ModelConfigService;
+        use crate::services::model_process_manager::ModelProcessManager;
+        use crate::services::model_runtime_service::ModelRuntimeService;
+
+        let root =
+            std::env::temp_dir().join(format!("rubrika-scoring-commit-fail-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "Scoring Commit Fail".into(),
+                root.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        let mut seeded = store.get_project_snapshot(project.id.clone()).unwrap();
+        let package_hash = scoring_package_hash(&seeded);
+        seeded.scoring_records = vec![ScoringRecord {
+            assessment_activity_id: None,
+            id: "record-1".into(),
+            run_id: "run-1".into(),
+            submission_id: "submission-1".into(),
+            student_id: "student-1".into(),
+            student_display_name: Some("Ali".into()),
+            student_number: Some("1".into()),
+            student_class_name: Some("A".into()),
+            question_id: "q-1".into(),
+            question_number: 1,
+            max_score: 10.0,
+            awarded_score: None,
+            scoring_applied: false,
+            decision_state: ScoringDecisionState::ModelCandidate,
+            decision_version: "v0".into(),
+            criterion_scores: vec![],
+            semantic_decisions: vec![],
+            rationale: String::new(),
+            confidence: 0.0,
+            needs_review: true,
+            review_reasons: vec![],
+            warnings: vec![],
+            raw_model_output: "{}".into(),
+            parse_diagnostics: None,
+            reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
+            source_hash: String::new(),
+            package_hash,
+            ocr_record_hash: String::new(),
+            question_text_hash: String::new(),
+            rubric_hash: String::new(),
+            teacher_review_status: ScoringReviewStatus::PendingReview,
+            teacher_manual_score: None,
+            teacher_reviewed_at: None,
+            teacher_notes: None,
+            invalidated_at: None,
+            invalidation_reason: None,
+            created_at: now,
+            updated_at: now,
+        }];
+        store.save_project(&seeded).unwrap();
+
+        let project_json = root.join("project.json");
+        let original_content =
+            std::fs::read_to_string(&project_json).expect("project.json should be readable");
+
+        // Externally modify the project file so the next commit fails the
+        // session-fingerprint check (PROJECT_EXTERNALLY_MODIFIED).
+        let mut external = store.get_project_snapshot(project.id.clone()).unwrap();
+        external.name = "external edit".to_string();
+        std::fs::write(
+            &project_json,
+            serde_json::to_string_pretty(&external).unwrap(),
+        )
+        .unwrap();
+
+        let service = ScoringService::new(
+            store.clone(),
+            std::sync::Arc::new(
+                crate::services::llama_server_gateway::LlamaServerGateway::default(),
+            ),
+            ModelRuntimeService::new(
+                ModelConfigService::new_with_path(
+                    std::env::temp_dir()
+                        .join(format!("rubrika-model-config-{}.json", Uuid::new_v4())),
+                ),
+                ModelProcessManager::new_with_state_path(
+                    ModelConfigService::new_with_path(
+                        std::env::temp_dir()
+                            .join(format!("rubrika-model-config-{}.json", Uuid::new_v4())),
+                    ),
+                    std::sync::Arc::new(
+                        crate::services::llama_server_gateway::LlamaServerGateway::default(),
+                    ),
+                    std::env::temp_dir()
+                        .join(format!("rubrika-model-state-{}.json", Uuid::new_v4())),
+                ),
+            ),
+            std::sync::Arc::new(JobManager::new()),
+        );
+
+        // Commit fail -> typed error; no success DTO is returned.
+        let error = service
+            .update_scoring_record(&project.id, "record-1", Some(7.0), None, false)
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectExternallyModified);
+
+        // Memory state must not be canonical: the failed mutation must not
+        // have written the teacher score into the session record.
+        let session = store.get_project_snapshot(project.id.clone()).unwrap();
+        assert_eq!(
+            session.scoring_records[0].teacher_manual_score, None,
+            "failed commit must not mutate the session record"
+        );
+        assert_eq!(
+            session.scoring_records[0].decision_state,
+            ScoringDecisionState::ModelCandidate
+        );
+
+        // The failed mutation must not have overwritten the external disk state.
+        let disk = std::fs::read_to_string(&project_json).unwrap();
+        assert!(
+            disk.contains("external edit"),
+            "failed commit must not overwrite the externally modified project file"
+        );
+
+        // Restore the disk to the session-known content and retry: success now.
+        std::fs::write(&project_json, &original_content).unwrap();
+        let updated = service
+            .update_scoring_record(&project.id, "record-1", Some(7.0), None, false)
+            .expect("retry must succeed after restoring the project file");
+        assert_eq!(updated.teacher_manual_score, Some(7.0));
+        assert_eq!(
+            updated.decision_state,
+            ScoringDecisionState::TeacherApproved
+        );
+        assert_eq!(updated.invalidated_at, None);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

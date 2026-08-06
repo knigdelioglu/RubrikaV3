@@ -293,6 +293,12 @@ pub struct ModelInvocationContract {
     pub sampling_parameters: SamplingParameters,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ModelResponseFormat>,
+    /// Komut katmanından model invocation'ına kadar taşınan izleme kimliği
+    /// (TD-25). `None` yalnızca correlation akışı bağlanmamış eski/derin
+    /// job akışlarında oluşur; kontrata yazıldığında command correlation_id
+    /// ile birebir aynıdır.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -841,12 +847,41 @@ pub struct RubricExtractionOutput {
     pub document_warnings: Vec<String>,
 }
 
+/// Diagnostic metadata about the page targeting / retry chain used for a
+/// rubric (or question text) extraction attempt (TD-19/TD-20).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RubricExtractionRetryMetadata {
+    /// Total number of model invocations made for this extraction.
+    pub attempts: u32,
+    /// Number of images sent with the final (or only) invocation.
+    pub image_count: u32,
+    /// Page numbers included in the final (or only) invocation.
+    #[serde(default)]
+    pub pages_used: Vec<u32>,
+    /// Why a multimodal retry was performed, if one was (`None` when the first
+    /// attempt already succeeded or a salvage/text-only repair sufficed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_reason: Option<String>,
+    /// Whether the first malformed response was recovered deterministically.
+    #[serde(default)]
+    pub salvage_used: bool,
+    /// Whether a text-only JSON repair (no images) was used.
+    #[serde(default)]
+    pub text_only_repair_used: bool,
+    /// Page numbers targeted by the first attempt (pre-fallback).
+    #[serde(default)]
+    pub targeted_pages: Vec<u32>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RubricExtractionResult {
     pub output: RubricExtractionOutput,
     pub raw_response: String,
     pub diagnostics: ModelDiagnostics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_metadata: Option<RubricExtractionRetryMetadata>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1353,6 +1388,7 @@ mod tests {
                 max_tokens: 256,
             },
             response_format: Some(ModelResponseFormat::JsonObject),
+            correlation_id: Some("corr-provenance".to_string()),
         };
 
         let json = serde_json::to_value(ModelProvenance::from_invocation(&contract))
@@ -1363,6 +1399,7 @@ mod tests {
         assert_eq!(json["policyVersion"], "ocr_review_policy_v1");
         assert_eq!(json["samplingParameters"]["maxTokens"], 256);
         assert_eq!(json["responseFormat"]["type"], "json_object");
+        assert_eq!(json["correlationId"], "corr-provenance");
 
         let restored: ModelProvenance = serde_json::from_value(json).expect("restore provenance");
         assert_eq!(restored.invocation, contract);

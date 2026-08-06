@@ -8,11 +8,14 @@ use uuid::Uuid;
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::project::Project;
 use crate::domain::student::{
-    QuestionAnswerRegion, QuestionAnswerTemplate, StudentAnswerCropTemplateItem,
+    NormalizedBBox, QuestionAnswerRegion, QuestionAnswerTemplate, StudentAnswerCropTemplateItem,
     StudentAnswerOcrCropBBox, StudentAnswerOcrJobMode, StudentAnswerOcrRenderDiagnostics,
     StudentIdentityCropTemplate, StudentSubmission,
 };
 use crate::platform::project_paths::TrustedProjectRoot;
+use crate::services::ocr_image_geometry_service::{
+    measure_registration_deviation, validate_registration, DEFAULT_MAX_REGISTRATION_DEVIATION,
+};
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
 use crate::services::workflow_engine;
@@ -342,6 +345,14 @@ impl StudentAnswerCropService {
         let mut layout_hint = "manual answer regions".to_string();
 
         if let Some(template) = template.filter(|template| !template.regions.is_empty()) {
+            // Registration gating (TD-21 residual, closed by the Faz 7+ golden
+            // benchmark): a page whose whole answer grid is systematically
+            // shifted would crop the wrong content. The golden scanned variant
+            // measures far below the threshold, so this never false-rejects a
+            // real scan; blank pages are exempt. Fail-closed in production.
+            if mode == StudentAnswerOcrJobMode::Production {
+                self.validate_page_registration(submission, preview_by_page, template)?;
+            }
             let mut missing_region = false;
             for region in template.sorted_regions() {
                 let Some(page_number) = submission
@@ -473,6 +484,45 @@ impl StudentAnswerCropService {
             render_diagnostics,
             layout_hint,
         })
+    }
+
+    /// Rejects a submission whose rendered pages carry a systematic answer-grid
+    /// shift (registration deviation above the production threshold). Blank
+    /// pages and pages without measurable ink are exempt. This is the Faz 7+
+    /// closure of the TD-21 registration gating residual: the golden scanned
+    /// variant measures ~0.01 against the 0.12 threshold, so the gate is safe
+    /// for real scans and only fires on grossly misregistered input.
+    fn validate_page_registration(
+        &self,
+        submission: &StudentSubmission,
+        preview_by_page: &BTreeMap<u32, PathBuf>,
+        template: &QuestionAnswerTemplate,
+    ) -> Result<(), AppError> {
+        let mut regions_by_page: BTreeMap<u32, Vec<NormalizedBBox>> = BTreeMap::new();
+        for region in template.sorted_regions() {
+            if let Some(page_number) = submission
+                .page_numbers
+                .get(region.page_offset as usize)
+                .copied()
+            {
+                regions_by_page
+                    .entry(page_number)
+                    .or_default()
+                    .push(region.normalized_bbox.clone());
+            }
+        }
+        for (page_number, bboxes) in regions_by_page {
+            let Some(preview_path) = preview_by_page.get(&page_number) else {
+                continue;
+            };
+            let Ok(image) = image::open(preview_path) else {
+                continue;
+            };
+            let measurement =
+                measure_registration_deviation(&image.grayscale().to_luma8(), &bboxes);
+            validate_registration(&measurement, DEFAULT_MAX_REGISTRATION_DEVIATION)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -623,7 +673,7 @@ pub(crate) fn crop_rect(
     crop_rect_values(bbox.x, bbox.y, bbox.width, bbox.height, width, height)
 }
 
-fn crop_rect_normalized(
+pub fn crop_rect_normalized(
     bbox: &crate::domain::student::NormalizedBBox,
     width: u32,
     height: u32,
@@ -779,6 +829,7 @@ mod tests {
 
     fn test_submission(page_numbers: Vec<u32>) -> StudentSubmission {
         StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".to_string(),
             student_id: "student-1".to_string(),
             document_id: "scan-1".to_string(),
@@ -962,6 +1013,79 @@ mod tests {
             Some("experimental_full_page_review_only")
         );
         assert!(experimental.layout_hint.contains("review"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn production_rejects_systematically_misregistered_page_and_accepts_aligned_one() {
+        let root = temp_root();
+        let project_store = ProjectStore::new();
+        let service = service(project_store);
+        let mut question = default_question(1);
+        question.id = "q1".to_string();
+        let submission = test_submission(vec![1]);
+        let template = QuestionAnswerTemplate {
+            question_id: question.id.clone(),
+            regions: vec![test_region(&question.id, "q1-region-0", 0, 0)],
+        };
+
+        let preview_dir = root.join("previews");
+        std::fs::create_dir_all(&preview_dir).unwrap();
+
+        // Misregistered page: ink confined to the top-left corner of the answer
+        // region (a large systematic offset from the region center). The gate
+        // must fail closed with the typed registration error, never silent
+        // wrong-content OCR.
+        let misreg_path = preview_dir.join("page-1-misregistered.png");
+        let mut misreg = image::GrayImage::from_pixel(100, 100, image::Luma([255]));
+        for y in 6..12 {
+            for x in 6..12 {
+                misreg.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+        misreg.save(&misreg_path).unwrap();
+        let mut pages = BTreeMap::new();
+        pages.insert(1, misreg_path);
+        let rejection = service.build_sources(
+            &root.to_string_lossy(),
+            "scan-1",
+            &submission,
+            &question,
+            &pages,
+            Some(&template),
+            StudentAnswerOcrJobMode::Production,
+        );
+        let error = match rejection {
+            Err(error) => error,
+            Ok(_) => panic!("systematically misregistered page must be rejected"),
+        };
+        assert_eq!(error.code, AppErrorCode::RegistrationOutOfRange);
+
+        // Aligned page: ink centered in the answer region → accepted.
+        let aligned_path = preview_dir.join("page-1-aligned.png");
+        let mut aligned = image::GrayImage::from_pixel(100, 100, image::Luma([255]));
+        for y in 18..32 {
+            for x in 10..70 {
+                aligned.put_pixel(x, y, image::Luma([0]));
+            }
+        }
+        aligned.save(&aligned_path).unwrap();
+        pages.insert(1, aligned_path);
+        let artifacts = service
+            .build_sources(
+                &root.to_string_lossy(),
+                "scan-1",
+                &submission,
+                &question,
+                &pages,
+                Some(&template),
+                StudentAnswerOcrJobMode::Production,
+            )
+            .unwrap();
+        assert_eq!(
+            artifacts.render_diagnostics.answer_region_source.as_deref(),
+            Some("manual_template")
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

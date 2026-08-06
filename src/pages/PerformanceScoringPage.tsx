@@ -936,6 +936,11 @@ export function PerformanceResultsView({
                     <td>
                       {status === 'missing' || status === 'not_performed' ? (
                         <span className="performance-non-rated-cell">—</span>
+                      ) : status === 'in_progress' ? (
+                        <>
+                          {assessment?.provisionalTotal ?? 0}/{maxPoints}
+                          <small className="performance-provisional-label"> (geçici)</small>
+                        </>
                       ) : status ? (
                         `${assessment?.provisionalTotal ?? 0}/${maxPoints}`
                       ) : (

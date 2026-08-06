@@ -125,7 +125,6 @@ export function ExamPackageWorkspacePage() {
     queryKey: ['jobs', projectId],
     queryFn: () => commands.listJobs(projectId),
     enabled: !!projectId,
-    refetchInterval: (query) => query.state.data?.some((job) => job.status === 'queued' || job.status === 'running') ? 1000 : false,
   });
 
   const project = projectQuery.data;

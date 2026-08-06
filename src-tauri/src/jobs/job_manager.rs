@@ -101,7 +101,14 @@ impl JobManager {
         app: &tauri::AppHandle<R>,
         input: JobRegistrationInput,
     ) -> Result<RegisteredJob, AppError> {
-        if !*self.accepting_new_jobs.lock().unwrap() {
+        if !*self.accepting_new_jobs.lock().map_err(|e| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Job accepting state could not be read.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(e.to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })? {
             return Err(AppError {
                 code: AppErrorCode::WorkflowBlocked,
                 message: "Uygulama kapanıyor, yeni iş kabul edilemez.".to_string(),
@@ -136,14 +143,28 @@ impl JobManager {
             )
         });
 
-        let mut idempotency_map = self.idempotency_map.lock().unwrap();
+        let mut idempotency_map = self.idempotency_map.lock().map_err(|e| AppError {
+            code: AppErrorCode::UnknownError,
+            message: "Job idempotency state could not be read.".to_string(),
+            recoverable: false,
+            suggested_action: None,
+            technical_details: Some(e.to_string()),
+            correlation_id: Uuid::new_v4().to_string(),
+        })?;
 
         if let Some(existing_job_id) = idempotency_map.get(&key) {
             if let Some(existing_snapshot) = jobs.get(existing_job_id) {
                 if existing_snapshot.status.is_active() {
                     match input.duplicate_policy {
                         DuplicatePolicy::ReturnExisting => {
-                            let tokens = self.task_tokens.lock().unwrap();
+                            let tokens = self.task_tokens.lock().map_err(|e| AppError {
+                                code: AppErrorCode::UnknownError,
+                                message: "Job cancellation state could not be read.".to_string(),
+                                recoverable: false,
+                                suggested_action: None,
+                                technical_details: Some(e.to_string()),
+                                correlation_id: Uuid::new_v4().to_string(),
+                            })?;
                             let token = tokens
                                 .get(existing_job_id)
                                 .cloned()
@@ -288,7 +309,16 @@ impl JobManager {
     }
 
     pub fn get_cancellation_token(&self, job_id: &str) -> Option<CancellationToken> {
-        self.task_tokens.lock().unwrap().get(job_id).cloned()
+        match self.task_tokens.lock() {
+            Ok(tokens) => tokens.get(job_id).cloned(),
+            Err(poisoned) => {
+                log::error!(
+                    "Job cancellation token store lock poisoned for job {job_id}; treating job as non-cancellable"
+                );
+                let _ = poisoned;
+                None
+            }
+        }
     }
 
     pub fn set_running<R: tauri::Runtime>(
@@ -1543,6 +1573,50 @@ mod tests {
                 .filter(|j| j.status.is_active())
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn lock_poison_returns_typed_error_instead_of_panicking() {
+        let manager = JobManager::new();
+
+        // Poison the accepting_new_jobs lock by panicking while it is held.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = manager.accepting_new_jobs.lock().unwrap();
+            std::panic::panic_any("intentional poison");
+        }));
+        assert!(
+            poisoned.is_err(),
+            "test precondition: lock must be poisoned"
+        );
+
+        let app = mock_app();
+        let handle = app.handle();
+        let result = manager.register_or_get_active_job(
+            handle,
+            JobRegistrationInput {
+                project_id: "poison".to_string(),
+                project_root_path: None,
+                kind: JobKind::Scoring,
+                display_label: None,
+                total: 1,
+                message: "poison".to_string(),
+                correlation_id: Some("corr-poison".to_string()),
+                idempotency_key: Some("key-poison".to_string()),
+                duplicate_policy: DuplicatePolicy::ReturnExisting,
+                cancellable: true,
+                retry_of_job_id: None,
+            },
+        );
+
+        let err = match result {
+            Ok(_) => panic!("poisoned lock must return a typed error, not panic"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, AppErrorCode::UnknownError);
+        assert!(
+            err.technical_details.is_some(),
+            "raw poison error must reach diagnostics"
         );
     }
 }

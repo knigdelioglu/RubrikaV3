@@ -12,6 +12,7 @@ use crate::services::student_answer_ocr_service::{
 use crate::AppState;
 use std::path::Path;
 use tauri::State;
+use uuid::Uuid;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,9 +133,14 @@ pub async fn accept_student_answer_ocr_generation(
     state: State<'_, AppState>,
     input: OcrGenerationInput,
 ) -> Result<OcrGeneration, AppError> {
+    let correlation_id = Uuid::new_v4().to_string();
     let generation = state
         .student_answer_ocr_service
-        .accept_student_answer_ocr_generation(&input.project_id, &input.generation_id)?;
+        .accept_student_answer_ocr_generation(
+            &input.project_id,
+            &input.generation_id,
+            &correlation_id,
+        )?;
     super::audit_critical(
         &state,
         &input.project_id,
@@ -142,7 +148,8 @@ pub async fn accept_student_answer_ocr_generation(
             "ocr_generation_accepted",
             "OCR nesli öğretmen tarafından kabul edildi.",
         )
-        .entity("ocr_generation", &input.generation_id),
+        .entity("ocr_generation", &input.generation_id)
+        .correlation(&correlation_id),
     )?;
     Ok(generation)
 }
@@ -152,9 +159,14 @@ pub async fn reject_student_answer_ocr_generation(
     state: State<'_, AppState>,
     input: OcrGenerationInput,
 ) -> Result<OcrGeneration, AppError> {
+    let correlation_id = Uuid::new_v4().to_string();
     let generation = state
         .student_answer_ocr_service
-        .reject_student_answer_ocr_generation(&input.project_id, &input.generation_id)?;
+        .reject_student_answer_ocr_generation(
+            &input.project_id,
+            &input.generation_id,
+            &correlation_id,
+        )?;
     super::audit_critical(
         &state,
         &input.project_id,
@@ -162,7 +174,8 @@ pub async fn reject_student_answer_ocr_generation(
             "ocr_generation_rejected",
             "OCR nesli öğretmen tarafından reddedildi.",
         )
-        .entity("ocr_generation", &input.generation_id),
+        .entity("ocr_generation", &input.generation_id)
+        .correlation(&correlation_id),
     )?;
     Ok(generation)
 }
@@ -240,6 +253,7 @@ pub async fn suggest_ocr_issue_correction_with_model(
     state: State<'_, AppState>,
     input: SuggestOcrIssueCorrectionWithModelInput,
 ) -> Result<SuggestStudentAnswerOcrIssueCorrectionWithModelOutput, AppError> {
+    let correlation_id = Uuid::new_v4().to_string();
     state
         .student_answer_ocr_service
         .suggest_ocr_issue_correction_with_model(
@@ -251,6 +265,7 @@ pub async fn suggest_ocr_issue_correction_with_model(
             input.highlight_region,
             input.crop_ref,
             input.model_input_crop_ref,
+            &correlation_id,
         )
         .await
 }

@@ -4758,6 +4758,7 @@ BAŞARILAR...";
     #[test]
     fn snapshot_refresh_detects_stale_dirty_questions() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: Some(6),
             exam_package_freeze: None,
             id: "p1".to_string(),
@@ -4832,6 +4833,7 @@ BAŞARILAR...";
     #[test]
     fn repair_question_text_from_raw_text_refreshes_dirty_snapshot_and_prunes_out_of_range() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: Some(6),
             exam_package_freeze: None,
             id: "p2".to_string(),
@@ -5264,6 +5266,7 @@ BAŞARILAR...";
         };
         project.questions = vec![question];
         project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            assessment_activity_id: None,
             exam_package_version: 1,
             freeze_status: crate::domain::project::ExamPackageFreezeStatus::Frozen,
             frozen_at: chrono::Utc::now().to_rfc3339(),

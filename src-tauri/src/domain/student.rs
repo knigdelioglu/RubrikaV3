@@ -302,6 +302,9 @@ pub struct StudentSubmission {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    /// TD-01: owning written-family assessment activity. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 /// A versioned OCR result set. Each submission gets its own generation so a
@@ -330,6 +333,9 @@ pub struct OcrGeneration {
     pub failure_reason: Option<String>,
     #[serde(default)]
     pub job_mode: StudentAnswerOcrJobMode,
+    /// TD-01: owning written-family assessment activity. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -826,6 +832,9 @@ pub struct StudentAnswerOcrRecord {
     pub parse_diagnostics: Option<StudentAnswerOcrParseDiagnostics>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub render_diagnostics: Option<StudentAnswerOcrRenderDiagnostics>,
+    /// TD-01: owning written-family assessment activity. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 impl Default for StudentIdentityOcrRecord {
@@ -900,6 +909,7 @@ impl Default for StudentAnswerOcrRecord {
             parse_diagnostics: None,
             render_diagnostics: None,
             ocr_provenance: None,
+            assessment_activity_id: None,
         }
     }
 }

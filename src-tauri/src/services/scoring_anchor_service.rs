@@ -267,6 +267,7 @@ fn build_anchor(project: &Project, source_record_id: &str) -> Result<ScoringAnch
         created_at: now,
         revoked_at: None,
         revoked_reason: None,
+        assessment_activity_id: project.resolve_written_scope_id().ok().flatten(),
     };
 
     // Keep the source record and OCR validation in the creation path even
@@ -590,6 +591,7 @@ mod tests {
 
     fn test_anchor(source_record_id: &str) -> ScoringAnchor {
         ScoringAnchor {
+            assessment_activity_id: None,
             id: "anchor-1".to_string(),
             version: "v1".to_string(),
             source_record_id: source_record_id.to_string(),

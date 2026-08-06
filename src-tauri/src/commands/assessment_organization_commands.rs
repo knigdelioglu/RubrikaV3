@@ -51,6 +51,16 @@ pub async fn get_assessment_activity(
 }
 
 #[tauri::command]
+pub async fn set_active_written_activity(
+    state: State<'_, AppState>,
+    input: AssessmentActivityIdInput,
+) -> Result<AssessmentActivity, AppError> {
+    state
+        .assessment_organization_service
+        .set_active_written_activity(input)
+}
+
+#[tauri::command]
 pub async fn get_assessment_class_applications(
     state: State<'_, AppState>,
     input: AssessmentActivityIdInput,

@@ -1,0 +1,133 @@
+{
+  "schema_version": "rubrika.synthetic.golden.v1",
+  "exam_id": "tymm_tde_001",
+  "synthetic": true,
+  "contains_real_student_data": false,
+  "blank_exam_pdf": "01_Bos_Sinav_Kagidi.pdf",
+  "filled_exam_pdf": "02_Doldurulmus_Ornek_Kagit.pdf",
+  "scanned_exam_pdf": "03_Doldurulmus_Tarama_Varyanti.pdf",
+  "rubric_pdf": "04_Cevap_Anahtari_ve_Rubrik.pdf",
+  "page_count": 4,
+  "regions": {
+    "q1": [
+      {
+        "page": 1,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.09739992517770293,
+          0.8790476190476191,
+          0.2731949120838009
+        ],
+        "role": "primary"
+      },
+      {
+        "page": 2,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.726805087916199,
+          0.8790476190476191,
+          0.15203890759446312
+        ],
+        "role": "continuation"
+      }
+    ],
+    "q2": [
+      {
+        "page": 2,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.10927796483352037,
+          0.8790476190476191,
+          0.5367564534231202
+        ],
+        "role": "table"
+      }
+    ],
+    "q3": [
+      {
+        "page": 3,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.5486344930789376,
+          0.8790476190476191,
+          0.31476805087916193
+        ],
+        "role": "matching"
+      }
+    ],
+    "q4": [
+      {
+        "page": 3,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.08314627759072202,
+          0.8790476190476191,
+          0.394219977553311
+        ],
+        "role": "correction_table"
+      }
+    ],
+    "q5": [
+      {
+        "page": 4,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.3682192293303404,
+          0.8790476190476191,
+          0.21380471380471378
+        ],
+        "role": "grammar"
+      }
+    ],
+    "q6": [
+      {
+        "page": 4,
+        "bbox_normalized": [
+          0.06047619047619047,
+          0.08314627759072202,
+          0.8790476190476191,
+          0.21380471380471378
+        ],
+        "role": "poem_interpretation"
+      }
+    ]
+  },
+  "ocr_ground_truth": {
+    "q1": "Ece, defteri arkadaşlarıyla paylaşma isteği ile sahibinin özel alanına saygı gösterme sorumluluğu arasında kalır. “İçindeki öyküler çok güzeldi ve arkadaşlarına göstermek istiyordu.” cümlesi paylaşma isteğini; “Sahibinin bu satırları kimseyle paylaşmak istemeyebileceğini düşündü.” cümlesi ise geri verme sorumluluğunu gösterir. Ece’nin defteri müdür yardımcısına teslim etmesi, çatışmayı sorumluluk yönünde çözdüğünü gösterir.",
+    "q2": {
+      "Anlatıcı": "Üçüncü kişi anlatıcı",
+      "Mekân": "Okulun eski kütüphanesi ve koridor",
+      "Zaman": "Yağmurlu bir okul günü / akşamüstü",
+      "Ece’nin özelliği": "Sorumluluk sahibi ve duyarlı",
+      "Metinsel kanıt": "Defteri müdür yardımcısına teslim etmeye karar vermesi"
+    },
+    "q3": "1-A, 2-B, 3-C, 4-D, 5-A",
+    "q4": {
+      "a": "Bugün, “Küçük Ağa” romanını bitirdim.",
+      "b": "Ankara’ya yarın mı gideceksin?",
+      "c": "Her şey bir anda değişti."
+    },
+    "q5": "Özne: Ece. Belirtili nesne: defteri. Dolaylı tümleç: müdür yardımcısına. Zarf tümleci: koridorda hızla. Yüklem: yürüdü; birleşik fiildir.",
+    "q6": "Şiirde ayrılık ile umut arasında bir duygu vardır. “Gitmek bazen dönmeyi anlamaktır.” dizesi ayrılığın kesin bir kopuş değil, insanın dönüşü ve bağlılığı anlaması olduğunu gösterir."
+  },
+  "expected_scoring": {
+    "q1": 18,
+    "q2": 20,
+    "q3": 12,
+    "q4": 10,
+    "q5": 7,
+    "q6": 13,
+    "total": 80,
+    "decision_state": "teacher_approved_golden"
+  },
+  "quality_gates": {
+    "vector_render_cer_max": 0.01,
+    "vector_render_wer_max": 0.02,
+    "scanned_variant_cer_max": 0.05,
+    "scanned_variant_wer_max": 0.08,
+    "printed_question_leakage_allowed": false,
+    "answer_key_leakage_allowed": false,
+    "structured_field_exact_match_min": 1.0,
+    "expected_total_score_exact": 80
+  }
+}

@@ -247,7 +247,12 @@ impl StudentScanService {
         let project = self
             .project_store
             .get_project_snapshot(project_id.to_string())?;
-        Ok(project.student_submissions)
+        Ok(project
+            .written_scope_view()
+            .student_submissions
+            .into_iter()
+            .cloned()
+            .collect())
     }
 
     pub fn create_student_page_groups(
@@ -258,6 +263,7 @@ impl StudentScanService {
         let document = self
             .find_student_scan_document(&project, &input.document_id)?
             .clone();
+        let scope_id = project.resolve_written_scope_id()?;
         let scope = resolve_batch_scope(
             &project,
             input.batch_id.as_deref(),
@@ -352,9 +358,17 @@ impl StudentScanService {
                     .map(|_| ClassMembershipSource::InheritedFromBatch),
                 page_numbers,
                 status: StudentSubmissionStatus::IdentityMissing,
-                answer_slots: build_answer_slots(&project.questions),
+                answer_slots: build_answer_slots(
+                    &project
+                        .written_scope_view()
+                        .questions
+                        .into_iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
                 warnings: vec![],
                 updated_at: Some(now.clone()),
+                assessment_activity_id: scope_id.clone(),
             };
             project.students.push(student);
             project.student_submissions.push(submission);
@@ -1385,6 +1399,7 @@ mod tests {
             }),
         });
         project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            assessment_activity_id: None,
             exam_package_version: 1,
             freeze_status: crate::domain::project::ExamPackageFreezeStatus::Frozen,
             frozen_at: chrono::Utc::now().to_rfc3339(),
@@ -1724,6 +1739,7 @@ mod tests {
         let submission_id = Uuid::new_v4().to_string();
         let student_id = Uuid::new_v4().to_string();
         project.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: submission_id.clone(),
             student_id,
             document_id: "scan".to_string(),
@@ -1737,6 +1753,7 @@ mod tests {
             updated_at: None,
         });
         let empty_generation = OcrGeneration {
+            assessment_activity_id: None,
             generation_id: Uuid::new_v4().to_string(),
             submission_id: submission_id.clone(),
             source_fingerprint: "source".to_string(),

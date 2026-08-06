@@ -28,6 +28,7 @@ pub fn evaluate_workflow_with_context(
     question_text_job_active: bool,
     student_answer_ocr_job_active: bool,
 ) -> WorkflowSnapshot {
+    let scoped = project.written_scope_view();
     let (current_stage, blocking_reasons, next_actions, text) = evaluate_workflow_inner(
         project,
         model_status,
@@ -63,23 +64,23 @@ pub fn evaluate_workflow_with_context(
             ) || check_preview_cache_valid(&project.root_path, &d.id)
         });
 
-    let question_ready = !project.questions.is_empty()
-        && project.questions.iter().all(|q| {
+    let question_ready = !scoped.questions.is_empty()
+        && scoped.questions.iter().all(|q| {
             matches!(
                 q.question_text.status,
                 TextFieldStatus::Suggested | TextFieldStatus::Confirmed | TextFieldStatus::Edited
             )
         });
-    let question_partial = !project.questions.is_empty()
+    let question_partial = !scoped.questions.is_empty()
         && !question_ready
-        && project.questions.iter().any(|q| {
+        && scoped.questions.iter().any(|q| {
             matches!(
                 q.question_text.status,
                 TextFieldStatus::Suggested | TextFieldStatus::Confirmed | TextFieldStatus::Edited
             )
         });
-    let rubric_ready = !project.questions.is_empty()
-        && project.questions.iter().all(|q| {
+    let rubric_ready = !scoped.questions.is_empty()
+        && scoped.questions.iter().all(|q| {
             matches!(
                 q.rubric.status,
                 RubricStatus::Suggested
@@ -88,9 +89,9 @@ pub fn evaluate_workflow_with_context(
                     | RubricStatus::Confirmed
             )
         });
-    let rubric_partial = !project.questions.is_empty()
+    let rubric_partial = !scoped.questions.is_empty()
         && !rubric_ready
-        && project.questions.iter().any(|q| {
+        && scoped.questions.iter().any(|q| {
             matches!(
                 q.rubric.status,
                 RubricStatus::Suggested
@@ -102,10 +103,10 @@ pub fn evaluate_workflow_with_context(
 
     let student_scan_progress =
         student_scan_preview_progress(&project.root_path, &student_scan_docs);
-    let student_answer_ocr_total = project.student_submissions.len() * project.questions.len();
-    let student_answer_ocr_records = project.student_answer_ocr_records.len();
-    let student_answer_ocr_reviewed = project
-        .student_answer_ocr_records
+    let student_answer_ocr_total = scoped.student_submissions.len() * scoped.questions.len();
+    let active_ocr_records = scoped.student_answer_ocr_records.clone();
+    let student_answer_ocr_records = active_ocr_records.len();
+    let student_answer_ocr_reviewed = active_ocr_records
         .iter()
         .filter(|record| {
             matches!(
@@ -301,13 +302,14 @@ pub fn evaluate_workflow_with_context(
 }
 
 fn exam_package_is_ready_to_freeze(project: &Project) -> bool {
+    let scoped = project.written_scope_view();
     let expected_count = project
         .expected_question_count
-        .unwrap_or(project.questions.len() as u32);
+        .unwrap_or(scoped.questions.len() as u32);
     expected_count > 0
-        && project.questions.len() == expected_count as usize
+        && scoped.questions.len() == expected_count as usize
         && (1..=expected_count).all(|number| {
-            project.questions.iter().any(|question| {
+            scoped.questions.iter().any(|question| {
                 question.number == number
                     && is_question_text_ready(&question.question_text)
                     && matches!(
@@ -376,9 +378,9 @@ pub fn evaluate_workflow_inner(
     Vec<WorkflowAction>,
     Option<String>,
 ) {
-    let exam_package_frozen = project
+    let scoped = project.written_scope_view();
+    let exam_package_frozen = scoped
         .exam_package_freeze
-        .as_ref()
         .is_some_and(|freeze| freeze.freeze_status == ExamPackageFreezeStatus::Frozen);
 
     let mut blocking_reasons = Vec::new();
@@ -462,12 +464,12 @@ pub fn evaluate_workflow_inner(
         .questions
         .iter()
         .any(|q| q.question_text.status == TextFieldStatus::Suggested);
-    let any_question_text_missing = project.questions.iter().any(|q| {
+    let any_question_text_missing = scoped.questions.iter().any(|q| {
         q.question_text.status == TextFieldStatus::Missing
             || q.question_text.status == TextFieldStatus::Failed
     });
 
-    if project.questions.is_empty()
+    if scoped.questions.is_empty()
         || (any_question_text_missing && !any_question_text_suggested)
         || project
             .questions
@@ -584,7 +586,7 @@ pub fn evaluate_workflow_inner(
                     || question.rubric.status == RubricStatus::Legacy
                     || !validation.valid
             });
-    let any_rubric_pending_review = project.questions.iter().any(|question| {
+    let any_rubric_pending_review = scoped.questions.iter().any(|question| {
         matches!(
             question.rubric.status,
             RubricStatus::Suggested | RubricStatus::Imported | RubricStatus::Manual
@@ -764,7 +766,7 @@ pub fn evaluate_workflow_inner(
         );
     }
 
-    if all_rubrics_confirmed && !project.questions.is_empty() {
+    if all_rubrics_confirmed && !scoped.questions.is_empty() {
         let student_scan_docs = project
             .documents
             .iter()
@@ -820,7 +822,7 @@ pub fn evaluate_workflow_inner(
             );
         }
 
-        let has_submissions = !project.student_submissions.is_empty();
+        let has_submissions = !scoped.student_submissions.is_empty();
         let all_batches_have_submissions = project.student_scan_batches.is_empty()
             || project.student_scan_batches.iter().all(|batch| {
                 project
@@ -836,7 +838,7 @@ pub fn evaluate_workflow_inner(
             if pages_per_student > 0 {
                 total_pages.div_ceil(pages_per_student)
             } else {
-                project.student_submissions.len() as u32
+                scoped.student_submissions.len() as u32
             }
         } else {
             project
@@ -936,7 +938,7 @@ pub fn evaluate_workflow_inner(
                 Some(if expected_groups > 0 {
                     format!(
                         "Öğrenci gruplaması tamamlanabilir: {}/{} grup hazır.",
-                        project.student_submissions.len(),
+                        scoped.student_submissions.len(),
                         expected_groups
                     )
                 } else {
@@ -979,11 +981,12 @@ pub fn evaluate_workflow_inner(
             );
         }
 
-        let ocr_total = project.student_submissions.len() * project.questions.len();
-        let ocr_records = project.student_answer_ocr_records.len();
+        let ocr_total = scoped.student_submissions.len() * scoped.questions.len();
+        let active_ocr_records = scoped.student_answer_ocr_records.clone();
+        let ocr_records = active_ocr_records.len();
         let ocr_all_reviewed = ocr_total > 0
             && ocr_records == ocr_total
-            && project.student_answer_ocr_records.iter().all(|record| {
+            && active_ocr_records.iter().all(|record| {
                 matches!(
                     record.status,
                     crate::domain::student::StudentAnswerOcrStatus::TeacherApproved
@@ -1146,14 +1149,15 @@ pub fn evaluate_workflow_inner(
 }
 
 fn student_grouping_is_complete(project: &Project) -> bool {
+    let scoped = project.written_scope_view();
     if project.student_scan_batches.is_empty() {
         return project.student_grouping_complete_at.is_some()
-            && !project.student_submissions.is_empty();
+            && !scoped.student_submissions.is_empty();
     }
 
     project.student_scan_batches.iter().all(|batch| {
         batch.grouping_completed_at.is_some()
-            && project.student_submissions.iter().any(|submission| {
+            && scoped.student_submissions.iter().any(|submission| {
                 submission.scan_batch_id.as_deref() == Some(batch.id.as_str())
                     && !submission.page_numbers.is_empty()
             })
@@ -1285,6 +1289,7 @@ mod tests {
 
     fn empty_project() -> Project {
         Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "test".into(),
@@ -1376,6 +1381,7 @@ mod tests {
         });
 
         p.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1".into(),
             number: 1,
             max_score: 10.0,
@@ -1464,6 +1470,7 @@ mod tests {
             }),
         });
         project.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1".into(),
             number: 1,
             max_score: 0.0,
@@ -1521,6 +1528,7 @@ mod tests {
             }],
         }];
         project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            assessment_activity_id: None,
             exam_package_version: 1,
             freeze_status: ExamPackageFreezeStatus::Frozen,
             frozen_at: "now".into(),
@@ -1572,6 +1580,7 @@ mod tests {
         project.student_grouping_complete_at = Some("now".into());
         project.student_pages_per_student = Some(1);
         project.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".into(),
             student_id: "student-1".into(),
             document_id: "student_scan".into(),
@@ -1681,6 +1690,58 @@ mod tests {
     }
 
     #[test]
+    fn test_live_evaluation_recomputes_entire_snapshot_ignoring_persisted_cache() {
+        let mut project = question_text_and_rubric_ready_project();
+        // Persisted cache is fully corrupted across every snapshot field.
+        project.workflow = WorkflowSnapshot {
+            current_stage: WorkflowStage::ScoringDone,
+            current_stage_label: "bayat-etiket".to_string(),
+            blocking_reasons: vec![BlockingReason::StudentScanNotFound],
+            next_actions: vec![WorkflowAction {
+                code: "stale_action".to_string(),
+                label: "bayat-aksiyon".to_string(),
+                enabled: true,
+                disabled_reason: None,
+                command: Some("stale_command".to_string()),
+                requires: None,
+            }],
+            summary: crate::domain::workflow::WorkflowSummary {
+                text: Some("bayat-ozet".to_string()),
+                ..Default::default()
+            },
+        };
+        let snap = evaluate_workflow(&project);
+        assert_eq!(
+            snap.current_stage,
+            WorkflowStage::QepReady,
+            "persisted cache stage must never override live evaluation"
+        );
+        assert_eq!(
+            snap.current_stage_label, "QEP Hazır",
+            "label must be recomputed from the live stage, not the cache"
+        );
+        assert!(
+            !snap
+                .blocking_reasons
+                .iter()
+                .any(|r| matches!(r, BlockingReason::StudentScanNotFound)),
+            "persisted cache blocking reasons must not leak into the live snapshot"
+        );
+        assert!(
+            !snap
+                .next_actions
+                .iter()
+                .any(|action| action.code == "stale_action"),
+            "persisted cache next actions must not leak into the live snapshot"
+        );
+        assert_ne!(
+            snap.summary.text.as_deref(),
+            Some("bayat-ozet"),
+            "persisted cache summary text must not leak into the live snapshot"
+        );
+    }
+
+    #[test]
     fn test_frozen_exam_package_advances_through_student_intake() {
         let mut with_preview_missing = frozen_ready_project();
         with_preview_missing.documents.push(Document {
@@ -1764,6 +1825,7 @@ mod tests {
             identity_ocr: None,
         });
         ready_for_ocr.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".into(),
             student_id: "student-1".into(),
             document_id: "scan".into(),
@@ -1885,6 +1947,7 @@ mod tests {
         };
         p.students.push(student.clone());
         p.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".into(),
             student_id: student.id.clone(),
             document_id: "scan".into(),
@@ -1957,6 +2020,7 @@ mod tests {
         p.student_scan_document_id = Some("scan".into());
         p.student_pages_per_student = Some(2);
         p.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".into(),
             student_id: "student-1".into(),
             document_id: "scan".into(),
@@ -2109,6 +2173,7 @@ mod tests {
             }),
         });
         project.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1".into(),
             number: 1,
             max_score: 10.0,
@@ -2326,6 +2391,7 @@ mod tests {
             }),
         });
         p.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1".into(),
             number: 1,
             max_score: 10.0,
@@ -2403,6 +2469,7 @@ mod tests {
             preview: None,
         });
         project.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1".into(),
             number: 1,
             max_score: 0.0,

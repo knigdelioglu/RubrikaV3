@@ -239,7 +239,8 @@ pub fn run() {
                     model_runtime_service.clone(),
                     job_manager.clone(),
                     speaking_engine.clone(),
-                ),
+                )
+                .with_audit_service(audit_service.clone()),
                 analysis_service: AnalysisService::new(
                     project_store.clone(),
                     model_gateway.clone(),
@@ -387,6 +388,7 @@ pub fn run() {
             commands::assessment_organization_commands::get_class_application_students,
             commands::assessment_organization_commands::update_assessment_activity,
             commands::assessment_organization_commands::remove_assessment_class_application,
+            commands::assessment_organization_commands::set_active_written_activity,
             commands::performance_commands::create_performance_task,
             commands::performance_commands::update_performance_task,
             commands::performance_commands::list_performance_tasks,

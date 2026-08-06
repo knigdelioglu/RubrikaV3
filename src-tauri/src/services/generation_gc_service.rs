@@ -449,6 +449,7 @@ mod tests {
         created_at: chrono::DateTime<chrono::Utc>,
     ) -> OcrGeneration {
         OcrGeneration {
+            assessment_activity_id: None,
             generation_id: id.to_string(),
             submission_id: submission.to_string(),
             source_fingerprint: "fp".to_string(),
@@ -632,6 +633,7 @@ mod tests {
 
     fn sample_ocr_record(id: &str) -> crate::domain::student::StudentAnswerOcrRecord {
         crate::domain::student::StudentAnswerOcrRecord {
+            assessment_activity_id: None,
             id: id.to_string(),
             submission_id: "s1".to_string(),
             question_id: "q1".to_string(),

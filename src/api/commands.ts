@@ -530,6 +530,13 @@ export const commands = {
       handleInvokeError(e);
     }
   },
+  setActiveWrittenActivity: async (input: { projectId: string; activityId: string }): Promise<AssessmentActivity> => {
+    try {
+      return await invoke<AssessmentActivity>('set_active_written_activity', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
   updateAssessmentActivity: async (input: { projectId: string; activityId: string; title?: string; speakingConfiguration?: SpeakingConfigurationSnapshot; status?: AssessmentStatus }): Promise<AssessmentActivity> => {
     try {
       return await invoke<AssessmentActivity>('update_assessment_activity', { input });

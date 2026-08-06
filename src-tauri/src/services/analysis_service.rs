@@ -233,6 +233,7 @@ impl AnalysisService {
                     max_tokens: 900,
                 },
                 None,
+                None,
             );
             let report_result = self
                 .model_gateway

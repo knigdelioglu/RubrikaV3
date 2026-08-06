@@ -468,6 +468,7 @@ mod tests {
     fn scoring_record() -> ScoringRecord {
         let now = chrono::Utc::now();
         ScoringRecord {
+            assessment_activity_id: None,
             id: "record-1".to_string(),
             run_id: "run-1".to_string(),
             submission_id: "submission-1".to_string(),
@@ -519,6 +520,7 @@ mod tests {
 
     fn submission() -> StudentSubmission {
         StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".to_string(),
             student_id: "student-1".to_string(),
             document_id: "document-1".to_string(),

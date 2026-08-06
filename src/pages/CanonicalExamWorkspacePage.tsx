@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { Volume2 } from 'lucide-react';
@@ -8,7 +8,6 @@ import { CanonicalExamWorkspaceHeader } from '../components/workspace/CanonicalE
 import { getExamStepDefinitions, resolveNextExamStep } from '../app/examWorkspace';
 import { ProjectContextState } from '../components/common/ProjectContextState';
 import { useProjectContext } from '../state/useProjectContext';
-
 import { ExamPackageWorkspacePage } from './ExamPackageWorkspacePage';
 import { StudentOperationsWorkspacePage } from './StudentOperationsWorkspacePage';
 import { StudentAnswerOcrPage } from './StudentAnswerOcrPage';
@@ -125,6 +124,16 @@ export function CanonicalExamWorkspacePage() {
   const activity = activityQuery.data;
   const workflow = workflowQuery.data;
   const performanceStatus = performanceStatusQuery.data ?? null;
+
+  // TD-01: entering a written/listening workspace selects it as the
+  // backend-authoritative written scope so the project-level written
+  // collections are isolated per activity.
+  const isWrittenFamily =
+    activity?.assessmentType === 'written' || activity?.assessmentType === 'listening';
+  useEffect(() => {
+    if (!projectId || !activityId || !isWrittenFamily) return;
+    void commands.setActiveWrittenActivity({ projectId, activityId });
+  }, [projectId, activityId, isWrittenFamily]);
 
   // Stale class state cleanup helper
   const handleSelectClassApp = (newAppId: string) => {

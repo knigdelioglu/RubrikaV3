@@ -79,6 +79,9 @@ pub struct AppError {
 | `STUDENT_SUBMISSION_NOT_FOUND` | Student submission could not be found | "Öğrenci submission'ı bulunamadı." |
 | `STUDENT_IDENTITY_INVALID` | Student identity is incomplete or invalid | "Öğrenci kimliği geçersiz." |
 | `OCR_NOT_READY` | OCR cannot start yet | "OCR hazırlığı tamam değil." |
+| `MIGRATION_AMBIGUOUS_ASSESSMENT_SCOPE` | TD-01 migration could not decide which written activity owns legacy flat written data | "Projedeki yazılı sınav verileri birden fazla yazılı sınava ait olabilir; hangisine ait olduğu belirlenemedi. Rubrika veri kaybına yol açacak tahmin yapmaz." |
+| `WRITTEN_SCOPE_AMBIGUOUS` | Written-family operation needs one active written activity but several exist without a pointer | "Bu projede birden fazla yazılı sınav var; çalışma alanı seçilmedi. Yazılı sınav çalışma alanına girip işlemi tekrar deneyin." |
+| `ACTIVE_WRITTEN_ACTIVITY_NOT_FOUND` | Active written pointer references a missing/non-written activity | "Aktif yazılı sınav çalışma alanı bulunamadı. Sınavı tekrar seçin." |
 | `PERMISSION_DENIED` | File system permission error | "Dosya erişim izni reddedildi." |
 | `UNKNOWN_ERROR` | Fallback catch-all | "Bilinmeyen bir hata oluştu." |
 

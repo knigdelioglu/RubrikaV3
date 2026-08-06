@@ -17,7 +17,7 @@ use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{
     AnalysisReportRequest, AnalysisReportResult, ExtractedQuestionCandidate,
     ExtractedRubricCandidate, ModelDiagnostics, ModelProvenance, ModelRequestKind,
-    ModelRequestPayloadSummary, ModelResponseFormat, ModelStatus, PrivacyMode, PromptContract,
+    ModelRequestPayloadSummary, ModelStatus, PrivacyMode, PromptContract,
     QuestionTextExtractionOutput, QuestionTextExtractionRequest, QuestionTextExtractionResult,
     RubricExtractionOutput, RubricExtractionRequest, RubricExtractionResult, ScoringCriterionScore,
     ScoringOutput, ScoringRequest, ScoringResult, SemanticCriterionDecision,
@@ -36,7 +36,7 @@ use crate::domain::student::{
 use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_gateway::ModelGateway;
 use crate::services::prompt_contract::{
-    invocation_metadata, legacy_prompt_contract_with_data, response_format_value, user_data_message,
+    invocation_metadata, response_format_value, user_data_message,
 };
 
 const QUESTION_TEXT_MAX_TOKENS: u32 = 4096;
@@ -64,18 +64,18 @@ const IDLE_CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 fn request_contract(
     provided: Option<PromptContract>,
     use_case: ModelRequestKind,
-    prompt: &str,
-    user_data: serde_json::Value,
-    max_tokens: u32,
-    response_format: Option<ModelResponseFormat>,
-) -> PromptContract {
-    provided.unwrap_or_else(|| {
-        legacy_prompt_contract_with_data(
-            use_case.clone(),
-            prompt,
-            user_data,
-            max_tokens,
-            response_format,
+) -> Result<PromptContract, AppError> {
+    provided.ok_or_else(|| {
+        app_error(
+            AppErrorCode::ModelPromptContractMissing,
+            "Model isteği için prompt kontratı yok; legacy fallback kaldırıldı.",
+            Some(format!(
+                "request_contract called without a prompt contract; use_case={use_case:?}"
+            )),
+            Some(
+                "Çağrıyı gönderen servis sürümü güncellenmeli; kontrat zorunlu hale getirildi."
+                    .to_string(),
+            ),
         )
     })
 }
@@ -573,15 +573,7 @@ impl ModelGateway for LlamaServerGateway {
         let contract = request_contract(
             input.prompt_contract.clone(),
             ModelRequestKind::QuestionText,
-            &input.prompt,
-            json!({
-                "targetQuestionNumber": input.target_question_number,
-                "pageIndex": input.page_index,
-                "pageCount": input.page_count,
-            }),
-            QUESTION_TEXT_MAX_TOKENS,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        )?;
 
         let request_body = json!({
             "model": "gemma",
@@ -682,22 +674,8 @@ impl ModelGateway for LlamaServerGateway {
             ));
         }
 
-        let contract = request_contract(
-            input.prompt_contract.clone(),
-            ModelRequestKind::RubricDraft,
-            &input.prompt,
-            json!({
-                "rawText": input.raw_text,
-                "targetQuestionNumber": input.target_question_number,
-                "strictJsonOnly": input.strict_json_only,
-                "attempt": input.attempt,
-            }),
-            RUBRIC_MAX_TOKENS,
-            Some(ModelResponseFormat::JsonSchema {
-                name: "rubric_extraction_suggestion".to_string(),
-                schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
-            }),
-        );
+        let contract =
+            request_contract(input.prompt_contract.clone(), ModelRequestKind::RubricDraft)?;
         let prompt = contract.system_policy.clone();
 
         let messages = if input.raw_text.is_some() {
@@ -863,6 +841,7 @@ impl ModelGateway for LlamaServerGateway {
                 error_code: None,
                 provenance: Some(ModelProvenance::from_invocation(&contract.invocation)),
             },
+            retry_metadata: None,
         })
     }
 
@@ -890,27 +869,7 @@ impl ModelGateway for LlamaServerGateway {
         )?;
 
         let review_policy = default_ocr_review_policy();
-        let contract = request_contract(
-            input.prompt_contract.clone(),
-            ModelRequestKind::Ocr,
-            &input.prompt,
-            json!({
-                "submissionId": input.submission_id,
-                "questionId": input.question_id,
-                "questionNumber": input.question_number,
-                "questionText": input.question_text,
-                "answerType": input.answer_type,
-                "preprocessMode": preprocess_mode,
-                "preprocessVersion": preprocess_version,
-                "modelInputCropRef": model_input_crop_ref,
-                "sourcePageNumbers": input.source_page_numbers,
-                "regionIds": input.region_ids,
-                "regionOrders": input.region_orders,
-                "regionPageOffsets": input.region_page_offsets,
-            }),
-            STUDENT_ANSWER_OCR_MAX_TOKENS,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        let contract = request_contract(input.prompt_contract.clone(), ModelRequestKind::Ocr)?;
 
         let request_body = json!({
             "model": "gemma",
@@ -1066,20 +1025,7 @@ impl ModelGateway for LlamaServerGateway {
         let contract = request_contract(
             input.prompt_contract.clone(),
             ModelRequestKind::OcrIssueCorrection,
-            &input.prompt,
-            json!({
-                "observedText": input.observed_text,
-                "highlightRegion": input.highlight_region,
-                "modelInputCropRef": input.model_input_crop_ref,
-                "sourceImageRef": input.source_image_ref,
-                "imageQuality": {
-                    "hasHighlightRegion": input.highlight_region.is_some(),
-                    "imageCount": input.model_input_images.len(),
-                },
-            }),
-            STUDENT_ANSWER_OCR_ISSUE_CORRECTION_MAX_TOKENS,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        )?;
         let request_body = json!({
             "model": "gemma",
             "messages": [
@@ -1219,20 +1165,7 @@ impl ModelGateway for LlamaServerGateway {
             None,
             "Öğrenci kimlik crop görseli okunamadı.",
         )?;
-        let contract = request_contract(
-            input.prompt_contract.clone(),
-            ModelRequestKind::Ocr,
-            &input.prompt,
-            json!({
-                "submissionId": input.submission_id,
-                "preprocessMode": preprocess_mode,
-                "preprocessVersion": preprocess_version,
-                "modelInputCropRef": model_input_crop_ref,
-                "sourcePageNumbers": input.source_page_numbers,
-            }),
-            STUDENT_IDENTITY_OCR_MAX_TOKENS,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        let contract = request_contract(input.prompt_contract.clone(), ModelRequestKind::Ocr)?;
         let request_body = json!({
             "model": "gemma",
             "messages": [
@@ -1350,14 +1283,7 @@ impl ModelGateway for LlamaServerGateway {
         let contract = request_contract(
             input.prompt_contract.clone(),
             ModelRequestKind::SpeakingTranscriptCleanup,
-            &input.prompt,
-            json!({
-                "rawTranscript": input.raw_transcript,
-                "segments": input.segments,
-            }),
-            input.max_tokens,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        )?;
         let request_body = json!({
             "model": "gemma-4-12b",
             "messages": [
@@ -1441,14 +1367,7 @@ impl ModelGateway for LlamaServerGateway {
         let contract = request_contract(
             input.prompt_contract.clone(),
             ModelRequestKind::AnalysisReport,
-            &input.prompt,
-            json!({ "analysisData": input.prompt }),
-            900,
-            Some(ModelResponseFormat::JsonSchema {
-                name: "analysis_report_v1".to_string(),
-                schema: analysis_report_json_schema(),
-            }),
-        );
+        )?;
         let request_body = json!({
             "model": "gemma-4-12b",
             "messages": [
@@ -1523,34 +1442,7 @@ impl ModelGateway for LlamaServerGateway {
 
         let max_tokens = if speaking_request { 3072 } else { 2048 };
         let timeout_seconds = if speaking_request { 300 } else { 600 };
-        let contract = request_contract(
-            input.prompt_contract.clone(),
-            ModelRequestKind::Scoring,
-            &input.prompt,
-            json!({
-                "submissionId": input.submission_id,
-                "questionId": input.question_id,
-                "questionNumber": input.question_number,
-                "studentDisplayName": input.student_display_name,
-                "studentNumber": input.student_number,
-                "studentClassName": input.student_class_name,
-                "questionText": input.question_text,
-                "expectedAnswer": input.expected_answer,
-                "answerType": input.answer_type,
-                "answerText": input.answer_text,
-                "rubric": input.rubric_json,
-                "criterionScoresSeed": input.criterion_scores_seed,
-                "partialCreditHints": input.partial_credit_hints,
-                "zeroScoreConditions": input.zero_score_conditions,
-                "commonMistakes": input.common_mistakes,
-                "maxScore": input.max_score,
-                "sourceHash": input.source_hash,
-                "packageHash": input.package_hash,
-                "ocrRecordHash": input.ocr_record_hash,
-            }),
-            max_tokens,
-            Some(ModelResponseFormat::JsonObject),
-        );
+        let contract = request_contract(input.prompt_contract.clone(), ModelRequestKind::Scoring)?;
         let request_body = build_scoring_request_body(&contract);
 
         let (http_status, response_body, duration_ms) = self
@@ -1728,7 +1620,7 @@ fn extract_reasoning_length(body_text: &str) -> Option<u32> {
     Some(after_start[..end].chars().count() as u32)
 }
 
-fn strip_reasoning_and_fences(text: &str) -> String {
+pub(crate) fn strip_reasoning_and_fences(text: &str) -> String {
     let without_think = remove_think_blocks(text);
     let trimmed = without_think.trim();
 
@@ -2113,6 +2005,7 @@ fn parse_speaking_transcript_cleanup_output(
     ))
 }
 
+#[cfg(test)]
 fn analysis_report_json_schema() -> serde_json::Value {
     json!({
         "type": "object",
@@ -2280,6 +2173,17 @@ fn rubric_artifact_dir(
             request.attempt.max(1)
         ),
     )
+}
+
+/// Reads the persisted raw response of the given rubric attempt, if it exists.
+///
+/// The gateway writes `response_raw.txt` before returning a parse error, so
+/// callers (TD-20 repair chain) can recover the malformed model text without
+/// resending the images.
+pub(crate) fn read_saved_rubric_raw_response(request: &RubricExtractionRequest) -> Option<String> {
+    let dir = rubric_artifact_dir(request).ok()??;
+    let raw_path = dir.join("response_raw.txt");
+    std::fs::read_to_string(raw_path).ok()
 }
 
 fn save_rubric_import_artifacts(
@@ -2611,18 +2515,7 @@ fn parse_rubric_model_response(
     let value: serde_json::Value = match serde_json::from_str(&candidate) {
         Ok(value) => value,
         Err(error) => {
-            if let Some(payload) = parse_partial_rubric_questions(&candidate) {
-                return Ok(payload);
-            }
-            return Err(app_error(
-                AppErrorCode::RubricJsonParseFailed,
-                "Rubrik JSON çıktısı çözülemedi.",
-                Some(format!(
-                    "JSON Parse Error: {}\nCandidate: {}\nRaw output received: {}",
-                    error, candidate, raw
-                )),
-                Some("Model çıktısını strict JSON olarak tekrar isteyin.".to_string()),
-            ));
+            return rubric_json_parse_failed(&candidate, raw, error);
         }
     };
 
@@ -2657,7 +2550,17 @@ fn parse_rubric_model_response(
 
     let mut questions = Vec::new();
     for item in items {
-        questions.push(parse_rubric_question_item(item, &[])?);
+        match parse_rubric_question_item(item, &[]) {
+            Ok(question) => questions.push(question),
+            // TD-20: a single malformed item must not discard the whole
+            // response; salvage the valid questions deterministically.
+            Err(item_error) => {
+                if let Some(payload) = parse_partial_rubric_questions(&candidate) {
+                    return Ok(payload);
+                }
+                return Err(item_error);
+            }
+        }
     }
 
     if questions.is_empty() {
@@ -2670,6 +2573,26 @@ fn parse_rubric_model_response(
     }
 
     Ok(crate::domain::model::RubricImportPayload { questions })
+}
+
+fn rubric_json_parse_failed(
+    candidate: &str,
+    raw: &str,
+    error: serde_json::Error,
+) -> Result<crate::domain::model::RubricImportPayload, AppError> {
+    // Deterministic salvage of a truncated/malformed JSON array.
+    if let Some(payload) = parse_partial_rubric_questions(candidate) {
+        return Ok(payload);
+    }
+    Err(app_error(
+        AppErrorCode::RubricJsonParseFailed,
+        "Rubrik JSON çıktısı çözülemedi.",
+        Some(format!(
+            "JSON Parse Error: {}\nCandidate: {}\nRaw output received: {}",
+            error, candidate, raw
+        )),
+        Some("Model çıktısını strict JSON olarak tekrar isteyin.".to_string()),
+    ))
 }
 
 struct StudentAnswerOcrParseOutcome {
@@ -3699,7 +3622,9 @@ fn rubric_string_array(
         .unwrap_or_default()
 }
 
-fn parse_partial_rubric_questions(raw: &str) -> Option<crate::domain::model::RubricImportPayload> {
+pub(crate) fn parse_partial_rubric_questions(
+    raw: &str,
+) -> Option<crate::domain::model::RubricImportPayload> {
     let questions_key = raw.find("\"questions\"")?;
     let array_start = raw[questions_key..].find('[')? + questions_key;
     let mut questions = Vec::new();
@@ -3763,7 +3688,7 @@ fn parse_partial_rubric_questions(raw: &str) -> Option<crate::domain::model::Rub
     }
 }
 
-fn rubric_payload_to_output(
+pub(crate) fn rubric_payload_to_output(
     payload: crate::domain::model::RubricImportPayload,
 ) -> RubricExtractionOutput {
     let questions = payload
@@ -4565,18 +4490,23 @@ fn semantic_scoring_schema_error(value: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::model::ModelResponseFormat;
 
     #[test]
     fn speaking_scoring_request_is_text_only() {
-        let contract = legacy_prompt_contract_with_data(
+        let contract = crate::services::prompt_contract::build_prompt_contract(
             ModelRequestKind::Scoring,
+            "speaking_scoring_v5_typed_user_data",
+            "speaking_scoring_output_v1",
+            "speaking_scoring_policy_v1",
             "speaking policy",
             json!({
                 "answerType": "speaking",
                 "transcriptForScoring": "Öğrenci metni"
             }),
-            3072,
+            crate::services::prompt_contract::default_sampling(3072),
             Some(ModelResponseFormat::JsonObject),
+            None,
         );
         let body = build_scoring_request_body(&contract);
         let messages = body["messages"]
@@ -4585,6 +4515,16 @@ mod tests {
         assert!(messages[0]["content"].is_string());
         assert!(messages[1]["content"].is_string());
         assert!(!body.to_string().contains("image_url"));
+    }
+
+    #[test]
+    fn missing_prompt_contract_is_rejected_fail_closed() {
+        let error = request_contract(None, ModelRequestKind::Scoring)
+            .expect_err("missing prompt contract must be rejected");
+        assert_eq!(error.code, AppErrorCode::ModelPromptContractMissing);
+        assert!(error.message.contains("legacy"));
+        assert!(error.suggested_action.is_some());
+        assert!(error.technical_details.is_some());
     }
 
     #[test]

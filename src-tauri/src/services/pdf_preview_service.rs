@@ -1066,6 +1066,7 @@ mod tests {
     #[test]
     fn preview_dir_and_metadata_path_are_stable() {
         let project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "proj-1".to_string(),
@@ -1139,6 +1140,7 @@ mod tests {
     #[test]
     fn set_preview_state_updates_matching_document_and_answer_key_is_previewable() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "p".into(),

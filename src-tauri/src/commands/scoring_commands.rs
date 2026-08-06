@@ -3,6 +3,7 @@ use crate::domain::scoring::{ScoringAnchorDto, ScoringRecord, ScoringSummaryDto}
 use crate::services::scoring_service::StartScoringOutput;
 use crate::AppState;
 use tauri::State;
+use uuid::Uuid;
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,9 +61,10 @@ pub async fn start_scoring_job(
     input: StartScoringInput,
 ) -> Result<StartScoringOutput, AppError> {
     let project_id = input.project_id.clone();
+    let correlation_id = Uuid::new_v4().to_string();
     let output = state
         .scoring_service
-        .start(app, input.project_id, input.force_rerun)
+        .start(app, input.project_id, input.force_rerun, &correlation_id)
         .await?;
     super::audit_critical(
         &state,
@@ -70,7 +72,8 @@ pub async fn start_scoring_job(
         crate::services::audit_service::AuditEntryInput::new(
             "scoring_run_started",
             "Notlandırma işi başlatıldı.",
-        ),
+        )
+        .correlation(&correlation_id),
     )?;
     Ok(output)
 }
@@ -80,6 +83,7 @@ pub async fn update_scoring_record(
     state: State<'_, AppState>,
     input: UpdateScoringRecordInput,
 ) -> Result<ScoringRecord, AppError> {
+    let correlation_id = Uuid::new_v4().to_string();
     let record = state.scoring_service.update_scoring_record(
         &input.project_id,
         &input.record_id,
@@ -94,7 +98,8 @@ pub async fn update_scoring_record(
             "scoring_record_updated",
             "Notlandırma kaydı öğretmen tarafından güncellendi.",
         )
-        .entity("scoring_record", &input.record_id),
+        .entity("scoring_record", &input.record_id)
+        .correlation(&correlation_id),
     )?;
     Ok(record)
 }

@@ -104,6 +104,9 @@ pub struct ScoringAnchor {
     pub revoked_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_reason: Option<String>,
+    /// TD-01: owning written-family assessment activity. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 /// Teacher-facing read DTO. The canonical anchor remains immutable apart from
@@ -336,10 +339,13 @@ pub struct ScoringRecord {
     pub invalidation_reason: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// TD-01: owning written-family assessment activity. Additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 fn default_scoring_applied() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -429,16 +435,16 @@ pub fn scoring_record_hash(record: &StudentAnswerOcrRecord) -> String {
 }
 
 pub fn scoring_source_hash(project: &Project) -> String {
-    project
-        .exam_package_freeze
-        .as_ref()
+    let view = project.written_scope_view();
+    view.exam_package_freeze
         .map(|freeze| freeze.source_hash.clone())
         .unwrap_or_else(|| stable_hash(&[&project.id, &project.root_path]))
 }
 
 pub fn scoring_question_text_hash(project: &Project) -> String {
+    let view = project.written_scope_view();
     stable_hash(
-        &project
+        &view
             .questions
             .iter()
             .flat_map(|question| {
@@ -458,8 +464,9 @@ pub fn scoring_question_text_hash(project: &Project) -> String {
 }
 
 pub fn scoring_rubric_hash(project: &Project) -> String {
+    let view = project.written_scope_view();
     stable_hash(
-        &project
+        &view
             .questions
             .iter()
             .flat_map(|question| {
@@ -517,7 +524,8 @@ pub fn scoring_package_hash(project: &Project) -> String {
         ));
     }
 
-    for submission in &project.student_submissions {
+    let view = project.written_scope_view();
+    for submission in &view.student_submissions {
         parts.push(format!(
             "{}:{}:{}:{:?}:{:?}",
             submission.id,
@@ -528,7 +536,7 @@ pub fn scoring_package_hash(project: &Project) -> String {
         ));
     }
 
-    for record in &project.student_answer_ocr_records {
+    for record in &view.student_answer_ocr_records {
         parts.push(format!(
             "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             record.submission_id,
@@ -561,18 +569,18 @@ pub fn scoring_active_run_id(project: &Project) -> Option<String> {
         return Some(run_id.to_string());
     }
 
-    scoring_latest_run_id_from_records(&project.scoring_records)
+    scoring_latest_run_id_from_records(&project.written_scope_view().scoring_records)
 }
 
 pub fn scoring_active_records(project: &Project) -> Vec<&ScoringRecord> {
+    let scoped = project.written_scope_view().scoring_records;
     let records: Vec<&ScoringRecord> = if let Some(run_id) = scoring_active_run_id(project) {
-        project
-            .scoring_records
-            .iter()
+        scoped
+            .into_iter()
             .filter(|record| record.run_id == run_id)
             .collect()
     } else {
-        project.scoring_records.iter().collect()
+        scoped
     };
 
     dedupe_scoring_records(records)
@@ -583,12 +591,12 @@ pub fn scoring_active_record_count(project: &Project) -> usize {
 }
 
 pub fn scoring_total_history_count(project: &Project) -> usize {
-    project.scoring_records.len()
+    project.written_scope_view().scoring_records.len()
 }
 
 pub fn scoring_duplicate_result_count(project: &Project) -> usize {
     let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for record in &project.scoring_records {
+    for record in &project.written_scope_view().scoring_records {
         *counts
             .entry((record.submission_id.clone(), record.question_id.clone()))
             .or_insert(0) += 1;
@@ -601,7 +609,7 @@ pub fn scoring_duplicate_result_count(project: &Project) -> usize {
         .sum()
 }
 
-fn scoring_latest_run_id_from_records(records: &[ScoringRecord]) -> Option<String> {
+fn scoring_latest_run_id_from_records(records: &[&ScoringRecord]) -> Option<String> {
     let mut best: Option<&ScoringRecord> = None;
     for record in records {
         if record.run_id.trim().is_empty() {
@@ -652,7 +660,8 @@ fn scoring_record_is_newer(candidate: &ScoringRecord, current: &ScoringRecord) -
 }
 
 pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
-    let expected_records = project.student_submissions.len() * project.questions.len();
+    let view = project.written_scope_view();
+    let expected_records = view.student_submissions.len() * view.questions.len();
     let active_records = scoring_active_records(project);
     let scoring_record_count = active_records.len();
     let approved_record_count = active_records
@@ -683,17 +692,16 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
         .filter(|record| record.package_hash != package_hash)
         .count();
 
-    let freeze_ready = project
+    let freeze_ready = view
         .exam_package_freeze
-        .as_ref()
         .is_some_and(|freeze| freeze.freeze_status == ExamPackageFreezeStatus::Frozen);
-    let questions_ready = !project.questions.is_empty()
-        && project.questions.iter().all(|question| {
+    let questions_ready = !view.questions.is_empty()
+        && view.questions.iter().all(|question| {
             is_question_text_ready(&question.question_text)
                 && validate_rubric_state(&question.rubric, Some(&question.answer_type)).valid
         });
-    let students_ready = !project.student_submissions.is_empty()
-        && project
+    let students_ready = !view.student_submissions.is_empty()
+        && view
             .student_submissions
             .iter()
             .all(|submission| !submission.page_numbers.is_empty())
@@ -705,19 +713,18 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
     // Set-based OCR kapsamı (TD-11): count eşitliği yerine kartezyen ikili
     // kümesinin gerçek kayıtlarla örtüşmesi aranır. Tekrarlı çift readiness'i
     // bloke eder; eksik çiftler structured olarak döner.
-    let expected_pairs: HashSet<(String, String)> = project
+    let expected_pairs: HashSet<(String, String)> = view
         .student_submissions
         .iter()
         .flat_map(|submission| {
-            project
-                .questions
+            view.questions
                 .iter()
                 .map(move |question| (submission.id.clone(), question.id.clone()))
         })
         .collect();
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
     let mut duplicate_pair_count = 0usize;
-    for record in &project.student_answer_ocr_records {
+    for record in &view.student_answer_ocr_records {
         let pair = (record.submission_id.clone(), record.question_id.clone());
         if !seen_pairs.insert(pair) {
             duplicate_pair_count += 1;
@@ -731,7 +738,7 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
     missing_pairs.sort();
 
     let ocr_pair_coverage_complete = duplicate_pair_count == 0 && missing_pairs.is_empty();
-    let ocr_status_ready = project.student_answer_ocr_records.iter().all(|record| {
+    let ocr_status_ready = view.student_answer_ocr_records.iter().all(|record| {
         record.status == super::student::StudentAnswerOcrStatus::TeacherApproved
             && !record.needs_review
     });
@@ -742,21 +749,21 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
         blockers.push("QEP_NOT_FROZEN".to_string());
     }
     if !questions_ready {
-        if project
+        if view
             .questions
             .iter()
             .any(|question| !is_question_text_ready(&question.question_text))
         {
             blockers.push("QUESTION_TEXT_MISSING".to_string());
         }
-        if project.questions.iter().any(|question| {
+        if view.questions.iter().any(|question| {
             !validate_rubric_state(&question.rubric, Some(&question.answer_type)).valid
         }) {
             blockers.push("RUBRIC_NOT_READY".to_string());
         }
     }
     if !students_ready {
-        if project.student_submissions.is_empty() {
+        if view.student_submissions.is_empty() {
             blockers.push("STUDENT_GROUPING_NOT_READY".to_string());
         }
         if project.students.iter().any(student_identity_is_missing) {
@@ -767,10 +774,10 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
         if duplicate_pair_count > 0 {
             blockers.push("STUDENT_ANSWER_OCR_DUPLICATE_PAIRS".to_string());
         }
-        if !missing_pairs.is_empty() && !project.student_answer_ocr_records.is_empty() {
+        if !missing_pairs.is_empty() && !view.student_answer_ocr_records.is_empty() {
             blockers.push("STUDENT_ANSWER_OCR_MISSING_PAIRS".to_string());
         }
-        if project.student_answer_ocr_records.is_empty() || !ocr_status_ready {
+        if view.student_answer_ocr_records.is_empty() || !ocr_status_ready {
             blockers.push("STUDENT_ANSWER_OCR_NOT_READY".to_string());
         }
     }
@@ -901,10 +908,11 @@ fn scoring_summary_score(record: &ScoringRecord) -> Option<f32> {
 }
 
 pub fn scoring_summary(project: &Project) -> ScoringSummaryDto {
+    let view = project.written_scope_view();
     let active_records = scoring_active_records(project);
-    let mut submission_summaries = Vec::with_capacity(project.student_submissions.len());
+    let mut submission_summaries = Vec::with_capacity(view.student_submissions.len());
 
-    for submission in &project.student_submissions {
+    for submission in &view.student_submissions {
         let records: Vec<&ScoringRecord> = active_records
             .iter()
             .copied()
@@ -933,7 +941,7 @@ pub fn scoring_summary(project: &Project) -> ScoringSummaryDto {
                 .iter()
                 .filter_map(|record| scoring_summary_score(record))
                 .sum::<f32>();
-        let max_score = project
+        let max_score = view
             .questions
             .iter()
             .map(|question| {
@@ -944,7 +952,7 @@ pub fn scoring_summary(project: &Project) -> ScoringSummaryDto {
                     .max(0.0)
             })
             .sum::<f32>();
-        let expected_record_count = project.questions.len() as u32;
+        let expected_record_count = view.questions.len() as u32;
         let final_records: Vec<&ScoringRecord> = records
             .iter()
             .copied()
@@ -955,7 +963,7 @@ pub fn scoring_summary(project: &Project) -> ScoringSummaryDto {
             .filter_map(|record| scoring_summary_score(record))
             .sum::<f32>();
         let is_complete = expected_record_count > 0
-            && project.questions.iter().all(|question| {
+            && view.questions.iter().all(|question| {
                 final_records.iter().any(|record| {
                     record.question_id == question.id && scoring_summary_score(record).is_some()
                 })
@@ -1180,6 +1188,7 @@ mod tests {
 
     fn base_project() -> Project {
         Project {
+            active_written_assessment_activity_id: None,
             id: "project-1".into(),
             name: "Project".into(),
             created_at: "now".into(),
@@ -1203,6 +1212,7 @@ mod tests {
             assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![StudentSubmission {
+                assessment_activity_id: None,
                 id: "submission-1".into(),
                 student_id: "student-1".into(),
                 document_id: "doc-1".into(),
@@ -1257,6 +1267,7 @@ mod tests {
             student_grouping_complete_at: Some("now".into()),
             expected_question_count: Some(1),
             exam_package_freeze: Some(ExamPackageFreeze {
+                assessment_activity_id: None,
                 exam_package_version: 1,
                 freeze_status: ExamPackageFreezeStatus::Frozen,
                 frozen_at: "now".into(),
@@ -1287,6 +1298,7 @@ mod tests {
                 }),
             }],
             questions: vec![Question {
+                assessment_activity_id: None,
                 id: "q-1".into(),
                 number: 1,
                 max_score: 10.0,
@@ -1397,6 +1409,7 @@ mod tests {
         let mut project = base_project();
         let now = chrono::Utc::now();
         project.scoring_records = vec![ScoringRecord {
+            assessment_activity_id: None,
             id: "record-1".into(),
             run_id: "run-1".into(),
             submission_id: "submission-1".into(),
@@ -1508,6 +1521,7 @@ mod tests {
     fn scoring_record_currentness_detects_stale_record() {
         let project = base_project();
         let mut record = ScoringRecord {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             run_id: "run-1".into(),
             submission_id: "submission-1".into(),
@@ -1566,6 +1580,7 @@ mod tests {
     fn proof_38_scoring_rerun_preserves_teacher_override() {
         let project = base_project();
         let mut record = ScoringRecord {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             run_id: "run-1".into(),
             submission_id: "submission-1".into(),
@@ -1625,6 +1640,7 @@ mod tests {
         let now = chrono::Utc::now();
         project.scoring_records = vec![
             ScoringRecord {
+                assessment_activity_id: None,
                 id: "old-1".into(),
                 run_id: "run-old".into(),
                 submission_id: "submission-1".into(),
@@ -1673,6 +1689,7 @@ mod tests {
                 updated_at: now - chrono::Duration::minutes(2),
             },
             ScoringRecord {
+                assessment_activity_id: None,
                 id: "new-1".into(),
                 run_id: "run-new".into(),
                 submission_id: "submission-1".into(),
@@ -1734,6 +1751,7 @@ mod tests {
         let mut project = base_project();
         project.latest_scoring_run_id = Some("run-new".into());
         project.scoring_records = vec![ScoringRecord {
+            assessment_activity_id: None,
             id: "old-1".into(),
             run_id: "run-old".into(),
             submission_id: "submission-1".into(),
@@ -1793,6 +1811,7 @@ mod tests {
         let now = chrono::Utc::now();
         project.scoring_records = vec![
             ScoringRecord {
+                assessment_activity_id: None,
                 id: "legacy-1".into(),
                 run_id: String::new(),
                 submission_id: "submission-1".into(),
@@ -1841,6 +1860,7 @@ mod tests {
                 updated_at: now - chrono::Duration::minutes(2),
             },
             ScoringRecord {
+                assessment_activity_id: None,
                 id: "new-1".into(),
                 run_id: "run-new".into(),
                 submission_id: "submission-1".into(),
@@ -2052,5 +2072,26 @@ mod tests {
         assert!(readiness.ready, "full pair coverage must be ready");
         assert!(readiness.missing_pairs.is_empty());
         assert_eq!(readiness.expected_records, 4);
+    }
+
+    #[test]
+    fn scoring_readiness_does_not_report_vacuous_ready_for_empty_sets() {
+        // Empty question/submission sets must never produce a vacuous `.all()`
+        // ready: expected_records is 0 and readiness must stay blocked.
+        let mut project = base_project();
+        project.questions.clear();
+        project.student_submissions.clear();
+        project.student_answer_ocr_records.clear();
+        let readiness = scoring_readiness(&project);
+        assert!(!readiness.ready, "empty sets must not be vacuously ready");
+        assert_eq!(readiness.expected_records, 0);
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "STUDENT_GROUPING_NOT_READY"));
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "STUDENT_ANSWER_OCR_NOT_READY"));
     }
 }

@@ -119,6 +119,84 @@ test('written step status marks student intake ready when exam package is frozen
   assert.equal(studentsState?.status, 'ready');
 });
 
+function listeningActivity(): AssessmentActivity {
+  return {
+    ...baseActivity,
+    id: 'activity_listen',
+    assessmentType: 'listening',
+    workflowFamily: 'listening',
+    listeningDetails: {
+      audioDocumentId: 'audio_1',
+      playCount: 2,
+      durationSeconds: 300,
+      instruction: 'İki kez dinletin.',
+    },
+  };
+}
+
+test('listening questions step consumes backend examPackageFreeze readiness', () => {
+  const notFrozenSnapshot: WorkflowSnapshot = {
+    ...defaultWorkflowSnapshot,
+    currentStage: 'question_text_missing',
+    summary: {
+      steps: [],
+      readiness: {
+        examPackageFreeze: false,
+        studentIntake: false,
+        scoring: false,
+      },
+    },
+  };
+  const blockedStates = deriveExamStepStatuses(listeningActivity(), notFrozenSnapshot);
+  assert.equal(
+    blockedStates.find((s) => s.definition.id === 'questions')?.status,
+    'ready',
+    'unfrozen backend readiness must keep the questions step open',
+  );
+
+  const frozenSnapshot: WorkflowSnapshot = {
+    ...defaultWorkflowSnapshot,
+    currentStage: 'qep_frozen',
+    summary: {
+      steps: [],
+      readiness: {
+        examPackageFreeze: true,
+        studentIntake: false,
+        scoring: false,
+      },
+    },
+  };
+  const frozenStates = deriveExamStepStatuses(listeningActivity(), frozenSnapshot);
+  assert.equal(
+    frozenStates.find((s) => s.definition.id === 'questions')?.status,
+    'completed',
+    'questions step must complete only from backend examPackageFreeze readiness',
+  );
+  const studentsState = frozenStates.find((s) => s.definition.id === 'students');
+  assert.equal(studentsState?.status, 'ready');
+});
+
+test('listening students step consumes backend studentIntake readiness', () => {
+  const intakeSnapshot: WorkflowSnapshot = {
+    ...defaultWorkflowSnapshot,
+    currentStage: 'student_answer_ocr_ready_for_scoring',
+    summary: {
+      steps: [],
+      readiness: {
+        examPackageFreeze: true,
+        studentIntake: true,
+        scoring: false,
+      },
+    },
+  };
+  const states = deriveExamStepStatuses(listeningActivity(), intakeSnapshot);
+  assert.equal(
+    states.find((s) => s.definition.id === 'students')?.status,
+    'completed',
+    'students step must complete only from backend studentIntake readiness',
+  );
+});
+
 test('speaking step status marks transcript blocked until task text is set', () => {
   const speakingActivity: AssessmentActivity = {
     ...baseActivity,

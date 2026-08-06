@@ -130,7 +130,6 @@ export function DocumentsPage({ hideHeader = false }: { hideHeader?: boolean } =
     queryKey: ['jobs', projectId],
     queryFn: () => commands.listJobs(projectId),
     enabled: !!projectId,
-    refetchInterval: (query) => query.state.data?.some(isActiveJob) ? 1000 : false,
   });
   const activePreviewJobs = (jobsQuery.data ?? []).filter(
     (job) => job.kind === 'pdf_preview_render' && isActiveJob(job),

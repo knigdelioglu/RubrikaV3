@@ -1,0 +1,162 @@
+{
+  "schema_version": "rubrika.synthetic.rubric.v1",
+  "exam_id": "tymm_tde_001",
+  "title": "9. Sınıf TDE - Metin Tahlili ve Dil Becerileri",
+  "max_score": 100,
+  "questions": [
+    {
+      "question_id": "q1",
+      "number": 1,
+      "answer_type": "open_ended",
+      "max_points": 20,
+      "criteria": [
+        {
+          "id": "q1_c1",
+          "label": "Temel çatışmayı belirleme",
+          "max_points": 8,
+          "levels": [
+            {
+              "id": "none",
+              "points": 0
+            },
+            {
+              "id": "partial",
+              "points": 4
+            },
+            {
+              "id": "complete",
+              "points": 8
+            }
+          ]
+        },
+        {
+          "id": "q1_c2",
+          "label": "Metinsel kanıt",
+          "max_points": 8,
+          "levels": [
+            {
+              "id": "none",
+              "points": 0
+            },
+            {
+              "id": "one_evidence",
+              "points": 4
+            },
+            {
+              "id": "two_evidence",
+              "points": 8
+            }
+          ]
+        },
+        {
+          "id": "q1_c3",
+          "label": "Açıklık ve gerekçelendirme",
+          "max_points": 4,
+          "levels": [
+            {
+              "id": "limited",
+              "points": 1
+            },
+            {
+              "id": "partial",
+              "points": 3
+            },
+            {
+              "id": "complete",
+              "points": 4
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "question_id": "q2",
+      "number": 2,
+      "answer_type": "table",
+      "max_points": 20,
+      "deterministic": true,
+      "fields": [
+        "Anlatıcı",
+        "Mekân",
+        "Zaman",
+        "Ece’nin özelliği",
+        "Metinsel kanıt"
+      ],
+      "points_per_field": 4
+    },
+    {
+      "question_id": "q3",
+      "number": 3,
+      "answer_type": "matching",
+      "max_points": 15,
+      "deterministic": true,
+      "answer_key": {
+        "1": "A",
+        "2": "B",
+        "3": "C",
+        "4": "D",
+        "5": "E"
+      },
+      "points_per_match": 3
+    },
+    {
+      "question_id": "q4",
+      "number": 4,
+      "answer_type": "correction_table",
+      "max_points": 15,
+      "deterministic": true,
+      "points_per_row": 5
+    },
+    {
+      "question_id": "q5",
+      "number": 5,
+      "answer_type": "grammar_analysis",
+      "max_points": 15,
+      "criteria": [
+        {
+          "id": "q5_c1",
+          "label": "Özne",
+          "max_points": 4
+        },
+        {
+          "id": "q5_c2",
+          "label": "Nesne ve yönelme",
+          "max_points": 4
+        },
+        {
+          "id": "q5_c3",
+          "label": "Zarf tümleçleri",
+          "max_points": 3
+        },
+        {
+          "id": "q5_c4",
+          "label": "Yüklem yapısı",
+          "max_points": 4
+        }
+      ]
+    },
+    {
+      "question_id": "q6",
+      "number": 6,
+      "answer_type": "open_ended",
+      "max_points": 15,
+      "criteria": [
+        {
+          "id": "q6_c1",
+          "label": "Baskın duygu",
+          "max_points": 6
+        },
+        {
+          "id": "q6_c2",
+          "label": "Dize kanıtı",
+          "max_points": 6
+        },
+        {
+          "id": "q6_c3",
+          "label": "Yorum",
+          "max_points": 3
+        }
+      ]
+    }
+  ]
+}

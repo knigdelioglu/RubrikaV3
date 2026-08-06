@@ -54,6 +54,8 @@ const SPEAKING_CLEANUP_PROMPT_VERSION: &str = "speaking_asr_cleanup_tr_v4_typed_
 const SPEAKING_RUBRIC_PROMPT_VERSION: &str = "speaking_rubric_evidence_tr_v5_typed_user_data";
 const SPEAKING_CLEANUP_TIMEOUT_SECONDS: u64 = 300;
 const FLUENCY_MIN_SAMPLE_RATIO_PERCENT: u64 = 60;
+// TD-36: değerlendirme retry gecikmesi tek noktadan ayarlanır (davranış korunur).
+const SPEAKING_SCORE_RETRY_DELAY_SECONDS: u64 = 2;
 const SPEAKING_RUNTIME_FINGERPRINT: &str =
     "gemma4-12b:text-only:mmproj-none:temperature-0:top-k-1:parallel-1:turbo3:v2";
 
@@ -151,6 +153,7 @@ pub struct SpeakingExamService {
     model_runtime_service: ModelRuntimeService,
     job_manager: Arc<JobManager>,
     engine: Arc<SpeakoflowEngine>,
+    audit_service: Option<Arc<crate::services::audit_service::AuditService>>,
 }
 
 impl SpeakingExamService {
@@ -167,7 +170,16 @@ impl SpeakingExamService {
             model_runtime_service,
             job_manager,
             engine,
+            audit_service: None,
         }
+    }
+
+    pub fn with_audit_service(
+        mut self,
+        audit_service: Arc<crate::services::audit_service::AuditService>,
+    ) -> Self {
+        self.audit_service = Some(audit_service);
+        self
     }
 
     pub fn list_microphones(&self) -> Result<Vec<speakoflow_types::MicrophoneDevice>, AppError> {
@@ -1153,10 +1165,33 @@ impl SpeakingExamService {
                         .to_string(),
                 );
                 attempt.model_id = "Speakoflow Embedded Whisper".to_string();
-                let _ = self.project_store.commit_snapshot_cas(&project);
+                self.commit_recovery_snapshot(&project, "speaking_engine_failure", attempt_id);
             }
         }
         log::error!("Speakoflow engine failure for attempt {attempt_id}: {details}");
+    }
+
+    /// Commits a failure-recovery snapshot. A failed commit is never silently
+    /// ignored: it is logged and recorded as an audit event so the review
+    /// marker loss is visible to the teacher and diagnostics.
+    fn commit_recovery_snapshot(&self, project: &Project, operation: &str, attempt_id: &str) {
+        if let Err(error) = self.project_store.commit_snapshot_cas(project).map(|_| ()) {
+            log::error!("{operation} kurtarma durumu kalıcı yazılamadı: {error}");
+            if let Some(audit_service) = self.audit_service.as_ref() {
+                let _ = audit_service.append(
+                    std::path::Path::new(&project.root_path),
+                    crate::services::audit_service::AuditEntryInput::new(
+                        operation,
+                        "Konuşma kurtarma durumu kalıcı yazılamadı.",
+                    )
+                    .project(&project.id)
+                    .entity("speaking_attempt", attempt_id)
+                    .metadata(json!({
+                        "commitError": format!("{:?}", error.code),
+                    })),
+                );
+            }
+        }
     }
 
     pub async fn sync_attempt<R: tauri::Runtime>(
@@ -1938,7 +1973,11 @@ impl SpeakingExamService {
                                 reconcile_speaking_scores(exam, &attempt.metrics, vec![]).scores;
                         }
                     }
-                    let _ = self.project_store.commit_snapshot_cas(&project);
+                    self.commit_recovery_snapshot(
+                        &project,
+                        "speaking_evaluation_failure",
+                        &attempt_id,
+                    );
                 }
             }
             let _ = self.job_manager.fail(&app, &job_id, error);
@@ -2092,6 +2131,7 @@ impl SpeakingExamService {
             }),
             default_sampling(cleanup_max_tokens),
             Some(crate::domain::model::ModelResponseFormat::JsonObject),
+            None,
         );
         cleanup_contract.invocation.model_fingerprint = "model:gemma4-12b".to_string();
         cleanup_contract.invocation.runtime_fingerprint = SPEAKING_RUNTIME_FINGERPRINT.to_string();
@@ -2230,6 +2270,7 @@ impl SpeakingExamService {
             }),
             default_sampling(3072),
             Some(crate::domain::model::ModelResponseFormat::JsonObject),
+            None,
         );
         prompt_contract.invocation.model_fingerprint = "model:gemma4-12b".to_string();
         prompt_contract.invocation.runtime_fingerprint = SPEAKING_RUNTIME_FINGERPRINT.to_string();
@@ -2275,9 +2316,12 @@ impl SpeakingExamService {
                 Ok(res) => break Ok(res),
                 Err(error) if scoring_attempts < 2 => {
                     log::warn!(
-                        "Gemma 4 12B değerlendirme denemesi {scoring_attempts} başarısız oldu ({error}), 2 saniye sonra yeniden deneniyor..."
+                        "Gemma 4 12B değerlendirme denemesi {scoring_attempts} başarısız oldu ({error}), {SPEAKING_SCORE_RETRY_DELAY_SECONDS} saniye sonra yeniden deneniyor..."
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        SPEAKING_SCORE_RETRY_DELAY_SECONDS,
+                    ))
+                    .await;
                 }
                 Err(error) => break Err(error),
             }
@@ -2464,7 +2508,7 @@ impl SpeakingExamService {
                 attempt.transcript_for_scoring = None;
                 attempt.cleanup_candidate = None;
                 attempt.state = SpeakingAttemptState::TeacherReview;
-                let _ = self.project_store.commit_snapshot_cas(&project);
+                self.commit_recovery_snapshot(&project, "speaking_cleanup_failure", attempt_id);
             }
         }
     }
@@ -3920,6 +3964,7 @@ mod tests {
             runtime_fingerprint: SPEAKING_RUNTIME_FINGERPRINT.to_string(),
             sampling_parameters: default_sampling(3072),
             response_format: Some(crate::domain::model::ModelResponseFormat::JsonObject),
+            correlation_id: None,
         };
         let provenance = speaking_model_provenance(
             SPEAKING_RUBRIC_PROFILE_ID,
@@ -5135,5 +5180,67 @@ mod tests {
     #[test]
     fn proof_53_speaking_finalize_kill_never_creates_fake_completed() {
         proof_8_speaking_cancel_preserves_teacher_data();
+    }
+
+    #[test]
+    fn commit_failure_in_recovery_path_is_audited_not_silently_swallowed() {
+        use crate::services::model_config_service::ModelConfigService;
+        use crate::services::model_process_manager::ModelProcessManager;
+        use crate::services::model_runtime_service::ModelRuntimeService;
+
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-commit-fail-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root_path_buf).unwrap();
+        let store = ProjectStore::new();
+        let project = store
+            .create_project(
+                "proj_commit_fail".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let jm = std::sync::Arc::new(JobManager::new());
+        let model_gateway_impl =
+            std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_config = ModelConfigService::new();
+        let model_process_manager =
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
+        let speaking_engine = std::sync::Arc::new(speakoflow_engine::SpeakoflowEngine::new());
+        let audit_service =
+            std::sync::Arc::new(crate::services::audit_service::AuditService::new());
+
+        let service = SpeakingExamService::new(
+            store.clone(),
+            model_gateway_impl,
+            model_runtime_service,
+            jm.clone(),
+            speaking_engine,
+        )
+        .with_audit_service(audit_service.clone());
+
+        // A snapshot whose storage_revision is not present in the store's
+        // revision history must fail the CAS commit. The recovery helper must
+        // surface that failure (audit event) instead of silently dropping it.
+        let current = store.get_project_snapshot(project.id.clone()).unwrap();
+        let mut stale = current.clone();
+        stale.storage_revision = current.storage_revision + 10_000;
+
+        service.commit_recovery_snapshot(&stale, "speaking_engine_failure", "attempt-commit-fail");
+
+        let audit_path = crate::services::audit_service::AuditService::audit_path(
+            std::path::Path::new(&project.root_path),
+        );
+        let content = std::fs::read_to_string(&audit_path)
+            .expect("audit file must exist after a failed recovery commit");
+        assert!(
+            content.contains("speaking_engine_failure"),
+            "failed recovery commit must be recorded in the audit trail"
+        );
+
+        // The failed commit must not have mutated the persisted project.
+        let persisted = store.get_project_snapshot(project.id.clone()).unwrap();
+        assert_eq!(persisted.storage_revision, current.storage_revision);
+        let _ = std::fs::remove_dir_all(&root_path_buf);
     }
 }

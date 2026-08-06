@@ -99,6 +99,13 @@ impl MutationOptions {
             correlation_id: Uuid::new_v4().to_string(),
         }
     }
+
+    /// Komut katmanının ürettiği correlation_id'yi mutation'a akıtır (TD-25).
+    /// Servisler kendi id'sini üretmez; komut zincirinden gelen id'yi taşır.
+    pub fn correlation(mut self, correlation_id: impl Into<String>) -> Self {
+        self.correlation_id = correlation_id.into();
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +347,7 @@ impl ProjectStore {
             student_grouping_complete_at: None,
             expected_question_count: None,
             exam_package_freeze: None,
+            active_written_assessment_activity_id: None,
             documents: vec![],
             questions: vec![],
             scoring_records: vec![],
@@ -1473,7 +1481,7 @@ impl ProjectStore {
         })?;
 
         let legacy_revision_missing = value.get("storageRevision").is_none();
-        let (mut warnings, migration_changed) = normalize_project_json(project_file, &mut value);
+        let (mut warnings, migration_changed) = normalize_project_json(project_file, &mut value)?;
 
         let project_json = serde_json::to_string(&value).map_err(|error| AppError {
             code: AppErrorCode::ProjectLoadFailed,
@@ -1562,10 +1570,13 @@ struct LoadedProject {
     legacy_revision_missing: bool,
 }
 
-fn normalize_project_json(project_file: &Path, value: &mut Value) -> (Vec<String>, bool) {
+fn normalize_project_json(
+    project_file: &Path,
+    value: &mut Value,
+) -> Result<(Vec<String>, bool), AppError> {
     let mut warnings = Vec::new();
     let Some(project) = value.as_object_mut() else {
-        return (warnings, false);
+        return Ok((warnings, false));
     };
 
     let class_changed = normalize_school_class_storage(project_file, project, &mut warnings);
@@ -1577,15 +1588,18 @@ fn normalize_project_json(project_file: &Path, value: &mut Value) -> (Vec<String
     normalize_student_identity_records(project_file, project, &mut warnings);
     let scoring_changed = normalize_scoring_records(project_file, project, &mut warnings);
     let scoring_anchors_changed = normalize_scoring_anchors(project_file, project, &mut warnings);
+    let written_scope_changed =
+        normalize_written_activity_scope(project_file, project, &mut warnings)?;
 
-    (
+    Ok((
         warnings,
         class_changed
             || assessment_changed
             || crop_template_changed
             || scoring_changed
-            || scoring_anchors_changed,
-    )
+            || scoring_anchors_changed
+            || written_scope_changed,
+    ))
 }
 
 fn normalize_scoring_anchors(
@@ -1602,6 +1616,240 @@ fn normalize_scoring_anchors(
         project_file.display()
     ));
     true
+}
+
+/// TD-01 versioned migration: attaches project-level flat written data to a
+/// written-family AssessmentActivity.
+///
+/// Policy (documented, see docs/FINAL_TECHNICAL_DEBT_CLOSURE.md FAZ 3):
+/// - A project with exactly one written-family activity deterministically owns
+///   every untagged flat written record; all records are tagged and the active
+///   pointer is set to that activity.
+/// - A project with written data but no written-family activity receives a
+///   deterministic **synthetic/ghost activity** built from project metadata so
+///   the flat data keeps a scope instead of being project-wide forever.
+/// - A project with several written-family activities and at least one untagged
+///   flat written record is AMBIGUOUS: no automatic guess is made and a typed
+///   `MIGRATION_AMBIGUOUS_ASSESSMENT_SCOPE` blocker is produced so the project
+///   cannot be opened/migrated until a human resolves the ownership.
+/// - Idempotent: a second run finds everything tagged and is a no-op.
+///
+/// Unknown JSON fields are preserved; this migration only adds fields.
+fn normalize_written_activity_scope(
+    project_file: &Path,
+    project: &mut Map<String, Value>,
+    warnings: &mut Vec<String>,
+) -> Result<bool, AppError> {
+    let written_ids = written_family_activity_ids_from_json(project);
+
+    let mut has_written_data = false;
+    let mut untagged = false;
+    // `studentSubmissions` is intentionally excluded from the "written data"
+    // trigger: submissions alone (grouping scaffolding) are re-grouped per
+    // activity and must not force a synthetic written activity.
+    for collection in [
+        "questions",
+        "studentAnswerOcrRecords",
+        "studentAnswerOcrGenerations",
+        "scoringRecords",
+        "scoringAnchors",
+    ] {
+        if let Some(Value::Array(entries)) = project.get(collection) {
+            if !entries.is_empty() {
+                has_written_data = true;
+            }
+            if entries.iter().any(|entry| {
+                entry
+                    .as_object()
+                    .and_then(|object| object.get("assessmentActivityId"))
+                    .is_none()
+            }) {
+                untagged = true;
+            }
+        }
+    }
+    if project
+        .get("examPackageFreeze")
+        .is_some_and(Value::is_object)
+    {
+        has_written_data = true;
+        let freeze_tagged = project
+            .get("examPackageFreeze")
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("assessmentActivityId"))
+            .is_some();
+        untagged |= !freeze_tagged;
+    }
+
+    if !has_written_data {
+        return Ok(false);
+    }
+
+    let target = match written_ids.as_slice() {
+        // Policy (documented in docs/FINAL_TECHNICAL_DEBT_CLOSURE.md FAZ 3):
+        // legacy written data with NO written-family activity is NOT assigned a
+        // synthetic/ghost activity. It stays untagged (project-wide scope),
+        // preserving pre-migration behavior; the deterministic attach fires as
+        // soon as the project has exactly one written activity, and the
+        // ambiguity blocker guards multi-activity projects. Guessing an owner
+        // for organization-less legacy data is intentionally avoided.
+        [] => {
+            warnings.push(format!(
+                "{}.written verisi AssessmentActivity kapsamına bağlanmadı; yazılı sınav organizasyonu oluşmadan veri proje geneli olarak korunur (documented TD-01 policy).",
+                project_file.display()
+            ));
+            return Ok(false);
+        }
+        [only] => Some((*only).to_string()),
+        _ => {
+            if untagged {
+                return Err(written_scope_ambiguous_error(project_file));
+            }
+            return Ok(false);
+        }
+    };
+
+    let Some(target) = target else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    changed |= tag_collection(project, "questions", &target);
+    changed |= tag_collection(project, "studentSubmissions", &target);
+    changed |= tag_collection(project, "studentAnswerOcrRecords", &target);
+    changed |= tag_generations(project, &target);
+    changed |= tag_collection(project, "scoringRecords", &target);
+    changed |= tag_collection(project, "scoringAnchors", &target);
+    if let Some(freeze) = project
+        .get_mut("examPackageFreeze")
+        .and_then(Value::as_object_mut)
+    {
+        if freeze.get("assessmentActivityId").is_none() {
+            freeze.insert(
+                "assessmentActivityId".to_string(),
+                Value::String(target.clone()),
+            );
+            changed = true;
+        }
+    }
+
+    let pointer_matches = project
+        .get("activeWrittenAssessmentActivityId")
+        .and_then(Value::as_str)
+        .is_some_and(|existing| existing == target);
+    let pointer_changed = if pointer_matches {
+        false
+    } else {
+        project.insert(
+            "activeWrittenAssessmentActivityId".to_string(),
+            Value::String(target.clone()),
+        );
+        true
+    };
+    changed |= pointer_changed;
+
+    if changed {
+        warnings.push(format!(
+            "{}.written scope, AssessmentActivity `{}` altına deterministic olarak bağlandı (TD-01 migration).",
+            project_file.display(),
+            target
+        ));
+    }
+    Ok(changed)
+}
+
+fn written_family_activity_ids_from_json(project: &Map<String, Value>) -> Vec<String> {
+    project
+        .get("assessmentActivities")
+        .and_then(Value::as_array)
+        .map(|activities| {
+            activities
+                .iter()
+                .filter_map(|activity| {
+                    let activity = activity.as_object()?;
+                    let assessment_type = activity
+                        .get("assessmentType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("written");
+                    if matches!(assessment_type, "written" | "listening") {
+                        activity
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn tag_collection(project: &mut Map<String, Value>, collection: &str, activity_id: &str) -> bool {
+    let mut changed = false;
+    if let Some(Value::Array(entries)) = project.get_mut(collection) {
+        for entry in entries {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            if object.get("assessmentActivityId").is_none() {
+                object.insert(
+                    "assessmentActivityId".to_string(),
+                    Value::String(activity_id.to_string()),
+                );
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn tag_generations(project: &mut Map<String, Value>, activity_id: &str) -> bool {
+    let mut changed = false;
+    if let Some(Value::Array(entries)) = project.get_mut("studentAnswerOcrGenerations") {
+        for entry in entries {
+            let Some(object) = entry.as_object_mut() else {
+                continue;
+            };
+            if object.get("assessmentActivityId").is_none() {
+                object.insert(
+                    "assessmentActivityId".to_string(),
+                    Value::String(activity_id.to_string()),
+                );
+                changed = true;
+            }
+            if let Some(Value::Array(results)) = object.get_mut("result") {
+                for result in results {
+                    if let Some(result) = result.as_object_mut() {
+                        if result.get("assessmentActivityId").is_none() {
+                            result.insert(
+                                "assessmentActivityId".to_string(),
+                                Value::String(activity_id.to_string()),
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
+fn written_scope_ambiguous_error(project_file: &Path) -> AppError {
+    AppError {
+        code: AppErrorCode::MigrationAmbiguousAssessmentScope,
+        message: "Projedeki yazılı sınav verileri birden fazla yazılı sınava ait olabilir; hangisine ait olduğu belirlenemedi.".to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Yazılı verilerin hangi sınava ait olduğunu netleştirip (tek bir yazılı sınav bırakarak) projeyi yeniden açın; Rubrika veri kaybına yol açacak tahmin yapmaz.".to_string(),
+        ),
+        technical_details: Some(format!(
+            "project_file={}; multiple written-family activities with untagged legacy written records",
+            project_file.display()
+        )),
+        correlation_id: Uuid::new_v4().to_string(),
+    }
 }
 
 fn normalize_student_answer_crop_template(
@@ -2732,6 +2980,15 @@ fn normalize_scoring_records(
                 "decisionState".to_string(),
                 Value::String(derived_state.to_string()),
             );
+            // Serde default for `scoringApplied` is fail-closed (`false`). A
+            // legacy record that genuinely carried an applied score must keep
+            // that semantic explicitly, otherwise a reload would silently
+            // downgrade it. Missing field is written with the legacy
+            // classification; the serde default now only guards records that
+            // skip this normalization entirely.
+            if record.get("scoringApplied").is_none() {
+                record.insert("scoringApplied".to_string(), Value::Bool(scoring_applied));
+            }
             changed = true;
             warnings.push(format!(
                 "{base_path}.decisionState eski notlandırma alanlarından {derived_state} olarak taşındı."
@@ -2955,6 +3212,7 @@ mod tests {
 
     fn sample_project(root_path: &Path, name: &str, updated_at: &str) -> Project {
         Project {
+            active_written_assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             name: name.to_string(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -2978,6 +3236,7 @@ mod tests {
             assessment_activities: vec![],
             student_scan_batches: vec![],
             student_submissions: vec![StudentSubmission {
+                assessment_activity_id: None,
                 id: Uuid::new_v4().to_string(),
                 student_id: Uuid::new_v4().to_string(),
                 document_id: Uuid::new_v4().to_string(),
@@ -3038,6 +3297,7 @@ mod tests {
             ],
             questions: vec![
                 Question {
+                    assessment_activity_id: None,
                     id: Uuid::new_v4().to_string(),
                     number: 1,
                     max_score: 5.0,
@@ -3078,6 +3338,7 @@ mod tests {
                     }),
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: Uuid::new_v4().to_string(),
                     number: 2,
                     max_score: 5.0,
@@ -3809,6 +4070,7 @@ mod tests {
         let mut project = sample_project(&root, "Legacy OCR", "2026-01-01T00:00:00Z");
         project.latest_scoring_run_id = None;
         project.scoring_records = vec![crate::domain::scoring::ScoringRecord {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             run_id: String::new(),
             submission_id: project.student_submissions[0].id.clone(),
@@ -3946,6 +4208,155 @@ mod tests {
             persisted_value["scoringRecords"][0]["decisionState"],
             serde_json::Value::String("provisional".to_string())
         );
+    }
+
+    #[test]
+    fn scoring_record_missing_scoring_applied_fails_closed_and_is_not_accepted() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "Fail-closed scoring", "2026-01-01T00:00:00Z");
+        project.scoring_records = vec![crate::domain::scoring::ScoringRecord {
+            assessment_activity_id: None,
+            id: Uuid::new_v4().to_string(),
+            run_id: String::new(),
+            submission_id: project.student_submissions[0].id.clone(),
+            student_id: project.students[0].id.clone(),
+            student_display_name: Some("Öğrenci".to_string()),
+            student_number: Some("1".to_string()),
+            student_class_name: Some("11A".to_string()),
+            question_id: project.questions[0].id.clone(),
+            question_number: 1,
+            max_score: 5.0,
+            awarded_score: Some(5.0),
+            scoring_applied: true,
+            decision_state: crate::domain::scoring::ScoringDecisionState::AutoAccepted,
+            decision_version: "v1".to_string(),
+            criterion_scores: vec![],
+            semantic_decisions: vec![],
+            rationale: "ok".to_string(),
+            confidence: 0.9,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            raw_model_output: "{}".to_string(),
+            parse_diagnostics: None,
+            reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
+            source_hash: "source".to_string(),
+            package_hash: "package".to_string(),
+            ocr_record_hash: "ocr".to_string(),
+            question_text_hash: "qtext".to_string(),
+            rubric_hash: "rubric".to_string(),
+            teacher_review_status: crate::domain::scoring::ScoringReviewStatus::PendingReview,
+            teacher_manual_score: None,
+            teacher_reviewed_at: None,
+            teacher_notes: None,
+            invalidated_at: None,
+            invalidation_reason: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+        let mut value = serde_json::to_value(&project).unwrap();
+        let record = value
+            .get_mut("scoringRecords")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|records| records.get_mut(0))
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        record.remove("scoringApplied");
+        write_project_value(&root, &value);
+
+        let reopened = ProjectStore::open_project_at_path(&root).unwrap();
+        assert!(!reopened.scoring_records[0].scoring_applied);
+        assert!(!crate::domain::scoring::scoring_record_is_accepted(
+            &reopened.scoring_records[0]
+        ));
+        assert!(!crate::domain::scoring::scoring_record_is_final(
+            &reopened.scoring_records[0]
+        ));
+    }
+
+    #[test]
+    fn legacy_scoring_record_without_scoring_applied_is_explicitly_classified() {
+        let root = temp_root();
+        let mut project =
+            sample_project(&root, "Legacy classified scoring", "2026-01-01T00:00:00Z");
+        project.scoring_records = vec![crate::domain::scoring::ScoringRecord {
+            assessment_activity_id: None,
+            id: Uuid::new_v4().to_string(),
+            run_id: String::new(),
+            submission_id: project.student_submissions[0].id.clone(),
+            student_id: project.students[0].id.clone(),
+            student_display_name: Some("Öğrenci".to_string()),
+            student_number: Some("1".to_string()),
+            student_class_name: Some("11A".to_string()),
+            question_id: project.questions[0].id.clone(),
+            question_number: 1,
+            max_score: 5.0,
+            awarded_score: Some(4.0),
+            scoring_applied: true,
+            decision_state: crate::domain::scoring::ScoringDecisionState::AutoAccepted,
+            decision_version: "v1".to_string(),
+            criterion_scores: vec![],
+            semantic_decisions: vec![],
+            rationale: "ok".to_string(),
+            confidence: 0.9,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            raw_model_output: "{}".to_string(),
+            parse_diagnostics: None,
+            reconciliation_diagnostics: None,
+            execution_diagnostics: None,
+            cache_provenance: None,
+            reuse_provenance: None,
+            consistency_review: None,
+            scoring_fingerprint: String::new(),
+            policy_version: String::new(),
+            answer_normalized_hash: String::new(),
+            answer_raw_hash: String::new(),
+            ocr_generation: String::new(),
+            source_hash: "source".to_string(),
+            package_hash: "package".to_string(),
+            ocr_record_hash: "ocr".to_string(),
+            question_text_hash: "qtext".to_string(),
+            rubric_hash: "rubric".to_string(),
+            teacher_review_status: crate::domain::scoring::ScoringReviewStatus::PendingReview,
+            teacher_manual_score: None,
+            teacher_reviewed_at: None,
+            teacher_notes: None,
+            invalidated_at: None,
+            invalidation_reason: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }];
+        let mut value = serde_json::to_value(&project).unwrap();
+        let record = value
+            .get_mut("scoringRecords")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|records| records.get_mut(0))
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        record.remove("scoringApplied");
+        record.remove("decisionState");
+        write_project_value(&root, &value);
+
+        let reopened = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(
+            reopened.scoring_records[0].decision_state,
+            crate::domain::scoring::ScoringDecisionState::AutoAccepted
+        );
+        assert!(reopened.scoring_records[0].scoring_applied);
+        assert!(crate::domain::scoring::scoring_record_is_accepted(
+            &reopened.scoring_records[0]
+        ));
     }
 
     #[test]
@@ -4927,7 +5338,8 @@ mod tests {
         });
 
         let (warnings, changed) =
-            normalize_project_json(Path::new("legacy/project.json"), &mut value);
+            normalize_project_json(Path::new("legacy/project.json"), &mut value)
+                .expect("normalize");
         let template = value
             .get("studentAnswerCropTemplate")
             .and_then(Value::as_object)
@@ -4964,7 +5376,8 @@ mod tests {
         });
 
         let (warnings, changed) =
-            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value);
+            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value)
+                .expect("normalize");
 
         assert!(changed);
         assert_eq!(
@@ -4997,7 +5410,8 @@ mod tests {
             .any(|warning| warning.contains("scoringAnchors")));
 
         let (_warnings, second_changed) =
-            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value);
+            normalize_project_json(Path::new("legacy/anchors/project.json"), &mut value)
+                .expect("normalize");
         assert!(!second_changed);
     }
 
@@ -5017,7 +5431,8 @@ mod tests {
         });
 
         let (warnings, _changed) =
-            normalize_project_json(Path::new("legacy/ocr/project.json"), &mut value);
+            normalize_project_json(Path::new("legacy/ocr/project.json"), &mut value)
+                .expect("normalize");
         let record = value
             .get("studentAnswerOcrRecords")
             .and_then(Value::as_array)
@@ -5136,5 +5551,284 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    fn written_activity(id: &str, sequence: u32) -> AssessmentActivity {
+        AssessmentActivity {
+            id: id.to_string(),
+            academic_year_id: "2026-2027".to_string(),
+            course_id: "tde".to_string(),
+            course_name: "Türk Dili ve Edebiyatı".to_string(),
+            title: id.to_string(),
+            grade_level: 9,
+            term: 1,
+            assessment_type: AssessmentType::Written,
+            workflow_family: WorkflowFamily::Written,
+            sequence_number: sequence,
+            status: AssessmentStatus::Draft,
+            common_document_ids: vec![],
+            listening_details: None,
+            speaking_configuration: None,
+            performance_details: None,
+            class_applications: vec![class_application(id, &format!("app-{id}"), "class-9-a")],
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// Strips every TD-01 `assessmentActivityId` marker from the project JSON
+    /// so it simulates a legacy flat written project before migration.
+    fn strip_written_scope_annotations(value: &mut Value) {
+        for collection in [
+            "questions",
+            "studentSubmissions",
+            "studentAnswerOcrRecords",
+            "studentAnswerOcrGenerations",
+            "scoringRecords",
+            "scoringAnchors",
+        ] {
+            if let Some(Value::Array(entries)) = value.get_mut(collection) {
+                for entry in entries {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.remove("assessmentActivityId");
+                        if let Some(Value::Array(results)) = object.get_mut("result") {
+                            for result in results {
+                                if let Some(result) = result.as_object_mut() {
+                                    result.remove("assessmentActivityId");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(freeze) = value.get_mut("examPackageFreeze") {
+            if let Some(object) = freeze.as_object_mut() {
+                object.remove("assessmentActivityId");
+            }
+        }
+        value
+            .as_object_mut()
+            .map(|object| object.remove("activeWrittenAssessmentActivityId"));
+    }
+
+    #[test]
+    fn single_written_activity_migration_attaches_legacy_flat_data_deterministically() {
+        let mut project = sample_project(&PathBuf::from("/tmp/p"), "legacy written", "2026-01-01");
+        project.assessment_activities = vec![written_activity("written-a", 1)];
+        project.questions = vec![crate::domain::question::default_question(1)];
+        project
+            .student_answer_ocr_records
+            .push(crate::domain::student::StudentAnswerOcrRecord {
+                assessment_activity_id: None,
+                id: "ocr-1".into(),
+                submission_id: project.student_submissions[0].id.clone(),
+                question_id: project.questions[0].id.clone(),
+                question_number: 1,
+                status: crate::domain::student::StudentAnswerOcrStatus::TeacherApproved,
+                answer_text: "cevap".into(),
+                prompt_version: "v1".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                ..Default::default()
+            });
+        let expected = project.clone();
+
+        let mut value = serde_json::to_value(&project).unwrap();
+        strip_written_scope_annotations(&mut value);
+        let (warnings, changed) =
+            normalize_project_json(Path::new("legacy/project.json"), &mut value)
+                .expect("single written activity migrates");
+
+        assert!(changed, "migration must attach flat data");
+        assert!(warnings.iter().any(|w| w.contains("deterministic")));
+        let migrated: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(migrated.assessment_activities.len(), 1);
+        assert_eq!(
+            migrated.active_written_assessment_activity_id.as_deref(),
+            Some("written-a")
+        );
+        for question in &migrated.questions {
+            assert_eq!(
+                question.assessment_activity_id.as_deref(),
+                Some("written-a")
+            );
+        }
+        for submission in &migrated.student_submissions {
+            assert_eq!(
+                submission.assessment_activity_id.as_deref(),
+                Some("written-a")
+            );
+        }
+        for record in &migrated.student_answer_ocr_records {
+            assert_eq!(record.assessment_activity_id.as_deref(), Some("written-a"));
+        }
+        assert_eq!(
+            migrated
+                .exam_package_freeze
+                .as_ref()
+                .and_then(|f| f.assessment_activity_id.as_deref()),
+            None
+        );
+        // Semantic equality: no flat written data was lost or reordered. The
+        // added `assessmentActivityId` markers are stripped before comparing.
+        let mut migrated_value = serde_json::to_value(&migrated).unwrap();
+        strip_written_scope_annotations(&mut migrated_value);
+        let migrated_questions = migrated_value["questions"].clone();
+        let migrated_submissions = migrated_value["studentSubmissions"].clone();
+        assert_eq!(
+            migrated_questions,
+            serde_json::to_value(&expected.questions).unwrap()
+        );
+        assert_eq!(
+            migrated_submissions,
+            serde_json::to_value(&expected.student_submissions).unwrap()
+        );
+    }
+
+    #[test]
+    fn written_scope_migration_is_idempotent_on_second_run() {
+        let mut project = sample_project(&PathBuf::from("/tmp/p"), "idem", "2026-01-01");
+        project.assessment_activities = vec![written_activity("written-a", 1)];
+        project.questions = vec![crate::domain::question::default_question(1)];
+
+        let mut value = serde_json::to_value(&project).unwrap();
+        strip_written_scope_annotations(&mut value);
+        let (_w1, first) = normalize_project_json(Path::new("legacy/project.json"), &mut value)
+            .expect("first migration");
+        assert!(first);
+
+        let (_w2, second) = normalize_project_json(Path::new("legacy/project.json"), &mut value)
+            .expect("second migration is a no-op");
+        assert!(!second, "second migration must be idempotent");
+    }
+
+    #[test]
+    fn ambiguous_written_scope_with_untagged_data_produces_typed_blocker() {
+        let mut project = sample_project(&PathBuf::from("/tmp/p"), "ambiguous", "2026-01-01");
+        project.assessment_activities = vec![
+            written_activity("written-a", 1),
+            written_activity("written-b", 2),
+        ];
+        project.questions = vec![crate::domain::question::default_question(1)];
+
+        let mut value = serde_json::to_value(&project).unwrap();
+        strip_written_scope_annotations(&mut value);
+        let error =
+            normalize_project_json(Path::new("legacy/project.json"), &mut value).unwrap_err();
+        assert_eq!(error.code, AppErrorCode::MigrationAmbiguousAssessmentScope);
+        assert!(error.message.contains("birden fazla"));
+        // Unknown/opaque fields must survive even on the blocked path.
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("opaqueLegacyField".into(), Value::String("keep".into()));
+        assert_eq!(
+            value
+                .as_object()
+                .and_then(|o| o.get("opaqueLegacyField"))
+                .and_then(Value::as_str),
+            Some("keep")
+        );
+    }
+
+    #[test]
+    fn legacy_written_data_without_activity_stays_untagged_and_loads_losslessly() {
+        let mut project = sample_project(&PathBuf::from("/tmp/p"), "no activity", "2026-01-01");
+        project.questions = vec![crate::domain::question::default_question(1)];
+        let expected = project.clone();
+        let mut value = serde_json::to_value(&project).unwrap();
+        strip_written_scope_annotations(&mut value);
+
+        let (_warnings, _changed) =
+            normalize_project_json(Path::new("legacy/project.json"), &mut value)
+                .expect("no written activity means no migration change");
+        let loaded: Project = serde_json::from_value(value).unwrap();
+        assert!(
+            loaded.assessment_activities.is_empty(),
+            "no synthetic activity may be created"
+        );
+        assert!(loaded
+            .questions
+            .iter()
+            .all(|q| q.assessment_activity_id.is_none()));
+        assert_eq!(
+            serde_json::to_value(&loaded.questions).unwrap(),
+            serde_json::to_value(&expected.questions).unwrap()
+        );
+        assert!(loaded.active_written_assessment_activity_id.is_none());
+    }
+
+    #[test]
+    fn opening_ambiguous_written_scope_project_returns_typed_blocker() {
+        let root = temp_root();
+        let mut project = sample_project(&root, "ambiguous", "2026-01-01");
+        project.assessment_activities = vec![
+            written_activity("written-a", 1),
+            written_activity("written-b", 2),
+        ];
+        project.questions = vec![crate::domain::question::default_question(1)];
+        write_project(&root, &project);
+        let mut value = serde_json::to_value(&project).unwrap();
+        strip_written_scope_annotations(&mut value);
+        std::fs::write(
+            root.join("project.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = ProjectStore::new()
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .expect_err("ambiguous written scope must block opening");
+        assert_eq!(error.code, AppErrorCode::MigrationAmbiguousAssessmentScope);
+    }
+
+    #[test]
+    fn reopening_after_written_activity_mutation_keeps_scope_consistent() {
+        // Regression for the stress path: activities created through `mutate`
+        // must not leave the project in an ambiguous state that blocks the
+        // next open. Every written activity created via `mutate` sets the
+        // active pointer so flat records stay scoped.
+        let root = temp_root();
+        let mut project = sample_project(&root, "scope consistent", "2026-01-01");
+        project.questions = vec![crate::domain::question::default_question(1)];
+        write_project(&root, &project);
+        let store = ProjectStore::new();
+        let opened = store
+            .open_project_with_warnings(root.to_string_lossy().to_string())
+            .unwrap()
+            .0;
+        let project_id = opened.id;
+
+        for index in 0..2u32 {
+            store
+                .mutate(
+                    &project_id,
+                    MutationOptions::new(format!("add_written_{index}")),
+                    move |project, _| {
+                        project
+                            .assessment_activities
+                            .push(written_activity(&format!("written-{index}"), index + 1));
+                        project.active_written_assessment_activity_id =
+                            Some(format!("written-{index}"));
+                        Ok(())
+                    },
+                )
+                .expect("written activity mutation");
+        }
+
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        assert_eq!(persisted.assessment_activities.len(), 2);
+        assert_eq!(
+            persisted.active_written_assessment_activity_id.as_deref(),
+            Some("written-1")
+        );
+        for question in &persisted.questions {
+            assert_eq!(
+                question.assessment_activity_id.as_deref(),
+                Some("written-0"),
+                "untagged question was deterministically attached to the sole written activity present at attach time"
+            );
+        }
     }
 }

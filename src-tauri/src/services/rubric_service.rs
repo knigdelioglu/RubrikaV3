@@ -870,6 +870,7 @@ fn build_exam_package_freeze(
         question_text_hash,
         invalidated_at: None,
         invalidation_reason: None,
+        assessment_activity_id: project.resolve_written_scope_id().ok().flatten(),
     }
 }
 
@@ -1091,6 +1092,7 @@ mod tests {
 
     fn confirmed_question(number: u32) -> Question {
         Question {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             number,
             max_score: 10.0,
@@ -1673,6 +1675,7 @@ mod tests {
             updated_at: None,
         };
         snapshot.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            assessment_activity_id: None,
             exam_package_version: 1,
             freeze_status: ExamPackageFreezeStatus::Frozen,
             frozen_at: "now".to_string(),

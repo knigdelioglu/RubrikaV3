@@ -1,10 +1,11 @@
 use tauri::State;
+use uuid::Uuid;
 
 use crate::domain::assessment::AssessmentActivity;
 use crate::domain::errors::AppError;
 use crate::domain::performance::{PerformanceAssessment, PerformanceRubric};
 use crate::services::audit_service::AuditEntryInput;
-use crate::services::performance_service::{
+use crate::services::performance_dtos::{
     ApprovePerformanceAssessmentInput, CreatePerformanceTaskInput, GetPerformanceReportInput,
     ListPerformanceAssessmentsInput, ListPerformanceTasksInput, PerformanceActivityIdInput,
     PerformanceReportDto, PerformanceStatusDto, PublishPerformanceRubricInput,
@@ -19,12 +20,16 @@ pub async fn create_performance_task(
     input: CreatePerformanceTaskInput,
 ) -> Result<AssessmentActivity, AppError> {
     let project_id = input.project_id.clone();
-    let activity = state.performance_service.create_performance_task(input)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let activity = state
+        .performance_service
+        .create_performance_task(input, &correlation_id)?;
     super::audit_critical(
         &state,
         &project_id,
         AuditEntryInput::new("performance_task_created", "Performans görevi oluşturuldu.")
-            .entity("assessment_activity", &activity.id),
+            .entity("assessment_activity", &activity.id)
+            .correlation(&correlation_id),
     )?;
     Ok(activity)
 }
@@ -36,12 +41,16 @@ pub async fn update_performance_task(
 ) -> Result<AssessmentActivity, AppError> {
     let project_id = input.project_id.clone();
     let activity_id = input.activity_id.clone();
-    let activity = state.performance_service.update_performance_task(input)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let activity = state
+        .performance_service
+        .update_performance_task(input, &correlation_id)?;
     super::audit_critical(
         &state,
         &project_id,
         AuditEntryInput::new("performance_task_updated", "Performans görevi güncellendi.")
-            .entity("assessment_activity", &activity_id),
+            .entity("assessment_activity", &activity_id)
+            .correlation(&correlation_id),
     )?;
     Ok(activity)
 }
@@ -69,9 +78,10 @@ pub async fn publish_performance_rubric(
 ) -> Result<PerformanceRubric, AppError> {
     let project_id = input.project_id.clone();
     let activity_id = input.activity_id.clone();
+    let correlation_id = Uuid::new_v4().to_string();
     let rubric = state
         .performance_service
-        .publish_performance_rubric(input)?;
+        .publish_performance_rubric(input, &correlation_id)?;
     super::audit_critical(
         &state,
         &project_id,
@@ -79,7 +89,8 @@ pub async fn publish_performance_rubric(
             "performance_rubric_published",
             "Performans rubriği yayınlandı (yeni sürüm).",
         )
-        .entity("assessment_activity", &activity_id),
+        .entity("assessment_activity", &activity_id)
+        .correlation(&correlation_id),
     )?;
     Ok(rubric)
 }
@@ -99,7 +110,10 @@ pub async fn save_performance_assessment(
     state: State<'_, AppState>,
     input: SavePerformanceAssessmentInput,
 ) -> Result<PerformanceAssessment, AppError> {
-    state.performance_service.save_performance_assessment(input)
+    let correlation_id = Uuid::new_v4().to_string();
+    state
+        .performance_service
+        .save_performance_assessment(input, &correlation_id)
 }
 
 #[tauri::command]
@@ -109,9 +123,10 @@ pub async fn approve_performance_assessment(
 ) -> Result<PerformanceAssessment, AppError> {
     let project_id = input.project_id.clone();
     let assessment_id = input.assessment_id.clone();
+    let correlation_id = Uuid::new_v4().to_string();
     let assessment = state
         .performance_service
-        .approve_performance_assessment(input)?;
+        .approve_performance_assessment(input, &correlation_id)?;
     super::audit_critical(
         &state,
         &project_id,
@@ -119,7 +134,8 @@ pub async fn approve_performance_assessment(
             "performance_assessment_approved",
             "Performans değerlendirmesi onaylandı.",
         )
-        .entity("performance_assessment", &assessment_id),
+        .entity("performance_assessment", &assessment_id)
+        .correlation(&correlation_id),
     )?;
     Ok(assessment)
 }
@@ -131,15 +147,17 @@ pub async fn set_performance_assessment_status(
 ) -> Result<PerformanceAssessment, AppError> {
     let project_id = input.project_id.clone();
     let status = input.status;
+    let correlation_id = Uuid::new_v4().to_string();
     let assessment = state
         .performance_service
-        .set_performance_assessment_status(input)?;
+        .set_performance_assessment_status(input, &correlation_id)?;
     let summary = format!("Performans değerlendirme durumu güncellendi ({status:?}).");
     super::audit_critical(
         &state,
         &project_id,
         AuditEntryInput::new("performance_assessment_status_updated", summary.as_str())
-            .entity("performance_assessment", &assessment.id),
+            .entity("performance_assessment", &assessment.id)
+            .correlation(&correlation_id),
     )?;
     Ok(assessment)
 }
@@ -177,7 +195,7 @@ mod tests {
         SetPerformanceAssessmentStatusInput,
     };
     use crate::domain::performance::{CriterionRating, PerformanceAssessmentStatus};
-    use crate::services::performance_service::PerformanceStatusDto;
+    use crate::services::performance_dtos::PerformanceStatusDto;
 
     #[test]
     fn create_performance_task_uses_camel_case_contract() {
@@ -277,7 +295,7 @@ mod tests {
 
     #[test]
     fn get_performance_status_uses_camel_case_contract() {
-        let input: crate::services::performance_service::PerformanceActivityIdInput =
+        let input: crate::services::performance_dtos::PerformanceActivityIdInput =
             serde_json::from_value(serde_json::json!({
                 "projectId": "project-1",
                 "activityId": "activity-1",

@@ -72,6 +72,10 @@ pub struct Question {
     pub question_text: TextFieldState,
     pub rubric: RubricState,
     pub crop_template: Option<CropTemplate>,
+    /// TD-01: owning written-family assessment activity. Additive field;
+    /// legacy questions omit it and the migration attaches them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_activity_id: Option<String>,
 }
 
 pub fn is_placeholder_text(text: &str) -> bool {
@@ -119,6 +123,7 @@ pub fn default_question(number: u32) -> Question {
             updated_at: None,
         },
         crop_template: None,
+        assessment_activity_id: None,
     }
 }
 

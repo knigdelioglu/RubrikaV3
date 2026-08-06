@@ -39,6 +39,11 @@ pub struct QuestionTextService {
     job_manager: Arc<JobManager>,
 }
 
+/// A question extraction is considered "visible" in the targeted page set when
+/// the model confidence is at least this value. Below it the service escalates
+/// to a ±1 page window and finally to the whole document.
+const QUESTION_TEXT_VISIBLE_CONFIDENCE: f32 = 0.5;
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionTextSource {
@@ -57,6 +62,28 @@ struct QuestionTextVisionFallbackRunInput {
     expected_question_count: u32,
     target_question_numbers: Vec<u32>,
     model_inputs: Vec<ModelInputImage>,
+    /// page_number -> question numbers detected on that page (from pdftotext).
+    page_questions: BTreeMap<u32, Vec<u32>>,
+    /// total number of prepared page inputs.
+    page_count: u32,
+}
+
+/// Result of one targeted extraction attempt for a single question (TD-19).
+#[derive(Debug)]
+pub(crate) struct QuestionTextTargetedOutcome {
+    pub(crate) candidate: Option<ExtractedQuestionCandidate>,
+    pub(crate) saw_ok: bool,
+    pub(crate) attempts: u32,
+    pub(crate) pages_used: Vec<u32>,
+    pub(crate) stage: &'static str,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// Page scope used for one targeted extraction attempt (TD-19).
+pub(crate) struct QuestionTextPageScope<'a> {
+    pub(crate) inputs: &'a [ModelInputImage],
+    pub(crate) page_questions: &'a BTreeMap<u32, Vec<u32>>,
+    pub(crate) page_count: u32,
 }
 
 impl QuestionTextService {
@@ -167,7 +194,11 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.commit_snapshot_cas(&proj);
+                    if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                        log::error!(
+                            "Soru metni çıkarımı workflow güncellemesi kalıcı yazılamadı: {error}"
+                        );
+                    }
                 }
             } else {
                 // Also update on success just to be safe
@@ -176,7 +207,11 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.commit_snapshot_cas(&proj);
+                    if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                        log::error!(
+                            "Soru metni çıkarımı workflow güncellemesi kalıcı yazılamadı: {error}"
+                        );
+                    }
                 }
             }
         });
@@ -296,6 +331,11 @@ impl QuestionTextService {
                         expected_question_count,
                         target_question_numbers: target_numbers_for_run,
                         model_inputs: content.model_input_images.clone(),
+                        page_questions:
+                            crate::services::page_window_service::question_numbers_by_page(
+                                &content.raw_text.clone().unwrap_or_default(),
+                            ),
+                        page_count: content.model_input_images.len() as u32,
                     },
                 )
                 .await;
@@ -319,14 +359,22 @@ impl QuestionTextService {
                     .get_project_snapshot(project_id_for_workflow)
                 {
                     proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.commit_snapshot_cas(&proj);
+                    if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                        log::error!(
+                            "Soru metni çıkarımı workflow güncellemesi kalıcı yazılamadı: {error}"
+                        );
+                    }
                 }
             } else if let Ok(mut proj) = service
                 .project_store
                 .get_project_snapshot(project_id_for_workflow)
             {
                 proj.workflow = workflow_engine::evaluate_workflow(&proj);
-                let _ = service.project_store.commit_snapshot_cas(&proj);
+                if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                    log::error!(
+                        "Soru metni çıkarımı workflow güncellemesi kalıcı yazılamadı: {error}"
+                    );
+                }
             }
         });
 
@@ -542,6 +590,10 @@ impl QuestionTextService {
                 expected_question_count,
                 target_question_numbers: fallback_targets,
                 model_inputs,
+                page_questions: crate::services::page_window_service::question_numbers_by_page(
+                    &content.raw_text.clone().unwrap_or_default(),
+                ),
+                page_count: content.model_input_images.len() as u32,
             };
             return self.run_vision_fallback(app, job_id, fallback_input).await;
         }
@@ -601,6 +653,8 @@ impl QuestionTextService {
             expected_question_count,
             target_question_numbers,
             model_inputs: all_prepared_inputs,
+            page_questions,
+            page_count,
         } = input;
 
         if target_question_numbers
@@ -679,16 +733,18 @@ impl QuestionTextService {
             )
             .await?;
 
-        let fallback_image_path = all_prepared_inputs
-            .first()
-            .map(|input| input.output_image_path.clone())
-            .unwrap_or_default();
+        let page_count = if page_count == 0 {
+            all_prepared_inputs.len() as u32
+        } else {
+            page_count
+        };
 
         let mut merged: BTreeMap<u32, ExtractedQuestionCandidate> = BTreeMap::new();
         let mut page_warnings = Vec::new();
         let mut successful_questions = 0u32;
         let mut attempted_questions = Vec::new();
         let mut failed_questions = Vec::new();
+        let mut page_usage: BTreeMap<u32, serde_json::Value> = BTreeMap::new();
         let mut project = self
             .project_store
             .get_project_snapshot(project_id.clone())?;
@@ -726,66 +782,23 @@ impl QuestionTextService {
                 )
                 .ok();
 
-            let prompt = build_question_text_prompt(question_number, expected_question_count);
-            let prompt_contract = build_prompt_contract(
-                crate::domain::model::ModelRequestKind::QuestionText,
-                "question_text_extraction_v2_typed_user_data",
-                "question_text_output_v1",
-                "question_text_policy_v1",
-                prompt.clone(),
-                json!({
-                    "targetQuestionNumber": question_number,
-                    "expectedQuestionCount": expected_question_count,
-                    "pageIndex": question_number,
-                    "pageCount": expected_question_count,
-                }),
-                default_sampling(4096),
-                Some(crate::domain::model::ModelResponseFormat::JsonObject),
-            );
-            let request = QuestionTextExtractionRequest {
-                prompt,
-                prompt_contract: Some(prompt_contract),
-                image_path: fallback_image_path.clone(),
-                page_index: question_number,
-                page_count: expected_question_count,
-                target_question_number: question_number,
-                model_input_images: all_prepared_inputs.clone(),
-            };
-
-            match self.model_gateway.extract_question_text(request).await {
-                Ok(result) => {
-                    successful_questions += 1;
-                    page_warnings.extend(result.output.page_warnings.clone());
-                    persist_raw_response(
-                        &self.project_store,
-                        &project_id,
-                        &job_id,
-                        question_number,
-                        &result.raw_response,
-                    )?;
-                    merge_candidates(
-                        &mut merged,
-                        result
-                            .output
-                            .questions
-                            .into_iter()
-                            .filter(|candidate| candidate.number == question_number)
-                            .collect(),
-                    );
-                }
+            let outcome = match self
+                .extract_question_text_targeted(
+                    &self.project_store,
+                    &project_id,
+                    &job_id,
+                    question_number,
+                    expected_question_count,
+                    &QuestionTextPageScope {
+                        inputs: &all_prepared_inputs,
+                        page_questions: &page_questions,
+                        page_count,
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
                 Err(mut error) => {
-                    if matches!(
-                        error.code,
-                        AppErrorCode::ModelResponseEmpty
-                            | AppErrorCode::ModelResponseInvalidJson
-                            | AppErrorCode::ModelResponseInvalidSchema
-                            | AppErrorCode::ModelResponseReasoningOnly
-                    ) {
-                        page_warnings.push(error.message.clone());
-                        failed_questions.push(question_number);
-                        continue;
-                    }
-
                     let old_details = error.technical_details.unwrap_or_default();
                     error.technical_details = Some(format!(
                         "Question: {question_number}/{expected_question_count}\n{old_details}"
@@ -793,7 +806,26 @@ impl QuestionTextService {
                     let _ = self.job_manager.fail(&app, &job_id, error.clone());
                     return Err(error);
                 }
+            };
+            page_warnings.extend(outcome.warnings);
+            if outcome.saw_ok {
+                successful_questions += 1;
             }
+            let found_candidate = outcome.candidate.is_some();
+            if let Some(candidate) = outcome.candidate.as_ref() {
+                merge_candidates(&mut merged, vec![candidate.clone()]);
+            } else {
+                failed_questions.push(question_number);
+            }
+            page_usage.insert(
+                question_number,
+                serde_json::json!({
+                    "pages": outcome.pages_used,
+                    "attempts": outcome.attempts,
+                    "stage": outcome.stage,
+                    "found": found_candidate,
+                }),
+            );
         }
 
         if successful_questions == 0 {
@@ -871,6 +903,7 @@ impl QuestionTextService {
                     "succeededQuestions": succeeded_questions,
                     "failedQuestions": failed_questions,
                     "calls": attempted_questions.len(),
+                    "pageUsage": page_usage,
                 },
                 "questionsExtracted": project.questions.iter().filter(|q| q.question_text.status == TextFieldStatus::Suggested).count(),
                 "questionsTotal": project.questions.len(),
@@ -887,6 +920,155 @@ impl QuestionTextService {
         Ok(())
     }
 
+    /// Extracts one question's text by escalating the page scope from the
+    /// exact target page to a ±1 window and finally to the whole document
+    /// (bounded broad fallback). Returns the best matching candidate or `None`.
+    ///
+    /// Fatal (non-retryable) model errors are returned; retryable errors are
+    /// collected in [`QuestionTextTargetedOutcome::warnings`].
+    async fn extract_question_text_targeted(
+        &self,
+        project_store: &ProjectStore,
+        project_id: &str,
+        job_id: &str,
+        question_number: u32,
+        expected_question_count: u32,
+        scope: &QuestionTextPageScope<'_>,
+    ) -> Result<QuestionTextTargetedOutcome, AppError> {
+        let fallback_image_path = scope
+            .inputs
+            .first()
+            .map(|input| input.output_image_path.clone())
+            .unwrap_or_default();
+        let prompt = build_question_text_prompt(question_number, expected_question_count);
+        let base_pages = crate::services::page_window_service::candidate_pages_for_question(
+            question_number,
+            scope.page_questions,
+            expected_question_count,
+            scope.page_count,
+        );
+        let window_pages = crate::services::page_window_service::expand_page_window(
+            &base_pages,
+            scope.page_count,
+            crate::services::page_window_service::WINDOW_RADIUS,
+        );
+        let all_pages = (1..=scope.page_count).collect::<Vec<_>>();
+
+        let mut saw_ok = false;
+        let mut best_target: Option<ExtractedQuestionCandidate> = None;
+        let mut attempts = 0u32;
+        let mut pages_used: Vec<u32> = Vec::new();
+        let mut stage = "target";
+        let mut warnings = Vec::new();
+        for (tier_stage, tier_pages) in [
+            ("target", base_pages),
+            ("window", window_pages),
+            ("fallback", all_pages),
+        ] {
+            if tier_pages.is_empty() {
+                continue;
+            }
+            let tier_inputs = crate::services::page_window_service::select_inputs_by_pages(
+                scope.inputs,
+                &tier_pages,
+            );
+            if tier_inputs.is_empty() {
+                continue;
+            }
+            attempts += 1;
+            pages_used = tier_pages.clone();
+            stage = tier_stage;
+            let tier_image_path = tier_inputs
+                .first()
+                .map(|input| input.output_image_path.clone())
+                .unwrap_or_else(|| fallback_image_path.clone());
+            let prompt_contract = build_prompt_contract(
+                crate::domain::model::ModelRequestKind::QuestionText,
+                "question_text_extraction_v2_typed_user_data",
+                "question_text_output_v1",
+                "question_text_policy_v1",
+                prompt.clone(),
+                json!({
+                    "targetQuestionNumber": question_number,
+                    "expectedQuestionCount": expected_question_count,
+                    "pageIndex": tier_pages.first().copied().unwrap_or(question_number),
+                    "pageCount": scope.page_count,
+                    "includedPages": tier_pages,
+                }),
+                default_sampling(4096),
+                Some(crate::domain::model::ModelResponseFormat::JsonObject),
+                None,
+            );
+            let request = QuestionTextExtractionRequest {
+                prompt: prompt.clone(),
+                prompt_contract: Some(prompt_contract),
+                image_path: tier_image_path,
+                page_index: question_number,
+                page_count: scope.page_count,
+                target_question_number: question_number,
+                model_input_images: tier_inputs,
+            };
+
+            match self.model_gateway.extract_question_text(request).await {
+                Ok(result) => {
+                    saw_ok = true;
+                    warnings.extend(result.output.page_warnings.clone());
+                    persist_raw_response(
+                        project_store,
+                        project_id,
+                        job_id,
+                        question_number,
+                        &result.raw_response,
+                    )?;
+                    if let Some(candidate) = result
+                        .output
+                        .questions
+                        .iter()
+                        .find(|candidate| candidate.number == question_number)
+                        .cloned()
+                    {
+                        let is_better = best_target.as_ref().map_or(true, |best| {
+                            candidate.confidence > best.confidence
+                                || (candidate.confidence == best.confidence
+                                    && candidate.question_text.len() > best.question_text.len())
+                        });
+                        if is_better {
+                            best_target = Some(candidate);
+                        }
+                        if best_target
+                            .as_ref()
+                            .is_some_and(|best| best.confidence >= QUESTION_TEXT_VISIBLE_CONFIDENCE)
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if matches!(
+                        error.code,
+                        AppErrorCode::ModelResponseEmpty
+                            | AppErrorCode::ModelResponseInvalidJson
+                            | AppErrorCode::ModelResponseInvalidSchema
+                            | AppErrorCode::ModelResponseReasoningOnly
+                    ) {
+                        warnings.push(error.message.clone());
+                        continue;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(QuestionTextTargetedOutcome {
+            candidate: best_target,
+            saw_ok,
+            attempts,
+            pages_used,
+            stage,
+            warnings,
+        })
+    }
+
     pub fn confirm_question_text(
         &self,
         project_id: &str,
@@ -896,9 +1078,18 @@ impl QuestionTextService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
         let now = chrono::Utc::now().to_rfc3339();
+        let written_count = project.written_family_activity_ids().len();
+        let scope_id = project.resolve_written_scope_id()?;
         let question = project
             .questions
             .iter_mut()
+            .filter(|q| {
+                record_belongs_to_written_scope(
+                    scope_id.as_deref(),
+                    written_count,
+                    q.assessment_activity_id.as_deref(),
+                )
+            })
             .find(|q| q.id == question_id)
             .ok_or_else(|| AppError {
                 code: AppErrorCode::QuestionTextSuggestionNotFound,
@@ -941,7 +1132,25 @@ impl QuestionTextService {
         let mut any_changed = false;
         let mut has_blocking_missing = false;
         let now = chrono::Utc::now().to_rfc3339();
-        for question in &mut project.questions {
+        let written_count = project.written_family_activity_ids().len();
+        let scope_id = project.resolve_written_scope_id()?;
+        let scoped_question_ids = project
+            .questions
+            .iter()
+            .filter(|q| {
+                record_belongs_to_written_scope(
+                    scope_id.as_deref(),
+                    written_count,
+                    q.assessment_activity_id.as_deref(),
+                )
+            })
+            .map(|q| q.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for question in project
+            .questions
+            .iter_mut()
+            .filter(|q| scoped_question_ids.contains(&q.id))
+        {
             match question.question_text.status {
                 TextFieldStatus::Missing | TextFieldStatus::Failed => {
                     has_blocking_missing = true;
@@ -1005,9 +1214,18 @@ impl QuestionTextService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
         let now = chrono::Utc::now().to_rfc3339();
+        let written_count = project.written_family_activity_ids().len();
+        let scope_id = project.resolve_written_scope_id()?;
         let question = project
             .questions
             .iter_mut()
+            .filter(|q| {
+                record_belongs_to_written_scope(
+                    scope_id.as_deref(),
+                    written_count,
+                    q.assessment_activity_id.as_deref(),
+                )
+            })
             .find(|q| q.id == question_id)
             .ok_or_else(|| AppError {
                 code: AppErrorCode::QuestionTextSuggestionNotFound,
@@ -1017,7 +1235,6 @@ impl QuestionTextService {
                 technical_details: None,
                 correlation_id: Uuid::new_v4().to_string(),
             })?;
-
         question.question_text.value = text;
         question.question_text.status = TextFieldStatus::Edited;
         question.question_text.source = if question.question_text.source == TextFieldSource::Unknown
@@ -1096,13 +1313,12 @@ impl QuestionTextService {
         }
         .to_string();
 
-        let suggested_count = project
-            .questions
+        let scoped_questions = project.written_scope_view().questions;
+        let suggested_count = scoped_questions
             .iter()
             .filter(|question| question.question_text.status == TextFieldStatus::Suggested)
             .count() as u32;
-        let confirmed_count = project
-            .questions
+        let confirmed_count = scoped_questions
             .iter()
             .filter(|question| {
                 matches!(
@@ -1111,8 +1327,7 @@ impl QuestionTextService {
                 )
             })
             .count() as u32;
-        let missing_count = project
-            .questions
+        let missing_count = scoped_questions
             .iter()
             .filter(|question| {
                 matches!(
@@ -1121,8 +1336,7 @@ impl QuestionTextService {
                 )
             })
             .count() as u32;
-        let missing_question_numbers = project
-            .questions
+        let missing_question_numbers = scoped_questions
             .iter()
             .filter(|question| {
                 matches!(
@@ -1190,11 +1404,11 @@ impl QuestionTextService {
             .get_project_snapshot(project_id.to_string())?;
         let mut suggestions = Vec::new();
 
-        for question in project.questions {
+        for question in project.written_scope_view().questions {
             suggestions.push(QuestionTextSuggestion {
-                question_id: question.id,
+                question_id: question.id.clone(),
                 number: question.number,
-                text: question.question_text.value,
+                text: question.question_text.value.clone(),
                 confidence: question.question_text.confidence.unwrap_or(0.0),
                 source: "exam_pdf".to_string(),
                 status: match question.question_text.status {
@@ -1205,7 +1419,7 @@ impl QuestionTextService {
                     TextFieldStatus::Failed => "failed",
                 }
                 .to_string(),
-                warnings: question.question_text.warnings,
+                warnings: question.question_text.warnings.clone(),
             });
         }
 
@@ -1577,6 +1791,18 @@ pub(crate) fn apply_extraction_to_project_with_expected(
     page_warnings: Vec<String>,
     expected_count: u32,
 ) -> QuestionCoverageValidationResult {
+    // TD-01: extraction is scoped to the active written activity. Questions of
+    // other written activities are never seen, edited, or overwritten here.
+    let written_count = project.written_family_activity_ids().len();
+    let scope_id = project.resolve_written_scope_id().ok().flatten();
+    project.questions.retain(|question| {
+        record_belongs_to_written_scope(
+            scope_id.as_deref(),
+            written_count,
+            question.assessment_activity_id.as_deref(),
+        )
+    });
+
     let coverage = validate_question_coverage(expected_count, candidates);
     let normalized_candidates = coverage.normalized_candidates.clone();
     let mut by_number: BTreeMap<u32, ExtractedQuestionCandidate> = BTreeMap::new();
@@ -1597,18 +1823,25 @@ pub(crate) fn apply_extraction_to_project_with_expected(
 
     if project.questions.is_empty() && expected_count > 0 {
         for number in 1..=expected_count {
-            project.questions.push(default_question(number));
+            let mut question = default_question(number);
+            question.assessment_activity_id = scope_id.clone();
+            project.questions.push(question);
         }
     }
 
     if project.questions.len() < expected_count as usize {
         let start = project.questions.len() as u32 + 1;
         for number in start..=expected_count {
-            project.questions.push(default_question(number));
+            let mut question = default_question(number);
+            question.assessment_activity_id = scope_id.clone();
+            project.questions.push(question);
         }
     }
 
     for question in &mut project.questions {
+        if question.assessment_activity_id.is_none() {
+            question.assessment_activity_id = scope_id.clone();
+        }
         if let Some(candidate) = by_number.get(&question.number) {
             let contaminated = contaminated_numbers.contains(&question.number);
             let existing_contaminated =
@@ -1667,6 +1900,7 @@ pub(crate) fn apply_extraction_to_project_with_expected(
             .any(|q| q.number == candidate.number)
         {
             let mut question = default_question(candidate.number);
+            question.assessment_activity_id = scope_id.clone();
             question.question_text.value = candidate.question_text.clone();
             question.question_text.source = TextFieldSource::ExamPdf;
             question.question_text.status = TextFieldStatus::Suggested;
@@ -1681,6 +1915,18 @@ pub(crate) fn apply_extraction_to_project_with_expected(
 
     project.questions.sort_by_key(|q| q.number);
     coverage
+}
+
+fn record_belongs_to_written_scope(
+    scope_id: Option<&str>,
+    written_count: usize,
+    record_activity: Option<&str>,
+) -> bool {
+    match (scope_id, record_activity) {
+        (Some(scope), Some(record)) => scope == record,
+        (Some(_), None) => written_count == 1,
+        (None, _) => true,
+    }
 }
 
 fn persist_raw_response(
@@ -1707,6 +1953,14 @@ fn persist_raw_response(
 mod tests {
     use super::*;
     use crate::domain::document::{Document, DocumentRole};
+    use crate::domain::model::{
+        AnalysisReportRequest, AnalysisReportResult, ModelStatus, QuestionTextExtractionResult,
+        RubricExtractionRequest, RubricExtractionResult, ScoringRequest, ScoringResult,
+        SpeakingTranscriptCleanupRequest, SpeakingTranscriptCleanupResult,
+        StudentAnswerOcrIssueCorrectionRequest, StudentAnswerOcrIssueCorrectionResult,
+        StudentAnswerOcrRequest, StudentAnswerOcrResult, StudentIdentityOcrRequest,
+        StudentIdentityOcrResult,
+    };
     use crate::domain::project::{ExamPackageFreeze, ExamPackageFreezeStatus, Project};
     use crate::domain::question::{AnswerType, Question, TextFieldSource, TextFieldState};
     use crate::domain::rubric::{RubricState, RubricStatus};
@@ -1719,6 +1973,8 @@ mod tests {
     use crate::services::pdf_service::SystemPdfService;
     use crate::services::project_store::ProjectStore;
     use crate::services::workflow_engine;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
 
     fn temp_project_root() -> String {
         let root = std::env::temp_dir().join(format!("rubrika-v3-{}", uuid::Uuid::new_v4()));
@@ -1726,25 +1982,259 @@ mod tests {
         root.to_string_lossy().to_string()
     }
 
+    fn page_input(page_number: u32) -> ModelInputImage {
+        ModelInputImage {
+            kind: crate::domain::model::ModelInputImageKind::QuestionText,
+            document_id: "doc-1".to_string(),
+            page_number,
+            source_image_path: format!("src-{page_number}.jpg"),
+            output_image_path: format!("out-{page_number}.jpg"),
+            source_width: 100,
+            source_height: 100,
+            output_width: 100,
+            output_height: 100,
+            source_bytes: 0,
+            output_bytes: 0,
+            base64_approx_bytes: 0,
+            long_edge_max: 2000,
+            jpeg_quality: 92,
+            created_at: "now".to_string(),
+            source_sha256: None,
+            output_sha256: None,
+            cache_key: None,
+            cache_transaction_id: None,
+            cache_hit: false,
+        }
+    }
+
+    fn qt_result(pages: &[u32], target: u32, confidence: f32) -> QuestionTextExtractionResult {
+        QuestionTextExtractionResult {
+            page_index: pages.first().copied().unwrap_or(0),
+            page_count: pages.len() as u32,
+            output: crate::domain::model::QuestionTextExtractionOutput {
+                questions: vec![ExtractedQuestionCandidate {
+                    number: target,
+                    question_text: format!("Question {target} text"),
+                    confidence,
+                    warnings: vec![],
+                }],
+                page_warnings: vec![],
+            },
+            raw_response: format!("raw for {target} on {pages:?}"),
+            diagnostics: crate::domain::model::ModelDiagnostics {
+                endpoint: "".to_string(),
+                request_kind: crate::domain::model::ModelRequestKind::QuestionText,
+                http_status: None,
+                duration_ms: 0,
+                prompt_length: None,
+                image_count: Some(pages.len() as u32),
+                image_total_bytes: None,
+                base64_approx_total_bytes: None,
+                model_input_images: vec![],
+                timeout_seconds: None,
+                max_tokens: None,
+                finish_reason: None,
+                content_length: None,
+                reasoning_content_length: None,
+                raw_text_stored_path: None,
+                error_code: None,
+                provenance: None,
+            },
+        }
+    }
+
+    #[derive(Clone)]
+    enum QtGatewayMode {
+        AlwaysVisible {
+            confidence: f32,
+        },
+        VisibleOnSubset {
+            page_sets: Vec<Vec<u32>>,
+            confidence: f32,
+        },
+        ConfidenceByPageSet {
+            page_sets: Vec<(Vec<u32>, f32)>,
+        },
+        AlwaysEmpty,
+        RetryableError,
+    }
+
+    struct RecordingGateway {
+        mode: QtGatewayMode,
+        calls: Mutex<Vec<Vec<u32>>>,
+    }
+
+    impl RecordingGateway {
+        fn new(mode: QtGatewayMode) -> Self {
+            Self {
+                mode,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::services::model_gateway::ModelGateway for RecordingGateway {
+        async fn get_status(&self) -> Result<ModelStatus, AppError> {
+            Ok(ModelStatus::default())
+        }
+        async fn probe_server(&self) -> Result<ModelStatus, AppError> {
+            Ok(ModelStatus::default())
+        }
+        async fn health_status(&self, _base_url: &str) -> Result<ModelStatus, AppError> {
+            Ok(ModelStatus::default())
+        }
+        async fn probe_status(&self, _base_url: &str) -> Result<ModelStatus, AppError> {
+            Ok(ModelStatus::default())
+        }
+        async fn extract_question_text(
+            &self,
+            input: QuestionTextExtractionRequest,
+        ) -> Result<QuestionTextExtractionResult, AppError> {
+            let pages = input
+                .model_input_images
+                .iter()
+                .map(|image| image.page_number)
+                .collect::<Vec<_>>();
+            self.calls.lock().unwrap().push(pages.clone());
+            let target = input.target_question_number;
+            match &self.mode {
+                QtGatewayMode::AlwaysVisible { confidence } => {
+                    Ok(qt_result(&pages, target, *confidence))
+                }
+                QtGatewayMode::VisibleOnSubset {
+                    page_sets,
+                    confidence,
+                } => {
+                    let visible = page_sets.iter().any(|set| {
+                        set.len() == pages.len() && set.iter().all(|p| pages.contains(p))
+                    });
+                    if visible {
+                        Ok(qt_result(&pages, target, *confidence))
+                    } else {
+                        Ok(qt_result(&pages, 0, 0.0))
+                    }
+                }
+                QtGatewayMode::ConfidenceByPageSet { page_sets } => {
+                    let matched = page_sets
+                        .iter()
+                        .find(|(set, _)| {
+                            set.len() == pages.len() && set.iter().all(|p| pages.contains(p))
+                        })
+                        .map(|(_, confidence)| *confidence);
+                    match matched {
+                        Some(confidence) => Ok(qt_result(&pages, target, confidence)),
+                        None => Ok(qt_result(&pages, 0, 0.0)),
+                    }
+                }
+                QtGatewayMode::AlwaysEmpty => {
+                    Ok(crate::domain::model::QuestionTextExtractionResult {
+                        page_index: pages.first().copied().unwrap_or(0),
+                        page_count: pages.len() as u32,
+                        output: crate::domain::model::QuestionTextExtractionOutput {
+                            questions: vec![],
+                            page_warnings: vec![],
+                        },
+                        raw_response: "empty".to_string(),
+                        diagnostics: crate::domain::model::ModelDiagnostics {
+                            endpoint: "".to_string(),
+                            request_kind: crate::domain::model::ModelRequestKind::QuestionText,
+                            http_status: None,
+                            duration_ms: 0,
+                            prompt_length: None,
+                            image_count: Some(0),
+                            image_total_bytes: None,
+                            base64_approx_total_bytes: None,
+                            model_input_images: vec![],
+                            timeout_seconds: None,
+                            max_tokens: None,
+                            finish_reason: None,
+                            content_length: None,
+                            reasoning_content_length: None,
+                            raw_text_stored_path: None,
+                            error_code: None,
+                            provenance: None,
+                        },
+                    })
+                }
+                QtGatewayMode::RetryableError => Err(AppError {
+                    code: AppErrorCode::ModelResponseEmpty,
+                    message: "empty".to_string(),
+                    recoverable: true,
+                    suggested_action: None,
+                    technical_details: None,
+                    correlation_id: "corr".to_string(),
+                }),
+            }
+        }
+        async fn draft_rubric(
+            &self,
+            _input: RubricExtractionRequest,
+        ) -> Result<RubricExtractionResult, AppError> {
+            Err(AppError {
+                code: AppErrorCode::UnknownError,
+                message: "unused".to_string(),
+                recoverable: false,
+                suggested_action: None,
+                technical_details: None,
+                correlation_id: "corr".to_string(),
+            })
+        }
+        async fn extract_student_answer_ocr(
+            &self,
+            _input: StudentAnswerOcrRequest,
+        ) -> Result<StudentAnswerOcrResult, AppError> {
+            unreachable!()
+        }
+        async fn suggest_student_answer_issue_correction(
+            &self,
+            _input: StudentAnswerOcrIssueCorrectionRequest,
+        ) -> Result<StudentAnswerOcrIssueCorrectionResult, AppError> {
+            unreachable!()
+        }
+        async fn extract_student_identity_ocr(
+            &self,
+            _input: StudentIdentityOcrRequest,
+        ) -> Result<StudentIdentityOcrResult, AppError> {
+            unreachable!()
+        }
+        async fn cleanup_speaking_transcript(
+            &self,
+            _input: SpeakingTranscriptCleanupRequest,
+        ) -> Result<SpeakingTranscriptCleanupResult, AppError> {
+            unreachable!()
+        }
+        async fn generate_analysis_report(
+            &self,
+            _input: AnalysisReportRequest,
+        ) -> Result<AnalysisReportResult, AppError> {
+            unreachable!()
+        }
+        async fn score_answer(&self, _input: ScoringRequest) -> Result<ScoringResult, AppError> {
+            unreachable!()
+        }
+    }
+
     fn service_for_tests(project_store: ProjectStore) -> QuestionTextService {
         service_for_tests_with_job_manager(project_store, std::sync::Arc::new(JobManager::new()))
     }
 
-    fn service_for_tests_with_job_manager(
+    fn service_for_tests_with_gateway(
         project_store: ProjectStore,
         job_manager: std::sync::Arc<JobManager>,
+        model_gateway: std::sync::Arc<dyn crate::services::model_gateway::ModelGateway>,
     ) -> QuestionTextService {
         let pdf_preview_service = std::sync::Arc::new(PdfPreviewService::new(
             project_store.clone(),
             std::sync::Arc::new(SystemPdfService),
             job_manager.clone(),
         ));
-        let model_gateway_impl = std::sync::Arc::new(LlamaServerGateway::default());
         let model_config = crate::services::model_config_service::ModelConfigService::new();
+        let runtime_gateway = std::sync::Arc::new(LlamaServerGateway::default());
         let model_process_manager =
             crate::services::model_process_manager::ModelProcessManager::new(
                 model_config.clone(),
-                model_gateway_impl.clone(),
+                runtime_gateway,
             );
         let model_runtime_service =
             crate::services::model_runtime_service::ModelRuntimeService::new(
@@ -1757,12 +2247,20 @@ mod tests {
         );
         QuestionTextService::new(
             project_store,
-            model_gateway_impl,
+            model_gateway,
             model_runtime_service,
             pdf_preview_service,
             document_content_extraction_service,
             job_manager,
         )
+    }
+
+    fn service_for_tests_with_job_manager(
+        project_store: ProjectStore,
+        job_manager: std::sync::Arc<JobManager>,
+    ) -> QuestionTextService {
+        let model_gateway_impl = std::sync::Arc::new(LlamaServerGateway::default());
+        service_for_tests_with_gateway(project_store, job_manager, model_gateway_impl)
     }
 
     #[test]
@@ -1788,6 +2286,7 @@ mod tests {
         let question_id = question.id.clone();
         project.questions = vec![question];
         project.exam_package_freeze = Some(ExamPackageFreeze {
+            assessment_activity_id: None,
             exam_package_version: 1,
             freeze_status: ExamPackageFreezeStatus::Frozen,
             frozen_at: "now".to_string(),
@@ -1884,6 +2383,7 @@ BAŞARILAR...";
     #[test]
     fn fallback_targets_are_clamped_and_deduped() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: Some(6),
             exam_package_freeze: None,
             id: "p1".to_string(),
@@ -1913,6 +2413,7 @@ BAŞARILAR...";
             documents: vec![],
             questions: vec![
                 Question {
+                    assessment_activity_id: None,
                     id: "q1".to_string(),
                     number: 1,
                     max_score: 0.0,
@@ -1941,6 +2442,7 @@ BAŞARILAR...";
                     crop_template: None,
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: "q2".to_string(),
                     number: 2,
                     max_score: 0.0,
@@ -1969,6 +2471,7 @@ BAŞARILAR...";
                     crop_template: None,
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: "q3".to_string(),
                     number: 3,
                     max_score: 0.0,
@@ -1997,6 +2500,7 @@ BAŞARILAR...";
                     crop_template: None,
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: "q4".to_string(),
                     number: 4,
                     max_score: 0.0,
@@ -2025,6 +2529,7 @@ BAŞARILAR...";
                     crop_template: None,
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: "q5".to_string(),
                     number: 5,
                     max_score: 0.0,
@@ -2053,6 +2558,7 @@ BAŞARILAR...";
                     crop_template: None,
                 },
                 Question {
+                    assessment_activity_id: None,
                     id: "q6".to_string(),
                     number: 6,
                     max_score: 0.0,
@@ -2137,6 +2643,7 @@ BAŞARILAR...";
     #[test]
     fn apply_extraction_creates_missing_skeletons_and_suggests_values() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "p1".to_string(),
@@ -2245,6 +2752,7 @@ BAŞARILAR...";
     #[test]
     fn apply_extraction_preserves_confirmed_texts() {
         let mut project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "p1".to_string(),
@@ -2283,6 +2791,7 @@ BAŞARILAR...";
             }],
             questions: vec![
                 Question {
+                    assessment_activity_id: None,
                     id: "q1".to_string(),
                     number: 1,
                     max_score: 0.0,
@@ -2527,6 +3036,7 @@ BAŞARILAR...";
             }),
         });
         project.questions = vec![Question {
+            assessment_activity_id: None,
             id: "q1".to_string(),
             number: 1,
             max_score: 10.0,
@@ -2621,6 +3131,7 @@ BAŞARILAR...";
             .expect("project");
 
         project.questions.push(Question {
+            assessment_activity_id: None,
             id: "q1-p7".to_string(),
             number: 1,
             max_score: 10.0,
@@ -2685,6 +3196,8 @@ BAŞARILAR...";
             expected_question_count: 1,
             target_question_numbers: vec![1],
             model_inputs: vec![],
+            page_questions: BTreeMap::new(),
+            page_count: 0,
         };
 
         let res = service
@@ -2706,5 +3219,148 @@ BAŞARILAR...";
             updated.questions[0].question_text.status,
             TextFieldStatus::Edited
         );
+    }
+
+    async fn targeted_outcome(
+        mode: QtGatewayMode,
+        page_questions: BTreeMap<u32, Vec<u32>>,
+        page_count: u32,
+        target: u32,
+    ) -> (QuestionTextTargetedOutcome, Vec<Vec<u32>>) {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        let project = store.create_project("p".to_string(), root).unwrap();
+        let gateway = std::sync::Arc::new(RecordingGateway::new(mode));
+        let service = service_for_tests_with_gateway(
+            store.clone(),
+            std::sync::Arc::new(JobManager::new()),
+            gateway.clone(),
+        );
+        let inputs = (1..=page_count).map(page_input).collect::<Vec<_>>();
+        let outcome = service
+            .extract_question_text_targeted(
+                &store,
+                &project.id,
+                "job-1",
+                target,
+                page_count,
+                &QuestionTextPageScope {
+                    inputs: &inputs,
+                    page_questions: &page_questions,
+                    page_count,
+                },
+            )
+            .await
+            .unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        (outcome, calls)
+    }
+
+    #[tokio::test]
+    async fn extraction_sends_only_the_target_page_not_all_pages() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(2, vec![2]);
+        let (outcome, calls) = targeted_outcome(
+            QtGatewayMode::AlwaysVisible { confidence: 0.9 },
+            page_questions,
+            5,
+            2,
+        )
+        .await;
+        assert!(outcome.candidate.is_some());
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(outcome.stage, "target");
+        // Exactly one request limited to the target page; no full-document clone.
+        assert_eq!(calls, vec![vec![2]]);
+    }
+
+    #[tokio::test]
+    async fn extraction_escalates_to_window_when_target_page_does_not_contain_question() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(2, vec![2]);
+        // Question visible only once the ±1 window (pages 1-3) is included.
+        let (outcome, calls) = targeted_outcome(
+            QtGatewayMode::VisibleOnSubset {
+                page_sets: vec![vec![1, 2, 3]],
+                confidence: 0.9,
+            },
+            page_questions,
+            5,
+            2,
+        )
+        .await;
+        assert!(outcome.candidate.is_some());
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(outcome.stage, "window");
+        assert_eq!(calls, vec![vec![2], vec![1, 2, 3]]);
+    }
+
+    #[tokio::test]
+    async fn extraction_uses_broad_fallback_as_last_resort() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(4, vec![4]);
+        // Question visible only when the whole document is sent.
+        let (outcome, calls) = targeted_outcome(
+            QtGatewayMode::VisibleOnSubset {
+                page_sets: vec![vec![1, 2, 3, 4, 5]],
+                confidence: 0.9,
+            },
+            page_questions,
+            5,
+            4,
+        )
+        .await;
+        assert!(outcome.candidate.is_some());
+        assert_eq!(outcome.attempts, 3);
+        assert_eq!(outcome.stage, "fallback");
+        assert_eq!(calls, vec![vec![4], vec![3, 4, 5], vec![1, 2, 3, 4, 5]]);
+    }
+
+    #[tokio::test]
+    async fn extraction_bounded_fallback_returns_none_when_question_never_visible() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(1, vec![1]);
+        let (outcome, calls) =
+            targeted_outcome(QtGatewayMode::AlwaysEmpty, page_questions, 3, 1).await;
+        assert!(outcome.candidate.is_none());
+        // Empty-but-successful responses still count as model calls.
+        assert!(outcome.saw_ok);
+        assert_eq!(outcome.attempts, 3);
+        // Bounded: exactly one attempt per tier, no unbounded retry loop.
+        assert_eq!(calls, vec![vec![1], vec![1, 2], vec![1, 2, 3]]);
+    }
+
+    #[tokio::test]
+    async fn extraction_escalates_on_low_confidence_and_keeps_best_candidate() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(2, vec![2]);
+        // Target page returns the question with low confidence; the window
+        // returns a high-confidence read. Both are used as best candidate.
+        let (outcome, calls) = targeted_outcome(
+            QtGatewayMode::ConfidenceByPageSet {
+                page_sets: vec![(vec![2], 0.3), (vec![1, 2, 3], 0.9)],
+            },
+            page_questions,
+            5,
+            2,
+        )
+        .await;
+        // Low-confidence target page result does NOT stop escalation.
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(calls, vec![vec![2], vec![1, 2, 3]]);
+        let candidate = outcome.candidate.expect("best candidate kept");
+        assert_eq!(candidate.confidence, 0.9);
+    }
+
+    #[tokio::test]
+    async fn extraction_treats_retryable_errors_as_escalation_signals() {
+        let mut page_questions = BTreeMap::new();
+        page_questions.insert(1, vec![1]);
+        let (outcome, calls) =
+            targeted_outcome(QtGatewayMode::RetryableError, page_questions, 3, 1).await;
+        assert!(outcome.candidate.is_none());
+        assert_eq!(outcome.attempts, 3);
+        assert_eq!(outcome.warnings.len(), 3);
+        assert_eq!(calls, vec![vec![1], vec![1, 2], vec![1, 2, 3]]);
     }
 }

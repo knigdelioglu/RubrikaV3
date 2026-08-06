@@ -162,7 +162,11 @@ impl ExamPackageBuildService {
                         &job_id,
                         Some(error.message.as_str()),
                     );
-                    let _ = service.project_store.commit_snapshot_cas(&project);
+                    if let Err(commit_error) = service.project_store.commit_snapshot_cas(&project) {
+                        log::error!(
+                            "Sınav paketi başarısızlık workflow güncellemesi kalıcı yazılamadı: {commit_error}"
+                        );
+                    }
                 }
             }
         });
@@ -1029,6 +1033,7 @@ mod tests {
         second.rubric.max_score = Some(5.0);
         second.rubric.expected_answer = Some("B".to_string());
         let project = Project {
+            active_written_assessment_activity_id: None,
             expected_question_count: None,
             exam_package_freeze: None,
             id: "p1".to_string(),

@@ -257,10 +257,6 @@ export function StudentAnswerOcrIssueReviewPage() {
     queryKey: ['jobs', projectId],
     queryFn: () => commands.listJobs(projectId!),
     enabled: !!projectId,
-    refetchInterval: (query) => {
-      const active = query.state.data?.some((job) => job.status === 'queued' || job.status === 'running');
-      return active ? 1000 : false;
-    },
   });
 
   const saveMutation = useMutation({

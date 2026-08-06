@@ -58,6 +58,7 @@ pub enum AppErrorCode {
     ModelResponseTruncated,
     ModelResponseInvalidContentType,
     ModelRequestTooLarge,
+    ModelPromptContractMissing,
     OcrFailed,
     ScoringFailed,
     QepNotFrozen,
@@ -203,6 +204,19 @@ pub enum AppErrorCode {
     PreviewActiveGenerationMissing,
     GenerationStillReferenced,
     GenerationGcFailed,
+    /// Versioned TD-01 migration could not determine which written-family
+    /// assessment activity owns the flat legacy written records.
+    MigrationAmbiguousAssessmentScope,
+    /// A written-family operation needs a single active written activity but
+    /// the project has several written activities and no active pointer.
+    WrittenScopeAmbiguous,
+    ActiveWrittenActivityNotFound,
+    /// A scanned OCR input is skewed beyond the acceptable deskew range; the
+    /// input is rejected rather than silently "corrected".
+    DeskewOutOfRange,
+    /// A scanned OCR page does not align with the expected answer-region grid
+    /// beyond the registration deviation threshold; the input is rejected.
+    RegistrationOutOfRange,
 }
 
 #[derive(Debug, Clone)]

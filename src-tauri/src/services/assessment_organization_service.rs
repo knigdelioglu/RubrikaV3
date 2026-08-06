@@ -389,6 +389,13 @@ impl AssessmentOrganizationService {
             updated_at: now,
         };
         project.assessment_activities.push(activity.clone());
+        if matches!(
+            activity.assessment_type,
+            crate::domain::assessment::AssessmentType::Written
+                | crate::domain::assessment::AssessmentType::Listening
+        ) {
+            project.active_written_assessment_activity_id = Some(activity.id.clone());
+        }
         Ok(activity)
     }
 
@@ -408,6 +415,46 @@ impl AssessmentOrganizationService {
                     "activity_id not found.",
                 )
             })
+    }
+
+    /// Backend-authoritative scope selector for written-family activities.
+    /// Persists `Project.active_written_assessment_activity_id` so the
+    /// project-level written collections are read and written against the
+    /// selected activity (TD-01). Rejects non-written activities.
+    pub fn set_active_written_activity(
+        &self,
+        input: AssessmentActivityIdInput,
+    ) -> Result<AssessmentActivity, AppError> {
+        let _mutation_guard = self.mutation_guard()?;
+        let mut project = self.load_project(&input.project_id)?;
+        let activity = project
+            .assessment_activities
+            .iter()
+            .find(|activity| activity.id == input.activity_id)
+            .ok_or_else(|| {
+                activity_error(
+                    AppErrorCode::AssessmentActivityNotFound,
+                    "Sınav bulunamadı.",
+                    "activity_id not found.",
+                )
+            })?;
+        if !matches!(
+            activity.assessment_type,
+            crate::domain::assessment::AssessmentType::Written
+                | crate::domain::assessment::AssessmentType::Listening
+        ) {
+            return Err(activity_error(
+                AppErrorCode::AssessmentInvalidInput,
+                "Yazılı sınav çalışma alanı yalnız yazılı/dinleme sınavları için seçilebilir.",
+                "set_active_written_activity requires a written-family activity.",
+            ));
+        }
+        project.active_written_assessment_activity_id = Some(activity.id.clone());
+        let updated = activity.clone();
+        self.project_store
+            .commit_snapshot_cas(&project)
+            .map(|_| ())?;
+        Ok(updated)
     }
 
     pub fn get_class_applications(
@@ -624,10 +671,10 @@ impl AssessmentOrganizationService {
     ) -> Result<ClassApplication, AppError> {
         let _mutation_guard = self.mutation_guard()?;
         let mut project = self.load_project(&input.project_id)?;
-        let activity = project
+        let activity_index = project
             .assessment_activities
-            .iter_mut()
-            .find(|activity| activity.id == input.activity_id)
+            .iter()
+            .position(|activity| activity.id == input.activity_id)
             .ok_or_else(|| {
                 activity_error(
                     AppErrorCode::AssessmentActivityNotFound,
@@ -635,7 +682,8 @@ impl AssessmentOrganizationService {
                     "activity_id not found.",
                 )
             })?;
-        let index = activity
+        let activity = &project.assessment_activities[activity_index];
+        let application_index = activity
             .class_applications
             .iter()
             .position(|application| application.id == input.application_id)
@@ -646,23 +694,57 @@ impl AssessmentOrganizationService {
                     "application_id not found.",
                 )
             })?;
-        let application = &activity.class_applications[index];
+        let activity_id = activity.id.clone();
+        let activity_type = activity.assessment_type;
+        let application = &activity.class_applications[application_index];
+        let application_id = application.id.clone();
+        let school_class_id = application.school_class_id.clone();
         let has_attempts = !application.performance_assessments.is_empty()
             || !application.speaking_attempts.is_empty()
             || project.speaking_exams.iter().any(|exam| {
-                exam.assessment_activity_id.as_deref() == Some(&activity.id)
+                exam.assessment_activity_id.as_deref() == Some(activity_id.as_str())
                     && exam.attempts.iter().any(|attempt| {
-                        attempt.class_application_id.as_deref() == Some(&application.id)
+                        attempt.class_application_id.as_deref() == Some(&application_id)
                     })
             });
-        if has_attempts {
+        // TD-01: written-family activities keep their project-level data
+        // (submissions, OCR, scoring) scoped to the activity; a class
+        // application that already owns such data must not be silently removed.
+        let written_data_for_class = if matches!(
+            activity_type,
+            crate::domain::assessment::AssessmentType::Written
+                | crate::domain::assessment::AssessmentType::Listening
+        ) {
+            let view = project.written_scope_view();
+            let scoped_submissions = view
+                .student_submissions
+                .iter()
+                .filter(|submission| {
+                    submission.class_id.as_deref() == Some(school_class_id.as_str())
+                })
+                .map(|submission| submission.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            !scoped_submissions.is_empty()
+                || view
+                    .student_answer_ocr_records
+                    .iter()
+                    .any(|record| scoped_submissions.contains(record.submission_id.as_str()))
+                || view
+                    .scoring_records
+                    .iter()
+                    .any(|record| scoped_submissions.contains(record.submission_id.as_str()))
+        } else {
+            false
+        };
+        if has_attempts || written_data_for_class {
             return Err(activity_error(
                 AppErrorCode::AssessmentClassApplicationInUse,
                 "Bu sınıf uygulamasında değerlendirme kayıtları bulunduğu için kaldırılamaz.",
                 "class application has assessments or artifacts.",
             ));
         }
-        let removed = activity.class_applications.remove(index);
+        let activity = &mut project.assessment_activities[activity_index];
+        let removed = activity.class_applications.remove(application_index);
         activity.updated_at = chrono::Utc::now().to_rfc3339();
         self.project_store
             .commit_snapshot_cas(&project)
@@ -1267,6 +1349,275 @@ mod tests {
         assert_eq!(
             result.unwrap_err().code,
             AppErrorCode::AssessmentClassApplicationInUse
+        );
+    }
+
+    fn written_activity_input(
+        project_id: &str,
+        class_id: &str,
+        sequence: u32,
+    ) -> CreateAssessmentActivityInput {
+        CreateAssessmentActivityInput {
+            project_id: project_id.to_string(),
+            academic_year_id: "2026-2027".into(),
+            course_id: "tde".into(),
+            course_name: "Türk Dili ve Edebiyatı".into(),
+            title: format!("{}. Yazılı", sequence),
+            grade_level: 11,
+            term: 1,
+            assessment_type: AssessmentType::Written,
+            sequence_number: sequence,
+            school_class_ids: vec![class_id.to_string()],
+            speaking_configuration: None,
+            listening_details: None,
+            performance_details: None,
+        }
+    }
+
+    #[test]
+    fn set_active_written_activity_persists_pointer_and_rejects_non_written() {
+        let (store, project_id, classes) = temp_project();
+        let school_class = classes
+            .create_school_class(CreateSchoolClassInput {
+                project_id: project_id.clone(),
+                name: "11C".into(),
+                academic_year: Some("2026-2027".into()),
+                grade_level: Some(11),
+                section: Some("C".into()),
+                display_order: None,
+            })
+            .expect("class should be created");
+        classes
+            .create_teaching_assignment(CreateTeachingAssignmentInput {
+                project_id: project_id.clone(),
+                academic_year_id: "2026-2027".into(),
+                course_id: "tde".into(),
+                course_name: "Türk Dili ve Edebiyatı".into(),
+                class_section_id: school_class.id.clone(),
+                teacher_id: None,
+            })
+            .expect("assignment should be created");
+        let service = AssessmentOrganizationService::new(store.clone(), Arc::new(classes.clone()));
+        let first = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 1))
+            .expect("written activity A");
+        let second = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 2))
+            .expect("written activity B");
+
+        // Creating a written activity auto-selects it as the active scope.
+        let persisted = store.get_project_snapshot(project_id.clone()).unwrap();
+        assert_eq!(
+            persisted.active_written_assessment_activity_id.as_deref(),
+            Some(second.id.as_str())
+        );
+
+        // Backend-authoritative pointer switch to activity A.
+        service
+            .set_active_written_activity(AssessmentActivityIdInput {
+                project_id: project_id.clone(),
+                activity_id: first.id.clone(),
+            })
+            .expect("switch to A");
+        let persisted = store.get_project_snapshot(project_id.clone()).unwrap();
+        assert_eq!(
+            persisted.active_written_assessment_activity_id.as_deref(),
+            Some(first.id.as_str())
+        );
+        assert_eq!(
+            persisted.resolve_written_scope_id().unwrap().as_deref(),
+            Some(first.id.as_str())
+        );
+
+        // Non-written activities are rejected.
+        let speaking = service
+            .create_activity(CreateAssessmentActivityInput {
+                assessment_type: AssessmentType::Speaking,
+                sequence_number: 3,
+                speaking_configuration: Some(SpeakingConfigurationSnapshot {
+                    speaking_type: "prepared".into(),
+                    task_text: "task".into(),
+                    target_duration_seconds: 180,
+                    min_duration_seconds: 60,
+                    max_duration_seconds: 300,
+                    rubric_version: "v1".into(),
+                    scoring_policy_version: "v1".into(),
+                    cleanup_prompt_version: "v1".into(),
+                    evaluation_prompt_version: "v1".into(),
+                    frozen_model_file_hash: None,
+                    rubric_snapshot: serde_json::json!({}),
+                }),
+                ..written_activity_input(&project_id, &school_class.id, 3)
+            })
+            .expect("speaking activity");
+        let error = service
+            .set_active_written_activity(AssessmentActivityIdInput {
+                project_id: project_id.clone(),
+                activity_id: speaking.id,
+            })
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::AssessmentInvalidInput);
+    }
+
+    #[test]
+    fn remove_class_application_with_written_submission_is_blocked() {
+        let (store, project_id, classes) = temp_project();
+        let school_class = classes
+            .create_school_class(CreateSchoolClassInput {
+                project_id: project_id.clone(),
+                name: "11D".into(),
+                academic_year: Some("2026-2027".into()),
+                grade_level: Some(11),
+                section: Some("D".into()),
+                display_order: None,
+            })
+            .expect("class should be created");
+        classes
+            .create_teaching_assignment(CreateTeachingAssignmentInput {
+                project_id: project_id.clone(),
+                academic_year_id: "2026-2027".into(),
+                course_id: "tde".into(),
+                course_name: "Türk Dili ve Edebiyatı".into(),
+                class_section_id: school_class.id.clone(),
+                teacher_id: None,
+            })
+            .expect("assignment should be created");
+        let service = AssessmentOrganizationService::new(store.clone(), Arc::new(classes));
+        let activity = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 1))
+            .expect("written activity");
+        let application_id = activity.class_applications[0].id.clone();
+
+        // TD-01: seed a project-level written submission scoped to this activity+class.
+        let mut project = store
+            .get_project_snapshot(project_id.clone())
+            .expect("project should load");
+        project.questions = vec![crate::domain::question::default_question(1)];
+        project
+            .student_submissions
+            .push(crate::domain::student::StudentSubmission {
+                id: "sub-w1".into(),
+                student_id: "student-1".into(),
+                document_id: "doc-1".into(),
+                class_id: Some(school_class.id.clone()),
+                scan_batch_id: None,
+                class_membership_source: None,
+                page_numbers: vec![1],
+                status: crate::domain::student::StudentSubmissionStatus::Grouped,
+                answer_slots: vec![],
+                warnings: vec![],
+                updated_at: None,
+                assessment_activity_id: Some(activity.id.clone()),
+            });
+        store.save_project(&project).expect("project should save");
+
+        let result = service.remove_class_application(ClassApplicationIdInput {
+            project_id: project_id.clone(),
+            activity_id: activity.id,
+            application_id,
+        });
+        assert_eq!(
+            result.unwrap_err().code,
+            AppErrorCode::AssessmentClassApplicationInUse
+        );
+
+        // An empty written class application is still removable.
+        let empty = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 2))
+            .expect("second written activity");
+        let removed = service
+            .remove_class_application(ClassApplicationIdInput {
+                project_id: project_id.clone(),
+                activity_id: empty.id.clone(),
+                application_id: empty.class_applications[0].id.clone(),
+            })
+            .expect("empty class application is removable");
+        assert_eq!(removed.id, empty.class_applications[0].id);
+    }
+
+    #[test]
+    fn activity_a_freeze_does_not_affect_activity_b_scoring_readiness() {
+        let (store, project_id, classes) = temp_project();
+        let school_class = classes
+            .create_school_class(CreateSchoolClassInput {
+                project_id: project_id.clone(),
+                name: "11E".into(),
+                academic_year: Some("2026-2027".into()),
+                grade_level: Some(11),
+                section: Some("E".into()),
+                display_order: None,
+            })
+            .expect("class should be created");
+        classes
+            .create_teaching_assignment(CreateTeachingAssignmentInput {
+                project_id: project_id.clone(),
+                academic_year_id: "2026-2027".into(),
+                course_id: "tde".into(),
+                course_name: "Türk Dili ve Edebiyatı".into(),
+                class_section_id: school_class.id.clone(),
+                teacher_id: None,
+            })
+            .expect("assignment should be created");
+        let service = AssessmentOrganizationService::new(store.clone(), Arc::new(classes));
+        let activity_a = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 1))
+            .expect("written activity A");
+        let activity_b = service
+            .create_activity(written_activity_input(&project_id, &school_class.id, 2))
+            .expect("written activity B");
+
+        let mut project = store.get_project_snapshot(project_id.clone()).unwrap();
+        let mut question = crate::domain::question::default_question(1);
+        question.assessment_activity_id = Some(activity_a.id.clone());
+        project.questions = vec![question];
+        project.exam_package_freeze = Some(crate::domain::project::ExamPackageFreeze {
+            exam_package_version: 1,
+            freeze_status: crate::domain::project::ExamPackageFreezeStatus::Frozen,
+            frozen_at: "2026-01-01T00:00:00Z".into(),
+            frozen_by: None,
+            source_hash: "src-hash-a".into(),
+            rubric_hash: "rubric-hash-a".into(),
+            question_text_hash: "qt-hash-a".into(),
+            invalidated_at: None,
+            invalidation_reason: None,
+            assessment_activity_id: Some(activity_a.id.clone()),
+        });
+        store.save_project(&project).expect("project should save");
+
+        // Pointer on A: A's frozen QEP is visible.
+        service
+            .set_active_written_activity(AssessmentActivityIdInput {
+                project_id: project_id.clone(),
+                activity_id: activity_a.id.clone(),
+            })
+            .expect("activate A");
+        let project_a = store.get_project_snapshot(project_id.clone()).unwrap();
+        let readiness_a = crate::domain::scoring::scoring_readiness(&project_a);
+        assert!(
+            !readiness_a.blockers.contains(&"QEP_NOT_FROZEN".to_string()),
+            "A sees its own frozen QEP"
+        );
+
+        // Pointer on B: A's QEP must NOT satisfy B's scoring readiness.
+        service
+            .set_active_written_activity(AssessmentActivityIdInput {
+                project_id: project_id.clone(),
+                activity_id: activity_b.id.clone(),
+            })
+            .expect("activate B");
+        let project_b = store.get_project_snapshot(project_id.clone()).unwrap();
+        assert_eq!(
+            project_b
+                .written_scope_view()
+                .exam_package_freeze
+                .map(|f| f.assessment_activity_id.as_deref()),
+            None,
+            "scoped view exposes no freeze for B"
+        );
+        let readiness_b = crate::domain::scoring::scoring_readiness(&project_b);
+        assert!(
+            readiness_b.blockers.contains(&"QEP_NOT_FROZEN".to_string()),
+            "B cannot reuse A's frozen QEP"
         );
     }
 }

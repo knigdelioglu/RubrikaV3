@@ -1690,6 +1690,7 @@ mod tests {
             identity_ocr: None,
         });
         project.student_submissions.push(StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".to_string(),
             student_id: "student-1".to_string(),
             document_id: batch.document_id.clone(),
@@ -1740,6 +1741,70 @@ mod tests {
         assert_eq!(
             remove.unwrap_err().code,
             AppErrorCode::StudentScanBatchInUse
+        );
+    }
+
+    #[test]
+    fn same_school_number_in_different_classes_stays_distinct() {
+        // TD-01 fixture: student identity is UUID-based and the school-number
+        // uniqueness check is scoped per class. Two students with the same
+        // number in different classes must both be accepted, keep distinct
+        // IDs, and never leak into each other's roster.
+        let (store, project) = project_for_tests();
+        let service = SchoolClassService::new(store);
+        let class_a = create_class(&service, &project.id, "9-A");
+        let class_b = create_class(&service, &project.id, "9-B");
+
+        let student_a = service
+            .create_class_student(CreateClassStudentInput {
+                project_id: project.id.clone(),
+                class_id: class_a.id.clone(),
+                display_name: Some("Ayşe".to_string()),
+                number: Some("123".to_string()),
+            })
+            .expect("first class may register number 123");
+        let student_b = service
+            .create_class_student(CreateClassStudentInput {
+                project_id: project.id.clone(),
+                class_id: class_b.id.clone(),
+                display_name: Some("Burak".to_string()),
+                number: Some("123".to_string()),
+            })
+            .expect("same number in a different class is not a conflict");
+
+        assert_ne!(student_a.id, student_b.id, "identity is UUID-based");
+        assert_eq!(student_a.class_name.as_deref(), Some("9-A"));
+        assert_eq!(student_b.class_name.as_deref(), Some("9-B"));
+
+        let roster_a = service
+            .list_class_students(ListClassStudentsInput {
+                project_id: project.id.clone(),
+                class_id: class_a.id.clone(),
+            })
+            .unwrap();
+        let roster_b = service
+            .list_class_students(ListClassStudentsInput {
+                project_id: project.id.clone(),
+                class_id: class_b.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(roster_a.len(), 1);
+        assert_eq!(roster_b.len(), 1);
+        assert_eq!(roster_a[0].id, student_a.id);
+        assert_eq!(roster_b[0].id, student_b.id);
+
+        // The per-class uniqueness scope still rejects a duplicate number
+        // inside the SAME class.
+        let duplicate_in_class = service.create_class_student(CreateClassStudentInput {
+            project_id: project.id.clone(),
+            class_id: class_a.id.clone(),
+            display_name: Some("Cem".to_string()),
+            number: Some("123".to_string()),
+        });
+        assert_eq!(
+            duplicate_in_class.unwrap_err().code,
+            AppErrorCode::StudentIdentityInvalid,
+            "same number inside the same class stays rejected"
         );
     }
 }

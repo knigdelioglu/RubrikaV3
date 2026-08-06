@@ -1,19 +1,25 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::assessment::{AssessmentActivity, AssessmentType, ClassApplicationStatus};
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::performance::{
-    CriterionRating, PerformanceAssessment, PerformanceAssessmentStatus, PerformanceCriterion,
-    PerformanceDetails, PerformanceLevel, PerformanceRubric, PerformanceSkillArea,
-    PerformanceWorkMode,
+    CriterionRating, PerformanceAssessment, PerformanceAssessmentStatus, PerformanceDetails,
+    PerformanceRubric,
 };
 use crate::domain::project::Project;
 use crate::services::assessment_organization_service::{
     AssessmentOrganizationService, CreateAssessmentActivityInput,
+};
+use crate::services::performance_dtos::{
+    ApprovePerformanceAssessmentInput, CreatePerformanceTaskInput, GetPerformanceReportInput,
+    ListPerformanceAssessmentsInput, ListPerformanceTasksInput, PerformanceActivityIdInput,
+    PerformanceReportCriterionScore, PerformanceReportDto, PerformanceReportStudentRow,
+    PerformanceReportSummary, PerformanceStatusDto, PublishPerformanceRubricInput,
+    SavePerformanceAssessmentInput, SetPerformanceAssessmentStatusInput,
+    UpdatePerformanceTaskInput,
 };
 use crate::services::project_store::{MutationOptions, ProjectStore};
 use crate::services::school_class_service::students_for_class;
@@ -22,213 +28,6 @@ use crate::services::school_class_service::students_for_class;
 pub struct PerformanceService {
     project_store: ProjectStore,
     assessment_organization_service: Arc<AssessmentOrganizationService>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreatePerformanceTaskInput {
-    pub project_id: String,
-    pub academic_year_id: String,
-    pub course_id: String,
-    pub course_name: String,
-    pub grade_level: u32,
-    pub term: u8,
-    pub sequence_number: u32,
-    #[serde(alias = "classSectionIds")]
-    pub school_class_ids: Vec<String>,
-    #[serde(default)]
-    pub title: String,
-    pub performance_details: PerformanceDetails,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_rubric: Option<PerformanceRubric>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdatePerformanceTaskInput {
-    pub project_id: String,
-    pub activity_id: String,
-    #[serde(default)]
-    pub title: Option<String>,
-    #[serde(default)]
-    pub performance_details: Option<PerformanceDetails>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListPerformanceTasksInput {
-    pub project_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub course_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub term: Option<u8>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub school_class_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceActivityIdInput {
-    pub project_id: String,
-    pub activity_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PublishPerformanceRubricInput {
-    pub project_id: String,
-    pub activity_id: String,
-    pub rubric: PerformanceRubric,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SavePerformanceAssessmentInput {
-    pub project_id: String,
-    pub activity_id: String,
-    pub application_id: String,
-    pub student_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assessment_id: Option<String>,
-    #[serde(default)]
-    pub ratings: Vec<CriterionRating>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub feedback: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApprovePerformanceAssessmentInput {
-    pub project_id: String,
-    pub activity_id: String,
-    pub application_id: String,
-    pub assessment_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetPerformanceAssessmentStatusInput {
-    pub project_id: String,
-    pub activity_id: String,
-    pub application_id: String,
-    pub student_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assessment_id: Option<String>,
-    pub status: PerformanceAssessmentStatus,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListPerformanceAssessmentsInput {
-    pub project_id: String,
-    pub activity_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub application_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetPerformanceReportInput {
-    pub project_id: String,
-    pub activity_id: String,
-    pub application_id: String,
-}
-
-/// Raporda ölçüt bazında bir öğrenci değerlendirmesi. Düzey/puan yoksa (henüz
-/// değerlendirilmedi, Missing veya NotPerformed) alanlar `None` kalır; raporda
-/// sıfırla karıştırılmaz ve boş hücre/etiket olarak gösterilir (K9).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceReportCriterionScore {
-    pub criterion_id: String,
-    pub criterion_name: String,
-    pub level_id: Option<String>,
-    pub level_name: Option<String>,
-    pub points: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceReportStudentRow {
-    pub student_id: String,
-    pub student_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub student_number: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<PerformanceAssessmentStatus>,
-    pub criterion_scores: Vec<PerformanceReportCriterionScore>,
-    /// Yalnız onaylı (Approved) satırlarda final toplam; taslak/eksik/gösterilmedi
-    /// satırlarında `None` kalır (provisional/final ayrımı, TD-07).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<u32>,
-    /// Onaylı veya InProgress satırlarda kaydın geçici toplamı; final toplamdan
-    /// ayrı taşınır, `total` onaylı satırlarda bununla aynı değeri taşır.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provisional_total: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub feedback: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assessed_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approved_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceReportSummary {
-    pub student_count: u32,
-    pub assessed_count: u32,
-    pub approved_count: u32,
-    pub missing_count: u32,
-    pub not_performed_count: u32,
-    pub unrated_count: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceReportDto {
-    pub task_title: String,
-    pub course_name: String,
-    pub grade_level: u32,
-    pub term: u8,
-    pub sequence_number: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub theme: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_area: Option<PerformanceSkillArea>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_mode: Option<PerformanceWorkMode>,
-    pub class_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub teacher_id: Option<String>,
-    pub rubric_id: String,
-    pub rubric_name: String,
-    pub rubric_version: u32,
-    pub criteria: Vec<PerformanceCriterion>,
-    pub levels: Vec<PerformanceLevel>,
-    pub max_points: u32,
-    pub generated_at: String,
-    pub summary: PerformanceReportSummary,
-    pub rows: Vec<PerformanceReportStudentRow>,
-}
-
-/// Performans görevi için authoritative readiness snapshot'ı (TD-03).
-/// Adım durumları (task/assessment/results) frontend'de türetilmez; kararlar
-/// bu DTO üzerinden render edilir.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceStatusDto {
-    pub has_published_rubric: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_rubric_version: Option<u32>,
-    pub has_draft_rubric: bool,
-    pub has_task_details: bool,
-    pub total_students: u32,
-    pub approved_count: u32,
-    pub in_progress_count: u32,
-    pub missing_count: u32,
-    pub not_performed_count: u32,
-    pub all_approved: bool,
 }
 
 impl PerformanceService {
@@ -245,6 +44,7 @@ impl PerformanceService {
     pub fn create_performance_task(
         &self,
         input: CreatePerformanceTaskInput,
+        correlation_id: &str,
     ) -> Result<AssessmentActivity, AppError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut details = input.performance_details.clone();
@@ -297,7 +97,7 @@ impl PerformanceService {
         };
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("create_performance_task"),
+            MutationOptions::new("create_performance_task").correlation(correlation_id),
             |project, _context| {
                 self.assessment_organization_service
                     .create_activity_in_project(project, &create_input)
@@ -309,10 +109,11 @@ impl PerformanceService {
     pub fn update_performance_task(
         &self,
         input: UpdatePerformanceTaskInput,
+        correlation_id: &str,
     ) -> Result<AssessmentActivity, AppError> {
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("update_performance_task"),
+            MutationOptions::new("update_performance_task").correlation(correlation_id),
             |project, _context| {
                 let activity = project
                     .assessment_activities
@@ -419,11 +220,12 @@ impl PerformanceService {
     pub fn publish_performance_rubric(
         &self,
         input: PublishPerformanceRubricInput,
+        correlation_id: &str,
     ) -> Result<PerformanceRubric, AppError> {
         validate_rubric(&input.rubric)?;
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("publish_performance_rubric"),
+            MutationOptions::new("publish_performance_rubric").correlation(correlation_id),
             |project, _context| {
                 let activity = project
                     .assessment_activities
@@ -514,10 +316,11 @@ impl PerformanceService {
     pub fn save_performance_assessment(
         &self,
         input: SavePerformanceAssessmentInput,
+        correlation_id: &str,
     ) -> Result<PerformanceAssessment, AppError> {
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("save_performance_assessment"),
+            MutationOptions::new("save_performance_assessment").correlation(correlation_id),
             |project, _context| {
                 let activity_index = project
                     .assessment_activities
@@ -686,10 +489,11 @@ impl PerformanceService {
     pub fn approve_performance_assessment(
         &self,
         input: ApprovePerformanceAssessmentInput,
+        correlation_id: &str,
     ) -> Result<PerformanceAssessment, AppError> {
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("approve_performance_assessment"),
+            MutationOptions::new("approve_performance_assessment").correlation(correlation_id),
             |project, _context| {
                 let activity = project
                     .assessment_activities
@@ -727,6 +531,14 @@ impl PerformanceService {
                             "application_id not found for activity.",
                         )
                     })?;
+                let approved_student_ids = application
+                    .performance_assessments
+                    .iter()
+                    .filter(|assessment| {
+                        assessment.status == PerformanceAssessmentStatus::Approved
+                    })
+                    .map(|assessment| assessment.student_id.clone())
+                    .collect::<HashSet<_>>();
                 let assessment = application
                     .performance_assessments
                     .iter_mut()
@@ -743,6 +555,17 @@ impl PerformanceService {
                         AppErrorCode::AssessmentActivityInUse,
                         "Bu değerlendirme zaten onaylanmış.",
                         "assessment is already approved.",
+                    ));
+                }
+                // Tek final karar garantisi: aynı öğrenci için aynı sınıf
+                // uygulamasında onaylanmış başka bir kayıt varsa ikinci final
+                // karar oluşturulmaz (scope doğrulaması öncesi legacy
+                // duplicate kayıtlara karşı savunmacı kontrol).
+                if approved_student_ids.contains(&assessment.student_id) {
+                    return Err(performance_error(
+                        AppErrorCode::AssessmentActivityInUse,
+                        "Bu öğrenci için onaylanmış bir değerlendirme zaten mevcut; birden fazla final karar oluşturulamaz.",
+                        "a second final assessment for the same student is not allowed.",
                     ));
                 }
                 let pinned = details
@@ -792,6 +615,7 @@ impl PerformanceService {
     pub fn set_performance_assessment_status(
         &self,
         input: SetPerformanceAssessmentStatusInput,
+        correlation_id: &str,
     ) -> Result<PerformanceAssessment, AppError> {
         if !matches!(
             input.status,
@@ -805,7 +629,7 @@ impl PerformanceService {
         }
         let output = self.project_store.mutate(
             &input.project_id,
-            MutationOptions::new("set_performance_assessment_status"),
+            MutationOptions::new("set_performance_assessment_status").correlation(correlation_id),
             |project, _context| {
                 let activity = project
                     .assessment_activities
@@ -1050,11 +874,15 @@ impl PerformanceService {
         let mut missing_count = 0u32;
         let mut not_performed_count = 0u32;
         let mut unrated_count = 0u32;
+        // TD-38: assessments are indexed by student_id so the roster scan stays
+        // O(roster + assessments) instead of O(roster × assessments).
+        let assessments_by_student: HashMap<&str, &PerformanceAssessment> = application
+            .performance_assessments
+            .iter()
+            .map(|assessment| (assessment.student_id.as_str(), assessment))
+            .collect();
         for student in roster {
-            let assessment = application
-                .performance_assessments
-                .iter()
-                .find(|assessment| assessment.student_id == student.id);
+            let assessment = assessments_by_student.get(student.id.as_str()).copied();
             let status = assessment.map(|assessment| assessment.status);
             match status {
                 Some(PerformanceAssessmentStatus::Missing) => missing_count += 1,
@@ -1554,22 +1382,25 @@ mod tests {
         sequence_number: u32,
     ) -> AssessmentActivity {
         service
-            .create_performance_task(CreatePerformanceTaskInput {
-                project_id: project_id.to_string(),
-                academic_year_id: "2026-2027".into(),
-                course_id: "tde".into(),
-                course_name: "Türk Dili ve Edebiyatı".into(),
-                grade_level: 9,
-                term: 1,
-                sequence_number,
-                school_class_ids: vec![class_id.to_string()],
-                title: format!("{sequence_number}. Performans Görevi"),
-                performance_details: PerformanceDetails {
-                    theme: "Doğa ve insan".into(),
-                    ..PerformanceDetails::default()
+            .create_performance_task(
+                CreatePerformanceTaskInput {
+                    project_id: project_id.to_string(),
+                    academic_year_id: "2026-2027".into(),
+                    course_id: "tde".into(),
+                    course_name: "Türk Dili ve Edebiyatı".into(),
+                    grade_level: 9,
+                    term: 1,
+                    sequence_number,
+                    school_class_ids: vec![class_id.to_string()],
+                    title: format!("{sequence_number}. Performans Görevi"),
+                    performance_details: PerformanceDetails {
+                        theme: "Doğa ve insan".into(),
+                        ..PerformanceDetails::default()
+                    },
+                    initial_rubric: None,
                 },
-                initial_rubric: None,
-            })
+                "test-correlation-id",
+            )
             .expect("task should be created")
     }
 
@@ -1635,11 +1466,14 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         let published = service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         assert_eq!(published.version, 1);
         let history = service
@@ -1650,11 +1484,14 @@ mod tests {
             .expect("history should load");
         assert_eq!(history.len(), 2);
         let second = service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id,
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id,
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("second publish should succeed");
         assert_eq!(second.version, 2);
     }
@@ -1704,52 +1541,61 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
 
         let error = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: vec![CriterionRating {
-                    criterion_id: "ghost-criterion".into(),
-                    level_id: "l1".into(),
-                    note: None,
-                }],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: vec![CriterionRating {
+                        criterion_id: "ghost-criterion".into(),
+                        level_id: "l1".into(),
+                        note: None,
+                    }],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentInvalidInput);
 
         let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: vec![
-                    CriterionRating {
-                        criterion_id: "c1".into(),
-                        level_id: "l1".into(),
-                        note: None,
-                    },
-                    CriterionRating {
-                        criterion_id: "c2".into(),
-                        level_id: "l2".into(),
-                        note: None,
-                    },
-                ],
-                feedback: Some("Güzel çalışma".into()),
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: vec![
+                        CriterionRating {
+                            criterion_id: "c1".into(),
+                            level_id: "l1".into(),
+                            note: None,
+                        },
+                        CriterionRating {
+                            criterion_id: "c2".into(),
+                            level_id: "l2".into(),
+                            note: None,
+                        },
+                    ],
+                    feedback: Some("Güzel çalışma".into()),
+                },
+                "test-correlation-id",
+            )
             .expect("assessment should save");
         assert_eq!(saved.provisional_total, 5 + 4);
         assert_eq!(saved.rubric_version, 1);
@@ -1762,87 +1608,105 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
 
         let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: vec![CriterionRating {
-                    criterion_id: "c1".into(),
-                    level_id: "l1".into(),
-                    note: None,
-                }],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: vec![CriterionRating {
+                        criterion_id: "c1".into(),
+                        level_id: "l1".into(),
+                        note: None,
+                    }],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("partial assessment should save");
         let error = service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: saved.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: saved.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentInvalidInput);
 
         let completed = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: Some(saved.id.clone()),
-                ratings: vec![
-                    CriterionRating {
-                        criterion_id: "c1".into(),
-                        level_id: "l1".into(),
-                        note: None,
-                    },
-                    CriterionRating {
-                        criterion_id: "c2".into(),
-                        level_id: "l1".into(),
-                        note: None,
-                    },
-                    CriterionRating {
-                        criterion_id: "c3".into(),
-                        level_id: "l1".into(),
-                        note: None,
-                    },
-                ],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: Some(saved.id.clone()),
+                    ratings: vec![
+                        CriterionRating {
+                            criterion_id: "c1".into(),
+                            level_id: "l1".into(),
+                            note: None,
+                        },
+                        CriterionRating {
+                            criterion_id: "c2".into(),
+                            level_id: "l1".into(),
+                            note: None,
+                        },
+                        CriterionRating {
+                            criterion_id: "c3".into(),
+                            level_id: "l1".into(),
+                            note: None,
+                        },
+                    ],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("completed assessment should save");
         let approved = service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: completed.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: completed.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .expect("approval should succeed");
         assert_eq!(approved.status, PerformanceAssessmentStatus::Approved);
         assert!(approved.approved_at.is_some());
 
         let error = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: Some(completed.id.clone()),
-                ratings: vec![],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: Some(completed.id.clone()),
+                    ratings: vec![],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentActivityInUse);
     }
@@ -1854,55 +1718,67 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
         let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: vec![
-                    CriterionRating {
-                        criterion_id: "c1".into(),
-                        level_id: "l1".into(),
-                        note: None,
-                    },
-                    CriterionRating {
-                        criterion_id: "c2".into(),
-                        level_id: "l2".into(),
-                        note: None,
-                    },
-                    CriterionRating {
-                        criterion_id: "c3".into(),
-                        level_id: "l3".into(),
-                        note: None,
-                    },
-                ],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: vec![
+                        CriterionRating {
+                            criterion_id: "c1".into(),
+                            level_id: "l1".into(),
+                            note: None,
+                        },
+                        CriterionRating {
+                            criterion_id: "c2".into(),
+                            level_id: "l2".into(),
+                            note: None,
+                        },
+                        CriterionRating {
+                            criterion_id: "c3".into(),
+                            level_id: "l3".into(),
+                            note: None,
+                        },
+                    ],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("assessment should save");
         service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: saved.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: saved.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .expect("approval should succeed");
 
         let error = service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id,
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id,
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentActivityInUse);
     }
@@ -1914,22 +1790,28 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
         let missing = service
-            .set_performance_assessment_status(SetPerformanceAssessmentStatusInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                status: PerformanceAssessmentStatus::Missing,
-            })
+            .set_performance_assessment_status(
+                SetPerformanceAssessmentStatusInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    status: PerformanceAssessmentStatus::Missing,
+                },
+                "test-correlation-id",
+            )
             .expect("missing should mark");
         assert_eq!(missing.status, PerformanceAssessmentStatus::Missing);
         assert_eq!(missing.provisional_total, 0);
@@ -1952,23 +1834,29 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
         let error = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id,
-                application_id: application,
-                student_id: "ghost-student".into(),
-                assessment_id: None,
-                ratings: vec![],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id,
+                    application_id: application,
+                    student_id: "ghost-student".into(),
+                    assessment_id: None,
+                    ratings: vec![],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::StudentNotFound);
     }
@@ -1981,15 +1869,18 @@ mod tests {
         let activity = create_task(&service, &project_id, &class_id, 1);
         let application = activity.class_applications[0].id.clone();
         let error = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id,
-                application_id: application,
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: vec![],
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id,
+                    application_id: application,
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: vec![],
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::RubricMissing);
     }
@@ -2001,22 +1892,25 @@ mod tests {
         let service = service(store, classes);
         create_task(&service, &project_id, &class_id, 1);
         let error = service
-            .create_performance_task(CreatePerformanceTaskInput {
-                project_id: project_id.clone(),
-                academic_year_id: "2026-2027".into(),
-                course_id: "tde".into(),
-                course_name: "Türk Dili ve Edebiyatı".into(),
-                grade_level: 9,
-                term: 1,
-                sequence_number: 1,
-                school_class_ids: vec![class_id],
-                title: "İkinci".into(),
-                performance_details: PerformanceDetails {
-                    theme: "Tema".into(),
-                    ..PerformanceDetails::default()
+            .create_performance_task(
+                CreatePerformanceTaskInput {
+                    project_id: project_id.clone(),
+                    academic_year_id: "2026-2027".into(),
+                    course_id: "tde".into(),
+                    course_name: "Türk Dili ve Edebiyatı".into(),
+                    grade_level: 9,
+                    term: 1,
+                    sequence_number: 1,
+                    school_class_ids: vec![class_id],
+                    title: "İkinci".into(),
+                    performance_details: PerformanceDetails {
+                        theme: "Tema".into(),
+                        ..PerformanceDetails::default()
+                    },
+                    initial_rubric: None,
                 },
-                initial_rubric: None,
-            })
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentActivityAlreadyExists);
     }
@@ -2029,11 +1923,14 @@ mod tests {
         let activity = create_task(&service, &project_id, &class_id, 1);
         let activity_id = activity.id.clone();
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let persisted = store
             .get_project_snapshot(project_id.clone())
@@ -2061,42 +1958,54 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
         let completed = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("completed assessment should save");
         service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: completed.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: completed.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .expect("approval should succeed");
 
         let error = service
-            .set_performance_assessment_status(SetPerformanceAssessmentStatusInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                status: PerformanceAssessmentStatus::Missing,
-            })
+            .set_performance_assessment_status(
+                SetPerformanceAssessmentStatusInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    status: PerformanceAssessmentStatus::Missing,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentActivityInUse);
     }
@@ -2108,23 +2017,29 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("v1 should publish");
         let application = activity.class_applications[0].id.clone();
         let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("v1 draft should save");
         assert_eq!(saved.rubric_version, 1);
         assert_eq!(saved.provisional_total, 12);
@@ -2136,23 +2051,29 @@ mod tests {
         changed.levels[3].points = 4;
         changed.levels[4].points = 2;
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: changed,
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: changed,
+                },
+                "test-correlation-id",
+            )
             .expect("v2 should publish");
 
         let resaved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: Some(saved.id.clone()),
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: Some(saved.id.clone()),
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("draft resave should succeed");
         assert_eq!(
             resaved.rubric_version, 1,
@@ -2191,29 +2112,35 @@ mod tests {
         add_student(&store, &project_id, "student-2", "9B");
         let service = service(store, classes);
         let activity = service
-            .create_performance_task(CreatePerformanceTaskInput {
-                project_id: project_id.clone(),
-                academic_year_id: "2026-2027".into(),
-                course_id: "tde".into(),
-                course_name: "Türk Dili ve Edebiyatı".into(),
-                grade_level: 9,
-                term: 1,
-                sequence_number: 1,
-                school_class_ids: vec![class_a.clone(), class_b.id.clone()],
-                title: "1. Performans Görevi".into(),
-                performance_details: PerformanceDetails {
-                    theme: "Doğa ve insan".into(),
-                    ..PerformanceDetails::default()
+            .create_performance_task(
+                CreatePerformanceTaskInput {
+                    project_id: project_id.clone(),
+                    academic_year_id: "2026-2027".into(),
+                    course_id: "tde".into(),
+                    course_name: "Türk Dili ve Edebiyatı".into(),
+                    grade_level: 9,
+                    term: 1,
+                    sequence_number: 1,
+                    school_class_ids: vec![class_a.clone(), class_b.id.clone()],
+                    title: "1. Performans Görevi".into(),
+                    performance_details: PerformanceDetails {
+                        theme: "Doğa ve insan".into(),
+                        ..PerformanceDetails::default()
+                    },
+                    initial_rubric: None,
                 },
-                initial_rubric: None,
-            })
+                "test-correlation-id",
+            )
             .expect("task should be created");
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let app_a = activity
             .class_applications
@@ -2230,38 +2157,47 @@ mod tests {
             .id
             .clone();
         let in_app_a = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: app_a.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: app_a.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("app A assessment should save");
         service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: app_b.clone(),
-                student_id: "student-2".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: app_b.clone(),
+                    student_id: "student-2".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("app B assessment should save");
 
         let error = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: app_b.clone(),
-                student_id: "student-2".into(),
-                assessment_id: Some(in_app_a.id.clone()),
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: app_b.clone(),
+                    student_id: "student-2".into(),
+                    assessment_id: Some(in_app_a.id.clone()),
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .unwrap_err();
         assert_eq!(error.code, AppErrorCode::AssessmentInvalidInput);
 
@@ -2280,6 +2216,102 @@ mod tests {
     }
 
     #[test]
+    fn approve_rejects_a_second_final_assessment_for_the_same_student() {
+        let (store, project_id, classes) = temp_project();
+        let class_id = setup_environment(store.clone(), project_id.clone(), classes.clone(), 9);
+        let service = service(store.clone(), classes);
+        let activity = create_task(&service, &project_id, &class_id, 1);
+        service
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
+            .expect("rubric should publish");
+        let application = activity.class_applications[0].id.clone();
+        let first = service
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
+            .expect("first assessment should save");
+        service
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: first.id.clone(),
+                },
+                "test-correlation-id",
+            )
+            .expect("first assessment should approve");
+
+        let mut project = store
+            .get_project_snapshot(project_id.clone())
+            .expect("project should load");
+        let second_id = Uuid::new_v4().to_string();
+        project.assessment_activities[0].class_applications[0]
+            .performance_assessments
+            .push(PerformanceAssessment {
+                id: second_id.clone(),
+                student_id: "student-1".into(),
+                rubric_id: first.rubric_id.clone(),
+                rubric_version: first.rubric_version,
+                ratings: full_ratings(),
+                provisional_total: first.provisional_total,
+                feedback: None,
+                status: PerformanceAssessmentStatus::InProgress,
+                assessed_at: Some("2026-01-01T00:00:00Z".into()),
+                approved_at: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+            });
+        store
+            .save_project(&project)
+            .expect("duplicate legacy assessment should save");
+
+        let error = service
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: second_id,
+                },
+                "test-correlation-id",
+            )
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::AssessmentActivityInUse);
+        let listed = service
+            .list_performance_assessments(ListPerformanceAssessmentsInput {
+                project_id: project_id.clone(),
+                activity_id: activity.id.clone(),
+                application_id: Some(application),
+            })
+            .expect("assessments should list");
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|assessment| assessment.status == PerformanceAssessmentStatus::Approved)
+                .count(),
+            1,
+            "exactly one final assessment must exist for the student"
+        );
+    }
+
+    #[test]
     fn report_does_not_publish_in_progress_total_as_final_total() {
         let (store, project_id, classes) = temp_project();
         let class_id = setup_environment(store.clone(), project_id.clone(), classes.clone(), 9);
@@ -2287,42 +2319,54 @@ mod tests {
         let service = service(store, classes);
         let activity = create_task(&service, &project_id, &class_id, 1);
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
         let application = activity.class_applications[0].id.clone();
         let approved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("approved assessment should save");
         service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: approved.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: approved.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .expect("approval should succeed");
         service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-2".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-2".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("in-progress assessment should save");
 
         let report = service
@@ -2372,11 +2416,14 @@ mod tests {
         assert!(!before.all_approved);
 
         service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
             .expect("rubric should publish");
 
         let published = service
@@ -2388,25 +2435,31 @@ mod tests {
         assert!(!published.all_approved);
 
         let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
+            .save_performance_assessment(
+                SavePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-1".into(),
+                    assessment_id: None,
+                    ratings: full_ratings(),
+                    feedback: None,
+                },
+                "test-correlation-id",
+            )
             .expect("draft should save");
         service
-            .set_performance_assessment_status(SetPerformanceAssessmentStatusInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-2".into(),
-                assessment_id: None,
-                status: PerformanceAssessmentStatus::Missing,
-            })
+            .set_performance_assessment_status(
+                SetPerformanceAssessmentStatusInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    student_id: "student-2".into(),
+                    assessment_id: None,
+                    status: PerformanceAssessmentStatus::Missing,
+                },
+                "test-correlation-id",
+            )
             .expect("missing should mark");
 
         let mixed = service
@@ -2418,12 +2471,15 @@ mod tests {
         assert!(!mixed.all_approved);
 
         service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: saved.id.clone(),
-            })
+            .approve_performance_assessment(
+                ApprovePerformanceAssessmentInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    application_id: application.clone(),
+                    assessment_id: saved.id.clone(),
+                },
+                "test-correlation-id",
+            )
             .expect("approval should succeed");
 
         let approved = service
@@ -2432,5 +2488,180 @@ mod tests {
         assert_eq!(approved.approved_count, 1);
         assert_eq!(approved.in_progress_count, 0);
         assert!(!approved.all_approved, "one student still unapproved");
+    }
+
+    /// TD-25 kabul kriteri kanıtı: komut katmanının ürettiği correlation_id,
+    /// mutation journal'ına, audit kaydına ve model invocation contract'ına
+    /// aynı değer olarak akar (performans akışı + OCR/job akışı).
+    #[test]
+    fn correlation_id_flows_to_mutation_audit_and_invocation_contract() {
+        let (store, project_id, classes) = temp_project();
+        let class_id = setup_environment(store.clone(), project_id.clone(), classes.clone(), 9);
+        let service = service(store.clone(), classes);
+        let correlation_id = format!("corr-e2e-{}", Uuid::new_v4());
+
+        // 1. Komut correlation_id'si mutation journal'ına yazılır.
+        let activity = service
+            .create_performance_task(
+                CreatePerformanceTaskInput {
+                    project_id: project_id.clone(),
+                    academic_year_id: "2026-2027".into(),
+                    course_id: "tde".into(),
+                    course_name: "Türk Dili ve Edebiyatı".into(),
+                    grade_level: 9,
+                    term: 1,
+                    sequence_number: 1,
+                    school_class_ids: vec![class_id],
+                    title: "Korelasyon Kanıtı".into(),
+                    performance_details: PerformanceDetails {
+                        theme: "Tema".into(),
+                        ..PerformanceDetails::default()
+                    },
+                    initial_rubric: None,
+                },
+                &correlation_id,
+            )
+            .expect("task should be created");
+
+        let root = store
+            .trusted_project_root(&project_id)
+            .expect("trusted root");
+        let journal = crate::services::transaction_journal::list(root.root())
+            .expect("transaction journal should be readable");
+        assert!(
+            journal.iter().any(|record| {
+                record.correlation_id == correlation_id
+                    && record.operation == "create_performance_task"
+            }),
+            "mutation journal must carry the command correlation_id"
+        );
+
+        // 2. Aynı correlation_id, komut katmanının audit kaydına yazılır
+        //    (performance_commands.rs'in kullandığı AuditEntryInput::correlation yolu).
+        let audit_service = crate::services::audit_service::AuditService::new();
+        audit_service
+            .append(
+                root.root(),
+                crate::services::audit_service::AuditEntryInput::new(
+                    "performance_task_created",
+                    "Performans görevi oluşturuldu.",
+                )
+                .entity("assessment_activity", &activity.id)
+                .correlation(&correlation_id),
+            )
+            .expect("audit append");
+        let audit_path = crate::services::audit_service::AuditService::audit_path(root.root());
+        let audit_content = std::fs::read_to_string(&audit_path).expect("audit file");
+        assert!(
+            audit_content.contains(&correlation_id),
+            "audit record must carry the command correlation_id"
+        );
+
+        // 3. Aynı correlation_id, model invocation contract'ına yazılır
+        //    (OCR/job akışındaki build_prompt_contract çağrısının izlediği yol).
+        let contract = crate::services::prompt_contract::build_prompt_contract(
+            crate::domain::model::ModelRequestKind::OcrIssueCorrection,
+            "student_answer_ocr_issue_correction_v2_typed_user_data",
+            "student_answer_ocr_issue_correction_output_v1",
+            "ocr_review_policy_v1",
+            "Yalnız gözlenen metni düzelt.",
+            serde_json::json!({ "observedText": "örnek" }),
+            crate::services::prompt_contract::default_sampling(128),
+            Some(crate::domain::model::ModelResponseFormat::JsonObject),
+            Some(&correlation_id),
+        );
+        assert_eq!(
+            contract.invocation.correlation_id.as_deref(),
+            Some(correlation_id.as_str()),
+            "invocation contract must carry the command correlation_id"
+        );
+
+        let _ = std::fs::remove_dir_all(root.root());
+    }
+
+    #[test]
+    fn save_performance_assessment_commit_failure_returns_typed_error_and_allows_retry() {
+        let (store, project_id, classes) = temp_project();
+        let class_id = setup_environment(store.clone(), project_id.clone(), classes.clone(), 9);
+        let service = service(store.clone(), classes);
+        let activity = create_task(&service, &project_id, &class_id, 1);
+        service
+            .publish_performance_rubric(
+                PublishPerformanceRubricInput {
+                    project_id: project_id.clone(),
+                    activity_id: activity.id.clone(),
+                    rubric: valid_rubric(),
+                },
+                "test-correlation-id",
+            )
+            .expect("rubric should publish");
+
+        let application = activity.class_applications[0].id.clone();
+        let project_json = {
+            let root = store.trusted_project_root(&project_id).unwrap();
+            root.root().join("project.json")
+        };
+        let original_content =
+            std::fs::read_to_string(&project_json).expect("project.json should be readable");
+
+        // Externally modify the project file so the next commit fails the
+        // session-fingerprint check (PROJECT_EXTERNALLY_MODIFIED).
+        let mut external = store.get_project_snapshot(project_id.clone()).unwrap();
+        external.name = "external edit".to_string();
+        std::fs::write(
+            &project_json,
+            serde_json::to_string_pretty(&external).unwrap(),
+        )
+        .unwrap();
+
+        let input = SavePerformanceAssessmentInput {
+            project_id: project_id.clone(),
+            activity_id: activity.id.clone(),
+            application_id: application.clone(),
+            student_id: "student-1".into(),
+            assessment_id: None,
+            ratings: full_ratings(),
+            feedback: None,
+        };
+
+        // Commit fail -> typed error; no success DTO is returned.
+        let error = service
+            .save_performance_assessment(input.clone(), "test-correlation-id")
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectExternallyModified);
+
+        // Memory state must not be canonical: the failed mutation must not
+        // have created an assessment in the session project.
+        let session = store.get_project_snapshot(project_id.clone()).unwrap();
+        let session_application = session
+            .assessment_activities
+            .iter()
+            .find(|candidate| candidate.id == activity.id)
+            .expect("activity should still exist")
+            .class_applications
+            .iter()
+            .find(|candidate| candidate.id == application)
+            .expect("application should still exist");
+        assert!(
+            session_application.performance_assessments.is_empty(),
+            "failed commit must not leave an assessment in the session project"
+        );
+
+        // The failed mutation must not have overwritten the external disk state.
+        let disk = std::fs::read_to_string(&project_json).unwrap();
+        assert!(
+            disk.contains("external edit"),
+            "failed commit must not overwrite the externally modified project file"
+        );
+
+        // Restore the disk to the session-known content and retry: success now.
+        std::fs::write(&project_json, &original_content).unwrap();
+        let saved = service
+            .save_performance_assessment(input, "test-correlation-id")
+            .expect("retry must succeed after restoring the project file");
+        assert_eq!(saved.status, PerformanceAssessmentStatus::InProgress);
+        assert_eq!(saved.provisional_total, 5 + 4 + 3);
+
+        let _ = std::fs::remove_dir_all(project_json.parent().unwrap());
     }
 }

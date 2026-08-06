@@ -24,22 +24,30 @@ use crate::domain::student::{
     StudentIdentityOcrRecord, StudentSubmission, StudentSubmissionStatus,
 };
 use crate::jobs::job_manager::JobManager;
+use crate::platform::project_paths::TrustedProjectRoot;
 use crate::services::model_gateway::ModelGateway;
 use crate::services::model_input_image_service::ModelInputImageService;
 use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeRequest, ModelRuntimeService, ModelUseCase,
 };
-use crate::services::ocr_image_preprocess_service::OcrImagePreprocessService;
+use crate::services::ocr_image_geometry_service::{
+    deskew_image, render_scale_to_dpi, validate_dpi_in_range, DESKEW_DEFAULT_MAX_ANGLE,
+    OCR_MAX_ACCEPTED_DPI, OCR_MIN_ACCEPTED_DPI,
+};
+use crate::services::ocr_image_preprocess_service::{
+    compute_image_statistics, fallback_handwriting_selection, select_preprocess_variant,
+    ImageStatistics, OcrImagePreprocessService, DEFAULT_PREPROCESS_MODE,
+};
 use crate::services::pdf_preview_service::PdfPreviewService;
 use crate::services::project_store::ProjectStore;
 use crate::services::prompt_contract::{build_prompt_contract, default_sampling};
 use crate::services::student_answer_crop_service::StudentAnswerCropService;
 use crate::services::workflow_engine;
 
-const PROMPT_VERSION: &str = "student_answer_ocr_v4_typed_user_data";
+pub const PROMPT_VERSION: &str = "student_answer_ocr_v4_typed_user_data";
 const ISSUE_CORRECTION_PROMPT_VERSION: &str =
     "student_answer_ocr_issue_correction_v2_observed_only";
-const PREPROCESS_VERSION: &str = "ocr_image_preprocess_v2";
+pub const PREPROCESS_VERSION: &str = "ocr_image_preprocess_v2";
 const CRITICAL_KEYWORD_OCR_UNCERTAIN_WARNING: &str = "critical_keyword_ocr_uncertain";
 const CRITICAL_KEYWORD_OCR_UNCERTAIN_REASON: &str = "critical_keyword_similarity";
 const PREPROCESS_VARIANTS: [OcrImagePreprocessMode; 5] = [
@@ -161,7 +169,7 @@ impl StudentAnswerOcrService {
                 correlation_id: Uuid::new_v4().to_string(),
             });
         }
-        if !force_rerun && !project.student_answer_ocr_records.is_empty() {
+        if !force_rerun && !project.resolved_active_ocr_records().is_empty() {
             return Err(AppError {
                 code: AppErrorCode::WorkflowBlocked,
                 message: "Öğrenci cevap OCR’ı zaten başlatılmış.".to_string(),
@@ -172,12 +180,14 @@ impl StudentAnswerOcrService {
                 ),
                 technical_details: Some(format!(
                     "existing_records={}",
-                    project.student_answer_ocr_records.len()
+                    project.resolved_active_ocr_records().len()
                 )),
                 correlation_id: Uuid::new_v4().to_string(),
             });
         }
-        let total = (project.student_submissions.len() * project.questions.len()) as u32;
+        let scope_id = project.resolve_written_scope_id()?;
+        let scoped = project.written_scope_view();
+        let total = (scoped.student_submissions.len() * scoped.questions.len()) as u32;
         let job = self.job_manager.start_job(
             &app,
             project_id.clone(),
@@ -208,6 +218,7 @@ impl StudentAnswerOcrService {
         let job_id_for_generation = job.id.clone();
         let source_document_id = document.id.clone();
         let source_fingerprint_for_queue = source_fingerprint.clone();
+        let scope_id_for_queue = scope_id.clone();
         let queue_result = self
             .project_store
             .mutate(
@@ -242,6 +253,7 @@ impl StudentAnswerOcrService {
                             source_storage_revision: context.current_revision,
                             failure_reason: None,
                             job_mode: mode,
+                            assessment_activity_id: scope_id_for_queue.clone(),
                         });
                     }
                     for submission in &mut current.student_submissions {
@@ -546,7 +558,8 @@ impl StudentAnswerOcrService {
             .project_store
             .get_project_snapshot(project_id.to_string())?;
         let now = chrono::Utc::now();
-        if project.student_answer_ocr_records.is_empty() {
+        let active_ocr_records = project.resolved_active_ocr_records();
+        if active_ocr_records.is_empty() {
             return Err(AppError {
                 code: AppErrorCode::OcrNotReady,
                 message: "Öğrenci cevap OCR kaydı bulunamadı.".to_string(),
@@ -557,7 +570,7 @@ impl StudentAnswerOcrService {
             });
         }
 
-        if project.student_answer_ocr_records.iter().any(|record| {
+        if active_ocr_records.iter().any(|record| {
             record_has_invalid_structured_answer(
                 record,
                 project
@@ -605,6 +618,7 @@ impl StudentAnswerOcrService {
         highlight_region: Option<StudentAnswerOcrCropBBox>,
         crop_ref: Option<String>,
         model_input_crop_ref: Option<String>,
+        correlation_id: &str,
     ) -> Result<SuggestStudentAnswerOcrIssueCorrectionWithModelOutput, AppError> {
         let project = self.project_store.open_project(project_path.clone())?;
         let record = project
@@ -719,6 +733,7 @@ impl StudentAnswerOcrService {
             }),
             default_sampling(512),
             Some(crate::domain::model::ModelResponseFormat::JsonObject),
+            Some(correlation_id),
         );
         let result = self
             .model_gateway
@@ -847,7 +862,7 @@ impl StudentAnswerOcrService {
             });
         }
 
-        if !force_rerun && !project.student_answer_ocr_records.is_empty() {
+        if !force_rerun && !project.resolved_active_ocr_records().is_empty() {
             return Err(AppError {
                 code: AppErrorCode::WorkflowBlocked,
                 message: "Öğrenci cevap OCR’ı zaten başlatılmış.".to_string(),
@@ -855,7 +870,7 @@ impl StudentAnswerOcrService {
                 suggested_action: Some("Mevcut OCR sonuçlarını kontrol edin.".to_string()),
                 technical_details: Some(format!(
                     "existing_records={}",
-                    project.student_answer_ocr_records.len()
+                    project.resolved_active_ocr_records().len()
                 )),
                 correlation_id: Uuid::new_v4().to_string(),
             });
@@ -877,6 +892,8 @@ impl StudentAnswerOcrService {
         let project = self
             .project_store
             .get_project_snapshot(project_id.clone())?;
+        let scope_id = project.resolve_written_scope_id()?;
+        let scoped_view = project.written_scope_view();
         let document = self
             .active_student_scan_document(&project)
             .cloned()
@@ -893,7 +910,7 @@ impl StudentAnswerOcrService {
         if file_fingerprint(&source_path)? != source_fingerprint {
             return Err(ocr_stale_error());
         }
-        let total = (project.student_submissions.len() * project.questions.len()) as u32;
+        let total = (scoped_view.student_submissions.len() * scoped_view.questions.len()) as u32;
         self.job_manager
             .update_progress(
                 &app,
@@ -932,8 +949,8 @@ impl StudentAnswerOcrService {
         let mut records = Vec::new();
 
         let cancel_token = self.job_manager.get_cancellation_token(&job_id);
-        for submission in project.student_submissions.clone() {
-            for question in &project.questions {
+        for submission in scoped_view.student_submissions.clone() {
+            for question in &scoped_view.questions {
                 if let Some(ref t) = cancel_token {
                     if t.is_cancelled() {
                         let _ = self.job_manager.mark_cancelled(&app, &job_id);
@@ -958,21 +975,23 @@ impl StudentAnswerOcrService {
                     &project_id,
                     &project.root_path,
                     &document.id,
-                    &submission,
+                    submission,
                     question,
                     mode,
                 ) {
                     Ok(value) => value,
                     Err(error) => {
                         failed += 1;
-                        records.push(self.failed_record(
-                            &submission,
+                        let mut failed = self.failed_record(
+                            submission,
                             question,
                             StudentAnswerOcrStatus::CropMissing,
                             error.message.clone(),
                             submission.page_numbers.clone(),
                             vec![],
-                        ));
+                        );
+                        failed.assessment_activity_id = scope_id.clone();
+                        records.push(failed);
                         continue;
                     }
                 };
@@ -1015,6 +1034,7 @@ impl StudentAnswerOcrService {
                     }),
                     default_sampling(4096),
                     Some(crate::domain::model::ModelResponseFormat::JsonObject),
+                    None,
                 );
                 let result = self
                     .model_gateway
@@ -1170,20 +1190,23 @@ impl StudentAnswerOcrService {
                                 model_provenance: result.diagnostics.provenance.clone(),
                             }),
                             render_diagnostics: Some(source_artifacts.render_diagnostics.clone()),
+                            assessment_activity_id: scope_id.clone(),
                         };
                         apply_deterministic_critical_term_analysis(&mut record, question);
                         records.push(record);
                     }
                     Err(error) if self.is_soft_model_error(&error) => {
                         failed += 1;
-                        records.push(self.failed_record(
-                            &submission,
+                        let mut failed = self.failed_record(
+                            submission,
                             question,
                             StudentAnswerOcrStatus::ModelError,
                             error.message.clone(),
                             source_artifacts.source_page_numbers.clone(),
                             vec![error.message.clone()],
-                        ));
+                        );
+                        failed.assessment_activity_id = scope_id.clone();
+                        records.push(failed);
                         if let Some(record) = records.last_mut() {
                             record.crop_refs =
                                 source_artifacts.render_diagnostics.crop_refs.clone();
@@ -1275,6 +1298,7 @@ impl StudentAnswerOcrService {
                             "OCR sonucu beklenen soru kapsamını doğrulayamadı.",
                         ));
                     }
+                    let active_ocr_records = current.resolved_active_ocr_records();
                     let generation = current
                         .student_answer_ocr_generations
                         .iter_mut()
@@ -1293,8 +1317,7 @@ impl StudentAnswerOcrService {
                                 | StudentAnswerOcrStatus::ParseFailed
                         )
                     });
-                    let protected = current
-                        .student_answer_ocr_records
+                    let protected = active_ocr_records
                         .iter()
                         .filter(|record| record.submission_id == submission.id)
                         .any(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
@@ -1342,7 +1365,7 @@ impl StudentAnswerOcrService {
             succeeded,
             failed,
             reviewed: committed_project
-                .student_answer_ocr_records
+                .resolved_active_ocr_records()
                 .iter()
                 .filter(|record| record.status == StudentAnswerOcrStatus::TeacherApproved)
                 .count() as u32,
@@ -1466,6 +1489,7 @@ impl StudentAnswerOcrService {
                 }),
                 default_sampling(1024),
                 Some(crate::domain::model::ModelResponseFormat::JsonObject),
+                None,
             );
             let result = self
                 .model_gateway
@@ -1638,6 +1662,7 @@ impl StudentAnswerOcrService {
             teacher_reviewed_at: None,
             parse_diagnostics: None,
             render_diagnostics: None,
+            assessment_activity_id: None,
         }
     }
 
@@ -1671,11 +1696,13 @@ impl StudentAnswerOcrService {
         &self,
         project_id: &str,
         generation_id: &str,
+        correlation_id: &str,
     ) -> Result<OcrGeneration, AppError> {
         let generation_id = generation_id.to_string();
         let output = self.project_store.mutate(
             project_id,
-            crate::services::project_store::MutationOptions::new("accept_ocr_generation"),
+            crate::services::project_store::MutationOptions::new("accept_ocr_generation")
+                .correlation(correlation_id),
             move |project, _context| {
                 let index = project
                     .student_answer_ocr_generations
@@ -1747,11 +1774,13 @@ impl StudentAnswerOcrService {
         &self,
         project_id: &str,
         generation_id: &str,
+        correlation_id: &str,
     ) -> Result<OcrGeneration, AppError> {
         let generation_id = generation_id.to_string();
         let output = self.project_store.mutate(
             project_id,
-            crate::services::project_store::MutationOptions::new("reject_ocr_generation"),
+            crate::services::project_store::MutationOptions::new("reject_ocr_generation")
+                .correlation(correlation_id),
             move |project, _context| {
                 let generation = project
                     .student_answer_ocr_generations
@@ -1895,7 +1924,7 @@ fn find_record_mut<'a>(
         })
 }
 
-fn answer_type_label(answer_type: &AnswerType) -> &'static str {
+pub fn answer_type_label(answer_type: &AnswerType) -> &'static str {
     match answer_type {
         AnswerType::GeneralText => "general_text",
         AnswerType::ShortText => "short_text",
@@ -2367,7 +2396,7 @@ where
     left
 }
 
-fn build_student_answer_ocr_prompt(
+pub fn build_student_answer_ocr_prompt(
     question_number: u32,
     question_text: &str,
     answer_type: &AnswerType,
@@ -2477,6 +2506,7 @@ fn select_issue_base_image_ref(
         .or_else(|| record.full_page_preview_refs.first().cloned())
 }
 
+#[derive(Debug)]
 struct PreprocessedOcrInputs {
     model_input_images: Vec<(u32, PathBuf)>,
     model_input_crop_ref: Option<String>,
@@ -2488,6 +2518,7 @@ struct PreprocessedOcrInputs {
     preprocess_applied: bool,
     preprocess_warnings: Vec<String>,
     preprocess_diagnostics: Vec<OcrImagePreprocessDiagnostics>,
+    render_dpi: Option<u32>,
 }
 
 fn build_ocr_provenance(
@@ -2559,7 +2590,11 @@ fn build_ocr_provenance_parts(
     if source_artifacts.region_ids.is_empty() {
         provenance_notes.push("full_page_review_only_regions_not_available".to_string());
     }
-    provenance_notes.push("render_dpi_unknown_for_existing_preview_artifact".to_string());
+    if let Some(dpi) = preprocess.and_then(|value| value.render_dpi) {
+        provenance_notes.push(format!("render_dpi_normalized_to_{dpi}"));
+    } else {
+        provenance_notes.push("render_dpi_unknown_for_existing_preview_artifact".to_string());
+    }
     provenance_notes.push("renderer_unknown_for_existing_preview_artifact".to_string());
     if diagnostics.is_none() {
         provenance_notes.push("final_model_artifact_unknown_model_call_failed".to_string());
@@ -2580,7 +2615,7 @@ fn build_ocr_provenance_parts(
         region_ids: source_artifacts.region_ids.clone(),
         region_orders: source_artifacts.region_orders.clone(),
         regions,
-        render_dpi: None,
+        render_dpi: preprocess.and_then(|value| value.render_dpi),
         renderer: None,
         preprocess_policy: preprocess.map(|_| PREPROCESS_VERSION.to_string()),
         preprocess_variant: preprocess.map(|value| value.preprocess_mode),
@@ -2622,84 +2657,115 @@ impl StudentAnswerOcrService {
             });
         }
 
+        let trusted_root =
+            TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
+
+        // Phase 1 — deskew each source (typed rejection on out-of-range skew;
+        // no-op for straight crops) and aggregate statistics for the
+        // deterministic variant selection (TD-22).
+        let mut deskewed_sources = Vec::with_capacity(sources.len());
+        let mut mean_sum = 0.0f32;
+        let mut std_sum = 0.0f32;
+        let mut edge_sum = 0.0f32;
+        let mut stats_count = 0u32;
+        for (page_number, source_path) in sources {
+            let deskewed = self.deskew_source_for_ocr(&trusted_root, source_path)?;
+            match image::open(&deskewed.path) {
+                Ok(image) => {
+                    let stats = compute_image_statistics(&image);
+                    mean_sum += stats.mean;
+                    std_sum += stats.std_dev;
+                    edge_sum += stats.edge_density;
+                    stats_count += 1;
+                    deskewed_sources.push((*page_number, deskewed, Some(stats)));
+                }
+                Err(_) => {
+                    deskewed_sources.push((*page_number, deskewed, None));
+                }
+            }
+        }
+
+        let selection = if stats_count > 0 {
+            select_preprocess_variant(&ImageStatistics {
+                mean: mean_sum / stats_count as f32,
+                std_dev: std_sum / stats_count as f32,
+                edge_density: edge_sum / stats_count as f32,
+            })
+        } else {
+            fallback_handwriting_selection()
+        };
+
+        // Phase 2 — produce only the selected variant per source; a failed
+        // selected variant falls back to the original crop (no eager 5x, no
+        // second model call).
         let mut model_input_images = Vec::with_capacity(sources.len());
         let mut original_crop_refs = Vec::with_capacity(sources.len());
         let mut preprocessed_crop_refs = Vec::with_capacity(sources.len());
         let mut preprocess_warnings = Vec::new();
         let mut preprocess_diagnostics = Vec::new();
-        let mut source_results = Vec::with_capacity(sources.len());
 
-        for (page_number, source_path) in sources {
-            let source_ref = source_path.to_string_lossy().to_string();
+        for (page_number, deskewed, _stats) in &deskewed_sources {
+            let source_ref = deskewed.path.to_string_lossy().to_string();
             original_crop_refs.push(source_ref.clone());
-            let mut variant_results: Vec<(OcrImagePreprocessMode, Option<PathBuf>)> = Vec::new();
-            for variant in PREPROCESS_VARIANTS {
+            if selection.selected != DEFAULT_PREPROCESS_MODE {
                 match self.ocr_image_preprocess_service.preprocess_image(
                     project_root,
-                    source_path,
-                    variant,
+                    &deskewed.path,
+                    selection.selected,
                 ) {
                     Ok(result) => {
                         preprocess_diagnostics.push(result.diagnostics.clone());
-                        variant_results
-                            .push((variant, Some(PathBuf::from(result.output_image_path))));
+                        preprocessed_crop_refs.push(result.output_image_path.clone());
+                        model_input_images
+                            .push((*page_number, PathBuf::from(result.output_image_path)));
                     }
                     Err(error) => {
+                        preprocess_warnings.push("preprocess_failed".to_string());
+                        preprocess_warnings.push("preprocess_fallback_used".to_string());
                         preprocess_diagnostics.push(preprocess_failure_diagnostics(
-                            variant,
-                            source_path,
+                            selection.selected,
+                            &deskewed.path,
                             error.message.clone(),
                         ));
-                        variant_results.push((variant, None));
+                        preprocess_diagnostics.push(preprocess_failure_diagnostics(
+                            OcrImagePreprocessMode::Original,
+                            &deskewed.path,
+                            "preprocess_fallback_used".to_string(),
+                        ));
+                        model_input_images.push((*page_number, deskewed.path.clone()));
                     }
                 }
+            } else {
+                model_input_images.push((*page_number, deskewed.path.clone()));
             }
-            source_results.push((*page_number, source_path.clone(), variant_results));
         }
 
-        let handwriting_available = source_results.iter().all(|(_, _, variants)| {
-            variants.iter().any(|(variant, path)| {
-                *variant == OcrImagePreprocessMode::HandwritingEnhanced && path.is_some()
-            })
-        });
-        let clean_available = source_results.iter().all(|(_, _, variants)| {
-            variants.iter().any(|(variant, path)| {
-                *variant == OcrImagePreprocessMode::CleanGrayscale && path.is_some()
-            })
-        });
-        let selected_mode = if handwriting_available {
-            OcrImagePreprocessMode::HandwritingEnhanced
-        } else if clean_available {
-            OcrImagePreprocessMode::CleanGrayscale
+        let any_preprocessed = !preprocessed_crop_refs.is_empty();
+        let selected_mode = if selection.selected == DEFAULT_PREPROCESS_MODE || !any_preprocessed {
+            DEFAULT_PREPROCESS_MODE
         } else {
-            OcrImagePreprocessMode::Original
+            selection.selected
         };
 
-        if selected_mode != OcrImagePreprocessMode::HandwritingEnhanced {
-            preprocess_warnings.push("preprocess_failed".to_string());
-            preprocess_warnings.push("preprocess_fallback_used".to_string());
-        }
-
-        for (page_number, source_path, variants) in &source_results {
-            let selected_path = if selected_mode == OcrImagePreprocessMode::Original {
-                source_path.clone()
-            } else {
-                variants
-                    .iter()
-                    .find(|(variant, path)| *variant == selected_mode && path.is_some())
-                    .and_then(|(_, path)| path.clone())
-                    .unwrap_or_else(|| source_path.clone())
-            };
-            if selected_mode != OcrImagePreprocessMode::Original {
-                preprocessed_crop_refs.push(selected_path.to_string_lossy().to_string());
+        // Record the deterministic selection reason on the produced
+        // diagnostics (provenance pattern; Faz 5).
+        for diagnostic in &mut preprocess_diagnostics {
+            if diagnostic.mode == selected_mode && diagnostic.technical_details.is_none() {
+                diagnostic.technical_details =
+                    Some(format!("variant_selection_reason:{}", selection.reason));
+                break;
             }
-            model_input_images.push((*page_number, selected_path));
         }
 
         let model_input_crop_ref = model_input_images
             .first()
             .map(|(_, path)| path.to_string_lossy().to_string());
-        let preprocess_applied = selected_mode != OcrImagePreprocessMode::Original;
+        let preprocess_applied = selected_mode != DEFAULT_PREPROCESS_MODE;
+
+        let render_dpi = render_scale_to_dpi(2.0);
+        if !validate_dpi_in_range(render_dpi, OCR_MIN_ACCEPTED_DPI, OCR_MAX_ACCEPTED_DPI) {
+            preprocess_warnings.push(format!("render_dpi_out_of_accepted_range:{render_dpi}"));
+        }
 
         Ok(PreprocessedOcrInputs {
             model_input_images,
@@ -2712,8 +2778,101 @@ impl StudentAnswerOcrService {
             preprocess_applied,
             preprocess_warnings,
             preprocess_diagnostics,
+            render_dpi: Some(render_dpi),
         })
     }
+
+    /// Deskews a single source crop. Straight crops are returned unchanged;
+    /// out-of-range skew is rejected with a typed error; unreadable sources are
+    /// returned unchanged so the preprocess pass surfaces the failure as a
+    /// warning rather than failing the whole OCR job.
+    fn deskew_source_for_ocr(
+        &self,
+        trusted_root: &TrustedProjectRoot,
+        source_path: &Path,
+    ) -> Result<DeskewedOcrSource, AppError> {
+        let source_content = match std::fs::read(source_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(DeskewedOcrSource {
+                    path: source_path.to_path_buf(),
+                    applied: false,
+                    angle_degrees: 0.0,
+                });
+            }
+        };
+        let image = match image::load_from_memory(&source_content) {
+            Ok(image) => image,
+            Err(error) => {
+                return Err(AppError {
+                    code: AppErrorCode::OcrFailed,
+                    message: "OCR görüntüsü açılamadı.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Crop önbelleğini yeniden oluşturun.".to_string()),
+                    technical_details: Some(error.to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                });
+            }
+        };
+        let result = deskew_image(&image, DESKEW_DEFAULT_MAX_ANGLE)?;
+        if !result.applied {
+            return Ok(DeskewedOcrSource {
+                path: source_path.to_path_buf(),
+                applied: false,
+                angle_degrees: result.angle_degrees,
+            });
+        }
+        let mut bytes = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut bytes);
+            result
+                .image
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .map_err(|error| AppError {
+                    code: AppErrorCode::OcrFailed,
+                    message: "Deskew çıktısı kaydedilemedi.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("OCR işlemini yeniden deneyin.".to_string()),
+                    technical_details: Some(error.to_string()),
+                    correlation_id: Uuid::new_v4().to_string(),
+                })?;
+        }
+        let fingerprint = stable_deskew_fingerprint(source_path, &source_content);
+        let managed = trusted_root.managed(&format!(
+            "cache/deskewed/ocr_image_geometry_v1/{fingerprint}.png"
+        ))?;
+        let absolute_path = trusted_root.root().join(managed.as_path());
+        if let Some(parent) = absolute_path.parent() {
+            trusted_root.ensure_managed_directory(parent)?;
+        }
+        trusted_root.atomic_write_bytes(&managed, &bytes)?;
+        Ok(DeskewedOcrSource {
+            path: absolute_path,
+            applied: true,
+            angle_degrees: result.angle_degrees,
+        })
+    }
+}
+
+struct DeskewedOcrSource {
+    path: PathBuf,
+    #[allow(dead_code)]
+    applied: bool,
+    #[allow(dead_code)]
+    angle_degrees: f32,
+}
+
+fn stable_deskew_fingerprint(source_path: &Path, content: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in source_path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for byte in content {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn preprocess_failure_diagnostics(
@@ -2994,6 +3153,7 @@ PY
             identity_ocr: None,
         }];
         project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             student_id,
             document_id: document.id,
@@ -3154,6 +3314,7 @@ PY
             identity_ocr: None,
         }];
         project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             student_id,
             document_id: document.id,
@@ -3284,6 +3445,7 @@ PY
             identity_ocr: None,
         }];
         project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             student_id,
             document_id: document.id,
@@ -3423,6 +3585,7 @@ PY
             identity_ocr: None,
         }];
         project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             student_id,
             document_id: document.id,
@@ -3653,6 +3816,79 @@ PY
     }
 
     #[test]
+    fn preprocess_model_inputs_generates_only_the_selected_variant() {
+        let root = temp_root();
+        let image_path = root.join("crop.png");
+        let mut image = ImageBuffer::from_pixel(60, 60, Rgba([245, 245, 245, 255]));
+        for y in 0..60 {
+            if (10..16).contains(&y) || (30..36).contains(&y) || (50..56).contains(&y) {
+                for x in 0..60 {
+                    image.put_pixel(x, y, Rgba([50, 50, 50, 255]));
+                }
+            }
+        }
+        DynamicImage::ImageRgba8(image).save(&image_path).unwrap();
+
+        let service = preprocess_service();
+        let inputs = service
+            .preprocess_model_inputs(
+                &root,
+                &[(1, image_path.clone())],
+                OcrImagePreprocessMode::HandwritingEnhanced,
+            )
+            .unwrap();
+
+        assert_eq!(
+            inputs.preprocess_mode,
+            OcrImagePreprocessMode::HandwritingEnhanced
+        );
+        assert!(inputs.preprocess_applied);
+        assert!(inputs.preprocess_warnings.is_empty());
+        // TD-22: the deterministic rule produces exactly the selected variant —
+        // no eager 5x preprocess generation, so a single produced mode and a
+        // single selection-reason diagnostic.
+        assert_eq!(
+            inputs.preprocess_diagnostics.len(),
+            1,
+            "only the selected variant may be produced"
+        );
+        let diagnostic = &inputs.preprocess_diagnostics[0];
+        assert_eq!(diagnostic.mode, OcrImagePreprocessMode::HandwritingEnhanced);
+        assert!(diagnostic.technical_details.as_deref().is_some_and(
+            |details| details.starts_with("variant_selection_reason:statistics_scored_")
+        ));
+        assert_eq!(inputs.render_dpi, Some(144));
+    }
+
+    #[test]
+    fn preprocess_model_inputs_rejects_out_of_range_skew_with_typed_error() {
+        let root = temp_root();
+        let image_path = root.join("skewed.png");
+        let mut base = image::GrayImage::from_pixel(300, 220, image::Luma([255]));
+        let mut y = 30;
+        while y + 8 < 220 {
+            for yy in y..(y + 8).min(220) {
+                for xx in 0..300 {
+                    base.put_pixel(xx, yy, image::Luma([40]));
+                }
+            }
+            y += 42;
+        }
+        let tilted = crate::services::ocr_image_geometry_service::rotate_gray(&base, 9.0);
+        DynamicImage::ImageLuma8(tilted).save(&image_path).unwrap();
+
+        let service = preprocess_service();
+        let error = service
+            .preprocess_model_inputs(
+                &root,
+                &[(1, image_path.clone())],
+                OcrImagePreprocessMode::HandwritingEnhanced,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::DeskewOutOfRange);
+    }
+
+    #[test]
     fn status_priority_marks_parse_failure_before_review() {
         assert_eq!(
             derive_student_answer_status(true, false, false, false, false),
@@ -3822,6 +4058,7 @@ PY
     #[test]
     fn failed_record_is_reviewable_and_keeps_empty_crop_refs() {
         let submission = StudentSubmission {
+            assessment_activity_id: None,
             id: "submission-1".to_string(),
             student_id: "student-1".to_string(),
             document_id: "document-1".to_string(),
@@ -3930,6 +4167,7 @@ PY
             identity_ocr: None,
         }];
         project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             student_id,
             document_id: document.id,
@@ -3945,6 +4183,7 @@ PY
         project.student_grouping_complete_at = Some(chrono::Utc::now().to_rfc3339());
         project.expected_question_count = Some(1);
         project.student_answer_ocr_records = vec![StudentAnswerOcrRecord {
+            assessment_activity_id: None,
             id: Uuid::new_v4().to_string(),
             submission_id: project.student_submissions[0].id.clone(),
             question_id: project.questions[0].id.clone(),
@@ -4054,5 +4293,433 @@ PY
                     | OcrGenerationStatus::Interrupted
             ));
         });
+    }
+
+    #[test]
+    fn update_student_answer_text_commit_failure_returns_typed_error_and_allows_retry() {
+        let root = temp_root();
+        let project_store = ProjectStore::new();
+        let mut project = project_store
+            .create_project(
+                "OCR Commit Fail".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let question_id = Uuid::new_v4().to_string();
+        let submission_id = Uuid::new_v4().to_string();
+        let student_id = new_student_id();
+        project.questions = vec![{
+            let mut question = default_question(1);
+            question.id = question_id.clone();
+            question.answer_type = AnswerType::GeneralText;
+            question.max_score = 1.0;
+            question.question_text = TextFieldState {
+                value: "Soru 1".to_string(),
+                source: TextFieldSource::Manual,
+                status: TextFieldStatus::Confirmed,
+                confidence: Some(1.0),
+                warnings: vec![],
+                updated_at: None,
+            };
+            question
+        }];
+        project.students = vec![Student {
+            id: student_id.clone(),
+            display_name: Some("Öğrenci".to_string()),
+            number: Some("1".to_string()),
+            class_name: Some("10-A".to_string()),
+            warnings: vec![],
+            identity_ocr: None,
+        }];
+        project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
+            id: submission_id.clone(),
+            student_id,
+            document_id: Uuid::new_v4().to_string(),
+            class_id: None,
+            scan_batch_id: None,
+            class_membership_source: None,
+            page_numbers: vec![1],
+            status: StudentSubmissionStatus::Grouped,
+            answer_slots: vec![],
+            warnings: vec![],
+            updated_at: None,
+        }];
+        project.student_answer_ocr_records = vec![StudentAnswerOcrRecord {
+            assessment_activity_id: None,
+            id: Uuid::new_v4().to_string(),
+            submission_id: submission_id.clone(),
+            question_id: question_id.clone(),
+            question_number: 1,
+            source_page_numbers: vec![1],
+            source_image_refs: vec![],
+            crop_refs: vec![],
+            original_crop_refs: vec![],
+            preprocessed_crop_refs: vec![],
+            model_input_crop_ref: None,
+            preprocess_mode: Some(OcrImagePreprocessMode::Original),
+            preprocess_version: Some(PREPROCESS_VERSION.to_string()),
+            preprocess_applied: false,
+            preprocess_warnings: vec![],
+            preprocess_diagnostics: vec![],
+            available_preprocess_variants: PREPROCESS_VARIANTS.to_vec(),
+            full_page_preview_refs: vec![],
+            answer_text: "eski metin".to_string(),
+            structured_answer: None,
+            confidence: Some(0.8),
+            uncertain_spans: vec![],
+            suggested_corrections: vec![],
+            critical_term_warnings: vec![],
+            ocr_semantic_warnings: vec![],
+            critical_keyword_uncertain: false,
+            status: StudentAnswerOcrStatus::TeacherApproved,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            review_policy: None,
+            model_provenance: None,
+            model_name: Some("gemma".to_string()),
+            prompt_version: PROMPT_VERSION.to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            teacher_corrected_text: None,
+            teacher_reviewed_at: Some(chrono::Utc::now()),
+            parse_diagnostics: None,
+            render_diagnostics: None,
+            ocr_provenance: None,
+        }];
+        project_store.save_project(&project).unwrap();
+
+        let project_json = root.join("project.json");
+        let original_content =
+            std::fs::read_to_string(&project_json).expect("project.json should be readable");
+
+        // Externally modify the project file so the next commit fails the
+        // session-fingerprint check (PROJECT_EXTERNALLY_MODIFIED).
+        let mut external = project_store
+            .get_project_snapshot(project.id.clone())
+            .unwrap();
+        external.name = "external edit".to_string();
+        std::fs::write(
+            &project_json,
+            serde_json::to_string_pretty(&external).unwrap(),
+        )
+        .unwrap();
+
+        let service = StudentAnswerOcrService::new(
+            project_store.clone(),
+            Arc::new(crate::services::llama_server_gateway::LlamaServerGateway::default()),
+            ModelRuntimeService::new(
+                test_config_service(),
+                ModelProcessManager::new_with_state_path(
+                    test_config_service(),
+                    Arc::new(crate::services::llama_server_gateway::LlamaServerGateway::default()),
+                    std::env::temp_dir()
+                        .join(format!("rubrika-model-state-{}.json", Uuid::new_v4())),
+                ),
+            ),
+            Arc::new(PdfPreviewService::new(
+                project_store.clone(),
+                Arc::new(SystemPdfService),
+                Arc::new(JobManager::new()),
+            )),
+            Arc::new(crate::services::model_input_image_service::ModelInputImageService::default()),
+            Arc::new(JobManager::new()),
+        );
+
+        // Commit fail -> typed error; no success DTO is returned.
+        let error = service
+            .update_student_answer_text(
+                &project.id,
+                &submission_id,
+                &question_id,
+                "düzeltilmiş".into(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, AppErrorCode::ProjectExternallyModified);
+
+        // Memory state must not be canonical: the record must keep its
+        // pre-mutation teacher_corrected_text (None).
+        let session = project_store
+            .get_project_snapshot(project.id.clone())
+            .unwrap();
+        let record = &session.student_answer_ocr_records[0];
+        assert_eq!(
+            record.teacher_corrected_text, None,
+            "failed commit must not mutate the session record"
+        );
+        assert_eq!(record.answer_text, "eski metin");
+
+        // The failed mutation must not have overwritten the external disk state.
+        let disk = std::fs::read_to_string(&project_json).unwrap();
+        assert!(
+            disk.contains("external edit"),
+            "failed commit must not overwrite the externally modified project file"
+        );
+
+        // Restore the disk to the session-known content and retry: success now.
+        std::fs::write(&project_json, &original_content).unwrap();
+        let updated = service
+            .update_student_answer_text(
+                &project.id,
+                &submission_id,
+                &question_id,
+                "düzeltilmiş".into(),
+            )
+            .expect("retry must succeed after restoring the project file");
+        assert_eq!(
+            updated.teacher_corrected_text.as_deref(),
+            Some("düzeltilmiş")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ocr_result_commit_is_atomic_and_never_writes_partial_state() {
+        let root = temp_root();
+        let project_store = ProjectStore::new();
+        let mut project = project_store
+            .create_project(
+                "OCR Atomic Commit".to_string(),
+                root.to_string_lossy().to_string(),
+            )
+            .unwrap();
+
+        let question_id = Uuid::new_v4().to_string();
+        let submission_id = Uuid::new_v4().to_string();
+        let student_id = new_student_id();
+        let generation_id = Uuid::new_v4().to_string();
+        let job_id = Uuid::new_v4().to_string();
+        let document_id = Uuid::new_v4().to_string();
+
+        project.questions = vec![{
+            let mut question = default_question(1);
+            question.id = question_id.clone();
+            question.answer_type = AnswerType::GeneralText;
+            question.question_text = TextFieldState {
+                value: "Soru 1".to_string(),
+                source: TextFieldSource::Manual,
+                status: TextFieldStatus::Confirmed,
+                confidence: Some(1.0),
+                warnings: vec![],
+                updated_at: None,
+            };
+            question
+        }];
+        project.students = vec![Student {
+            id: student_id.clone(),
+            display_name: Some("Öğrenci".to_string()),
+            number: Some("1".to_string()),
+            class_name: Some("10-A".to_string()),
+            warnings: vec![],
+            identity_ocr: None,
+        }];
+        project.student_submissions = vec![StudentSubmission {
+            assessment_activity_id: None,
+            id: submission_id.clone(),
+            student_id,
+            document_id: document_id.clone(),
+            class_id: None,
+            scan_batch_id: None,
+            class_membership_source: None,
+            page_numbers: vec![1],
+            status: StudentSubmissionStatus::OcrRunning,
+            answer_slots: vec![],
+            warnings: vec![],
+            updated_at: None,
+        }];
+        let now = chrono::Utc::now();
+        project.student_answer_ocr_generations = vec![OcrGeneration {
+            generation_id: generation_id.clone(),
+            submission_id: submission_id.clone(),
+            source_fingerprint: "fp".to_string(),
+            created_at: now,
+            model_name: Some("gemma".to_string()),
+            prompt_version: PROMPT_VERSION.to_string(),
+            status: OcrGenerationStatus::Candidate,
+            result: vec![],
+            diagnostics: None,
+            teacher_review_status: OcrTeacherReviewStatus::Pending,
+            created_by_job_id: job_id.clone(),
+            source_document_id: document_id.clone(),
+            source_storage_revision: project.storage_revision,
+            failure_reason: None,
+            job_mode: StudentAnswerOcrJobMode::Production,
+            assessment_activity_id: None,
+        }];
+        project_store.save_project(&project).unwrap();
+
+        // A candidate OCR record the commit would normally apply.
+        let candidate = StudentAnswerOcrRecord {
+            assessment_activity_id: None,
+            id: Uuid::new_v4().to_string(),
+            submission_id: submission_id.clone(),
+            question_id: question_id.clone(),
+            question_number: 1,
+            source_page_numbers: vec![1],
+            source_image_refs: vec!["cache/model_inputs/.../1.png".to_string()],
+            crop_refs: vec![],
+            original_crop_refs: vec![],
+            preprocessed_crop_refs: vec![],
+            model_input_crop_ref: None,
+            preprocess_mode: Some(OcrImagePreprocessMode::HandwritingEnhanced),
+            preprocess_version: Some(PREPROCESS_VERSION.to_string()),
+            preprocess_applied: true,
+            preprocess_warnings: vec![],
+            preprocess_diagnostics: vec![],
+            available_preprocess_variants: PREPROCESS_VARIANTS.to_vec(),
+            full_page_preview_refs: vec![],
+            answer_text: "cevap metni".to_string(),
+            structured_answer: None,
+            confidence: Some(0.9),
+            uncertain_spans: vec![],
+            suggested_corrections: vec![],
+            critical_term_warnings: vec![],
+            ocr_semantic_warnings: vec![],
+            critical_keyword_uncertain: false,
+            status: StudentAnswerOcrStatus::Succeeded,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            review_policy: None,
+            model_provenance: None,
+            model_name: Some("gemma".to_string()),
+            prompt_version: PROMPT_VERSION.to_string(),
+            created_at: now,
+            updated_at: now,
+            teacher_corrected_text: None,
+            teacher_reviewed_at: None,
+            parse_diagnostics: None,
+            render_diagnostics: None,
+            ocr_provenance: None,
+        };
+
+        // First commit mutates every state the OCR result touches and then
+        // fails on purpose (simulates the coverage validation failing after the
+        // in-memory writes). The transaction must roll everything back.
+        let candidate_for_fail = candidate.clone();
+        let submission_for_fail = submission_id.clone();
+        let generation_for_fail = generation_id.clone();
+        let injected_failure = project_store.commit_job(
+            &project.id,
+            crate::services::project_store::MutationOptions::new("commit_ocr_generation"),
+            move |current, _context| -> Result<(), AppError> {
+                let generation = current
+                    .student_answer_ocr_generations
+                    .iter_mut()
+                    .find(|generation| generation.generation_id == generation_for_fail)
+                    .ok_or_else(|| ocr_entity_missing_error("OCR candidate artık mevcut değil."))?;
+                generation.result = vec![candidate_for_fail.clone()];
+                generation.status = OcrGenerationStatus::Active;
+                generation.teacher_review_status = OcrTeacherReviewStatus::NotRequired;
+                current
+                    .student_answer_ocr_records
+                    .extend(vec![candidate_for_fail.clone()]);
+                if let Some(submission) = current
+                    .student_submissions
+                    .iter_mut()
+                    .find(|submission| submission.id == submission_for_fail)
+                {
+                    submission.status = StudentSubmissionStatus::OcrSuggested;
+                }
+                Err(ocr_candidate_failed_error(
+                    "OCR sonucu beklenen soru kapsamını doğrulayamadı.",
+                ))
+            },
+        );
+        assert!(
+            matches!(
+                injected_failure,
+                crate::services::project_store::JobCommitResult::Rejected(_)
+            ),
+            "the injected commit failure must surface as a typed rejection"
+        );
+
+        // Nothing may have been written: generation still Candidate, no OCR
+        // records, submission still OCR-running.
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        let generation = persisted
+            .student_answer_ocr_generations
+            .iter()
+            .find(|generation| generation.generation_id == generation_id)
+            .unwrap();
+        assert_eq!(
+            generation.status,
+            OcrGenerationStatus::Candidate,
+            "failed commit must not activate the generation"
+        );
+        assert!(
+            generation.result.is_empty(),
+            "failed commit must not persist candidate records"
+        );
+        assert!(
+            persisted.student_answer_ocr_records.is_empty(),
+            "failed commit must not persist OCR records"
+        );
+        assert_eq!(
+            persisted.student_submissions[0].status,
+            StudentSubmissionStatus::OcrRunning,
+            "failed commit must not change the submission status"
+        );
+
+        // Retry with a successful commit: every state updates in the same
+        // atomic write.
+        let candidate_for_success = candidate.clone();
+        let submission_for_success = submission_id.clone();
+        let generation_for_success = generation_id.clone();
+        let applied = project_store.commit_job(
+            &project.id,
+            crate::services::project_store::MutationOptions::new("commit_ocr_generation"),
+            move |current, _context| {
+                let generation = current
+                    .student_answer_ocr_generations
+                    .iter_mut()
+                    .find(|generation| generation.generation_id == generation_for_success)
+                    .ok_or_else(|| ocr_entity_missing_error("OCR candidate artık mevcut değil."))?;
+                generation.result = vec![candidate_for_success.clone()];
+                generation.status = OcrGenerationStatus::Active;
+                generation.teacher_review_status = OcrTeacherReviewStatus::NotRequired;
+                current
+                    .student_answer_ocr_records
+                    .extend(vec![candidate_for_success.clone()]);
+                if let Some(submission) = current
+                    .student_submissions
+                    .iter_mut()
+                    .find(|submission| submission.id == submission_for_success)
+                {
+                    submission.status = StudentSubmissionStatus::OcrSuggested;
+                }
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(
+                applied,
+                crate::services::project_store::JobCommitResult::Applied(_)
+            ),
+            "the retried commit must apply"
+        );
+
+        let persisted = ProjectStore::open_project_at_path(&root).unwrap();
+        let generation = persisted
+            .student_answer_ocr_generations
+            .iter()
+            .find(|generation| generation.generation_id == generation_id)
+            .unwrap();
+        assert_eq!(generation.status, OcrGenerationStatus::Active);
+        assert_eq!(generation.result.len(), 1);
+        assert_eq!(
+            generation.teacher_review_status,
+            OcrTeacherReviewStatus::NotRequired
+        );
+        assert_eq!(persisted.student_answer_ocr_records.len(), 1);
+        assert_eq!(
+            persisted.student_submissions[0].status,
+            StudentSubmissionStatus::OcrSuggested
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

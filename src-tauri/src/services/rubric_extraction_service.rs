@@ -131,7 +131,11 @@ impl RubricExtractionService {
                     .get_project_snapshot(project_id.clone())
                 {
                     proj.workflow = crate::services::workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.commit_snapshot_cas(&proj);
+                    if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                        log::error!(
+                            "Rubrik import workflow güncellemesi kalıcı yazılamadı: {error}"
+                        );
+                    }
                 }
             } else {
                 if let Ok(mut proj) = service
@@ -139,7 +143,11 @@ impl RubricExtractionService {
                     .get_project_snapshot(project_id.clone())
                 {
                     proj.workflow = crate::services::workflow_engine::evaluate_workflow(&proj);
-                    let _ = service.project_store.commit_snapshot_cas(&proj);
+                    if let Err(error) = service.project_store.commit_snapshot_cas(&proj) {
+                        log::error!(
+                            "Rubrik import workflow güncellemesi kalıcı yazılamadı: {error}"
+                        );
+                    }
                 }
             }
         });
@@ -305,6 +313,8 @@ impl RubricExtractionService {
         let mut image_paths = Vec::new();
         let mut image_dimensions = Vec::new();
         let mut image_byte_sizes = Vec::new();
+        let mut page_usage: std::collections::BTreeMap<u32, serde_json::Value> =
+            std::collections::BTreeMap::new();
 
         let extraction_result: Result<crate::domain::model::RubricExtractionResult, AppError> =
             if is_text_based {
@@ -370,6 +380,7 @@ impl RubricExtractionService {
                             name: "rubric_extraction_suggestion".to_string(),
                             schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
                         }),
+                        None,
                     );
                     let req = RubricExtractionRequest {
                         prompt: rubric_prompt,
@@ -451,6 +462,7 @@ impl RubricExtractionService {
                             error_code: None,
                             provenance: None,
                         },
+                        retry_metadata: None,
                     })
                 }
             } else {
@@ -537,6 +549,9 @@ impl RubricExtractionService {
                     .cloned()
                     .collect::<Vec<_>>();
                 let fallback_image_path = image_paths.first().cloned();
+                let page_count = all_prepared_inputs.len() as u32;
+                let page_questions =
+                    crate::services::page_window_service::question_numbers_by_page(&raw_text);
                 for question_number in target_questions.clone() {
                     let _ = self.job_manager.update_progress(
                     &app,
@@ -576,65 +591,101 @@ impl RubricExtractionService {
                         question_text,
                         question_text_status,
                     );
-                    let prompt_contract = build_prompt_contract(
-                        crate::domain::model::ModelRequestKind::RubricDraft,
-                        "rubric_extraction_v2_typed_user_data",
-                        crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
-                        "rubric_extraction_policy_v1",
-                        rubric_prompt.clone(),
-                        json!({
-                            "targetQuestionNumber": question_number,
-                            "expectedQuestionCount": expected_question_count,
-                            "questionText": question_text,
-                            "questionTextStatus": question_text_status,
-                            "strictJsonOnly": false,
-                            "attempt": 1,
-                            "imageInput": true,
-                        }),
-                        default_sampling(8192),
-                        Some(crate::domain::model::ModelResponseFormat::JsonSchema {
-                            name: "rubric_extraction_suggestion".to_string(),
-                            schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
-                        }),
+                    // TD-19: escalate from the exact target page to a ±1 window
+                    // and finally to the whole document (bounded) instead of
+                    // resending every page for every question.
+                    let base_pages =
+                        crate::services::page_window_service::candidate_pages_for_question(
+                            question_number,
+                            &page_questions,
+                            expected_question_count,
+                            page_count,
+                        );
+                    let window_pages = crate::services::page_window_service::expand_page_window(
+                        &base_pages,
+                        page_count,
+                        crate::services::page_window_service::WINDOW_RADIUS,
                     );
-                    let req = RubricExtractionRequest {
-                        prompt: rubric_prompt,
-                        prompt_contract: Some(prompt_contract),
-                        raw_text: None,
-                        image_path: fallback_image_path.clone(),
-                        target_question_number: question_number,
-                        model_input_images: all_prepared_inputs.clone(),
-                        strict_json_only: false,
-                        attempt: 1,
-                        project_root_path: Some(project.root_path.clone()),
-                        job_id: Some(format!("{job_id}_q{question_number}")),
-                    };
+                    let all_pages = (1..=page_count).collect::<Vec<_>>();
 
-                    let page_res_result = self.draft_rubric_with_retry(req).await;
-                    match page_res_result {
-                        Ok(page_res) => {
-                            let mut found = false;
-                            for q in page_res.output.questions {
-                                if q.number == question_number {
-                                    merged_questions.insert(q.number, q);
-                                    found = true;
+                    let mut question_found = false;
+                    let mut attempts = 0u32;
+                    let mut pages_used: Vec<u32> = Vec::new();
+                    let mut last_stage = "target";
+                    for (stage, tier_pages) in [
+                        ("target", base_pages),
+                        ("window", window_pages),
+                        ("fallback", all_pages),
+                    ] {
+                        if tier_pages.is_empty() {
+                            continue;
+                        }
+                        let tier_inputs =
+                            crate::services::page_window_service::select_inputs_by_pages(
+                                &all_prepared_inputs,
+                                &tier_pages,
+                            );
+                        if tier_inputs.is_empty() {
+                            continue;
+                        }
+                        attempts += 1;
+                        pages_used = tier_pages.clone();
+                        last_stage = stage;
+                        let tier_image_path = tier_inputs
+                            .first()
+                            .map(|input| input.output_image_path.clone())
+                            .or_else(|| fallback_image_path.clone());
+                        let req = self.build_vision_rubric_request(
+                            &RubricVisionQuestionContext {
+                                prompt: &rubric_prompt,
+                                question_number,
+                                expected_question_count,
+                                project_root: &project.root_path,
+                                job_id: &job_id,
+                                question_text,
+                                question_text_status,
+                            },
+                            tier_image_path,
+                            tier_inputs,
+                            false,
+                            1,
+                            &pages_used,
+                        );
+                        match self.draft_rubric_with_retry(req).await {
+                            Ok(page_res) => {
+                                let mut found = false;
+                                for q in page_res.output.questions {
+                                    if q.number == question_number {
+                                        merged_questions.insert(q.number, q);
+                                        found = true;
+                                    }
+                                }
+                                merged_warnings.extend(page_res.output.document_warnings);
+                                if found {
+                                    question_found = true;
+                                    break;
                                 }
                             }
-                            if !found {
-                                failed_questions.push(question_number);
-                                merged_warnings.push(format!(
-                                    "question_{question_number}_missing_in_model_response"
-                                ));
+                            Err(e) => {
+                                last_error = Some(e);
                             }
-                            merged_warnings.extend(page_res.output.document_warnings);
-                        }
-                        Err(e) => {
-                            failed_questions.push(question_number);
-                            merged_warnings
-                                .push(format!("question_{question_number}_failed: {:?}", e.code));
-                            last_error = Some(e);
                         }
                     }
+                    if !question_found {
+                        failed_questions.push(question_number);
+                        merged_warnings.push(format!(
+                            "question_{question_number}_missing_in_model_response"
+                        ));
+                    }
+                    page_usage.insert(
+                        question_number,
+                        json!({
+                            "pages": pages_used,
+                            "attempts": attempts,
+                            "stage": last_stage,
+                            "found": question_found,
+                        }),
+                    );
                 }
 
                 if failed_questions.len() == target_questions.len() && !target_questions.is_empty()
@@ -682,6 +733,7 @@ impl RubricExtractionService {
                             error_code: None,
                             provenance: None,
                         },
+                        retry_metadata: None,
                     })
                 }
             };
@@ -956,6 +1008,7 @@ impl RubricExtractionService {
                 "artifactDir": artifact_dir,
                 "warnings": q_warnings,
                 "errorCode": if status == "failed" { Some("MODEL_EXTRACTION_FAILED") } else { None },
+                "pageUsage": page_usage.get(&question_number),
             }));
         }
 
@@ -998,7 +1051,68 @@ fn should_retry_rubric_parse(error: &AppError) -> bool {
     )
 }
 
+/// Per-question context needed to build a vision rubric extraction request.
+struct RubricVisionQuestionContext<'a> {
+    prompt: &'a str,
+    question_number: u32,
+    expected_question_count: u32,
+    project_root: &'a str,
+    job_id: &'a str,
+    question_text: Option<&'a str>,
+    question_text_status: &'a str,
+}
+
 impl RubricExtractionService {
+    /// Builds a vision rubric extraction request targeting a bounded page set.
+    fn build_vision_rubric_request(
+        &self,
+        context: &RubricVisionQuestionContext<'_>,
+        image_path: Option<String>,
+        model_input_images: Vec<ModelInputImage>,
+        strict_json_only: bool,
+        attempt: u32,
+        pages_used: &[u32],
+    ) -> RubricExtractionRequest {
+        let mut user_data = json!({
+            "targetQuestionNumber": context.question_number,
+            "expectedQuestionCount": context.expected_question_count,
+            "questionText": context.question_text,
+            "questionTextStatus": context.question_text_status,
+            "strictJsonOnly": strict_json_only,
+            "attempt": attempt,
+            "imageInput": true,
+        });
+        if !pages_used.is_empty() {
+            user_data["includedPages"] = json!(pages_used);
+        }
+        let prompt_contract = build_prompt_contract(
+            crate::domain::model::ModelRequestKind::RubricDraft,
+            "rubric_extraction_v2_typed_user_data",
+            crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
+            "rubric_extraction_policy_v1",
+            context.prompt.to_string(),
+            user_data,
+            default_sampling(8192),
+            Some(crate::domain::model::ModelResponseFormat::JsonSchema {
+                name: "rubric_extraction_suggestion".to_string(),
+                schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
+            }),
+            None,
+        );
+        RubricExtractionRequest {
+            prompt: context.prompt.to_string(),
+            prompt_contract: Some(prompt_contract),
+            raw_text: None,
+            image_path,
+            target_question_number: context.question_number,
+            model_input_images,
+            strict_json_only,
+            attempt,
+            project_root_path: Some(context.project_root.to_string()),
+            job_id: Some(format!("{}_q{}", context.job_id, context.question_number)),
+        }
+    }
+
     async fn draft_rubric_with_retry(
         &self,
         request: RubricExtractionRequest,
@@ -1007,24 +1121,128 @@ impl RubricExtractionService {
         match first_attempt {
             Ok(result) => Ok(result),
             Err(first_error) if should_retry_rubric_parse(&first_error) => {
+                let had_images =
+                    !request.model_input_images.is_empty() || request.image_path.is_some();
+                let mut salvage_used = false;
+                let mut text_only_repair_used = false;
+                let mut repair_attempted = false;
+                let mut retry_reason = None;
+
+                // TD-20: recover the malformed first response without resending
+                // the images. The gateway already attempts a deterministic
+                // salvage while parsing; this layer adds a full-text salvage and
+                // a text-only JSON repair that never sends images.
+                if had_images {
+                    if let Some(raw_response) =
+                        crate::services::llama_server_gateway::read_saved_rubric_raw_response(
+                            &request,
+                        )
+                    {
+                        let cleaned =
+                            crate::services::llama_server_gateway::strip_reasoning_and_fences(
+                                &raw_response,
+                            );
+                        if let Some(payload) =
+                            crate::services::llama_server_gateway::parse_partial_rubric_questions(
+                                &cleaned,
+                            )
+                        {
+                            salvage_used = true;
+                            return Ok(rubric_result_from_salvage(
+                                payload,
+                                &request,
+                                cleaned,
+                                crate::domain::model::RubricExtractionRetryMetadata {
+                                    attempts: 1,
+                                    image_count: request.model_input_images.len() as u32,
+                                    pages_used: vec![],
+                                    retry_reason: None,
+                                    salvage_used,
+                                    text_only_repair_used: false,
+                                    targeted_pages: vec![],
+                                },
+                            ));
+                        }
+                        if !cleaned.trim().is_empty() {
+                            repair_attempted = true;
+                            let mut repair_request = request.clone();
+                            repair_request.raw_text = Some(cleaned.clone());
+                            repair_request.model_input_images = vec![];
+                            repair_request.image_path = None;
+                            repair_request.strict_json_only = true;
+                            repair_request.attempt = 2;
+                            if let Some(prompt_contract) = repair_request.prompt_contract.as_mut() {
+                                if let Some(user_data) = prompt_contract.user_data.as_object_mut() {
+                                    user_data.insert("strictJsonOnly".to_string(), json!(true));
+                                    user_data.insert("attempt".to_string(), json!(2));
+                                    user_data.insert("rawText".to_string(), json!(cleaned));
+                                }
+                            }
+                            match self.model_gateway.draft_rubric(repair_request).await {
+                                Ok(mut result) => {
+                                    text_only_repair_used = true;
+                                    result.retry_metadata =
+                                        Some(crate::domain::model::RubricExtractionRetryMetadata {
+                                            attempts: 2,
+                                            image_count: 0,
+                                            pages_used: vec![],
+                                            retry_reason: None,
+                                            salvage_used: false,
+                                            text_only_repair_used,
+                                            targeted_pages: vec![],
+                                        });
+                                    return Ok(result);
+                                }
+                                Err(repair_error) => {
+                                    retry_reason = Some(format!(
+                                        "text_only_repair_failed:{:?}",
+                                        repair_error.code
+                                    ));
+                                }
+                            }
+                        } else {
+                            retry_reason = Some("first_response_empty".to_string());
+                        }
+                    }
+                }
+
+                // Explicit-reason multimodal retry (last resort).
+                let reason = retry_reason
+                    .unwrap_or_else(|| format!("first_error_code={:?}", first_error.code));
+                let retry_attempt = if repair_attempted { 3 } else { 2 };
                 let mut retry_request = request;
                 retry_request.strict_json_only = true;
-                retry_request.attempt = 2;
+                retry_request.attempt = retry_attempt;
                 if let Some(prompt_contract) = retry_request.prompt_contract.as_mut() {
                     if let Some(user_data) = prompt_contract.user_data.as_object_mut() {
                         user_data.insert("strictJsonOnly".to_string(), json!(true));
-                        user_data.insert("attempt".to_string(), json!(2));
+                        user_data.insert("attempt".to_string(), json!(retry_attempt));
                     }
                 }
-                let retry_result = self.model_gateway.draft_rubric(retry_request).await;
+                let retry_result = self.model_gateway.draft_rubric(retry_request.clone()).await;
                 match retry_result {
-                    Ok(result) => Ok(result),
+                    Ok(mut result) => {
+                        result.retry_metadata =
+                            Some(crate::domain::model::RubricExtractionRetryMetadata {
+                                attempts: retry_attempt,
+                                image_count: retry_request.model_input_images.len() as u32,
+                                pages_used: vec![],
+                                retry_reason: Some(reason.clone()),
+                                salvage_used,
+                                text_only_repair_used,
+                                targeted_pages: vec![],
+                            });
+                        Ok(result)
+                    }
                     Err(mut retry_error) => {
                         let details = format!(
-                            "retry_attempted=true\nfirst_error_code={:?}\nfirst_error_message={}\nfirst_error_details={:?}\nretry_error_code={:?}\nretry_error_message={}\nretry_error_details={:?}",
+                            "retry_attempted=true\nfirst_error_code={:?}\nfirst_error_message={}\nfirst_error_details={:?}\nsalvage_used={}\ntext_only_repair_used={}\nretry_reason={}\nretry_error_code={:?}\nretry_error_message={}\nretry_error_details={:?}",
                             first_error.code,
                             first_error.message,
                             first_error.technical_details,
+                            salvage_used,
+                            text_only_repair_used,
+                            reason,
                             retry_error.code,
                             retry_error.message,
                             retry_error.technical_details
@@ -1036,6 +1254,41 @@ impl RubricExtractionService {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Builds a `RubricExtractionResult` from a deterministically salvaged payload.
+fn rubric_result_from_salvage(
+    payload: crate::domain::model::RubricImportPayload,
+    request: &RubricExtractionRequest,
+    raw_response: String,
+    retry_metadata: crate::domain::model::RubricExtractionRetryMetadata,
+) -> crate::domain::model::RubricExtractionResult {
+    let output = crate::services::llama_server_gateway::rubric_payload_to_output(payload);
+    let raw_length = raw_response.len() as u32;
+    crate::domain::model::RubricExtractionResult {
+        output,
+        raw_response,
+        diagnostics: crate::domain::model::ModelDiagnostics {
+            endpoint: "".to_string(),
+            request_kind: crate::domain::model::ModelRequestKind::RubricDraft,
+            http_status: Some(200),
+            duration_ms: 0,
+            prompt_length: None,
+            image_count: Some(request.model_input_images.len() as u32),
+            image_total_bytes: None,
+            base64_approx_total_bytes: None,
+            model_input_images: request.model_input_images.clone(),
+            timeout_seconds: None,
+            max_tokens: None,
+            finish_reason: Some("salvaged".to_string()),
+            content_length: Some(raw_length),
+            reasoning_content_length: None,
+            raw_text_stored_path: None,
+            error_code: None,
+            provenance: None,
+        },
+        retry_metadata: Some(retry_metadata),
     }
 }
 
@@ -1550,6 +1803,7 @@ except Exception as e:
             .create_project("Test Project".to_string(), root)
             .unwrap();
         project.questions.push(crate::domain::question::Question {
+            assessment_activity_id: None,
             id: "q-1".to_string(),
             number: 1,
             max_score: 10.0,
@@ -1722,6 +1976,7 @@ except Exception as e:
         };
 
         project.questions.push(crate::domain::question::Question {
+            assessment_activity_id: None,
             id: "q1-p6".to_string(),
             number: 1,
             max_score: 10.0,
@@ -1811,5 +2066,395 @@ except Exception as e:
             updated.questions[0].rubric.expected_answer,
             Some("Teacher answer".to_string())
         );
+    }
+
+    // ------------------------------------------------------------------
+    // TD-20 rubric parse retry chain tests (fake gateway + artifacts)
+    // ------------------------------------------------------------------
+
+    fn rubric_image(page_number: u32) -> ModelInputImage {
+        ModelInputImage {
+            kind: crate::domain::model::ModelInputImageKind::Rubric,
+            document_id: "doc-1".to_string(),
+            page_number,
+            source_image_path: format!("src-{page_number}.jpg"),
+            output_image_path: format!("out-{page_number}.jpg"),
+            source_width: 100,
+            source_height: 100,
+            output_width: 100,
+            output_height: 100,
+            source_bytes: 0,
+            output_bytes: 0,
+            base64_approx_bytes: 0,
+            long_edge_max: 2000,
+            jpeg_quality: 92,
+            created_at: "now".to_string(),
+            source_sha256: None,
+            output_sha256: None,
+            cache_key: None,
+            cache_transaction_id: None,
+            cache_hit: false,
+        }
+    }
+
+    fn rubric_ok_result() -> crate::domain::model::RubricExtractionResult {
+        crate::domain::model::RubricExtractionResult {
+            output: crate::domain::model::RubricExtractionOutput {
+                questions: vec![crate::domain::model::ExtractedRubricCandidate {
+                    number: 1,
+                    max_points: Some(10.0),
+                    expected_answer: Some("A".to_string()),
+                    key_concepts: vec![],
+                    criteria: vec![],
+                    partial_credit_hints: vec![],
+                    zero_score_conditions: vec![],
+                    common_mistakes: vec![],
+                    confidence: 1.0,
+                    warnings: vec![],
+                }],
+                document_warnings: vec![],
+            },
+            raw_response: "raw".to_string(),
+            diagnostics: crate::domain::model::ModelDiagnostics {
+                endpoint: "".to_string(),
+                request_kind: crate::domain::model::ModelRequestKind::RubricDraft,
+                http_status: None,
+                duration_ms: 0,
+                prompt_length: None,
+                image_count: Some(1),
+                image_total_bytes: None,
+                base64_approx_total_bytes: None,
+                model_input_images: vec![],
+                timeout_seconds: None,
+                max_tokens: None,
+                finish_reason: None,
+                content_length: None,
+                reasoning_content_length: None,
+                raw_text_stored_path: None,
+                error_code: None,
+                provenance: None,
+            },
+            retry_metadata: None,
+        }
+    }
+
+    fn rubric_parse_error(code: AppErrorCode) -> AppError {
+        AppError {
+            code,
+            message: "parse error".to_string(),
+            recoverable: true,
+            suggested_action: None,
+            technical_details: None,
+            correlation_id: "corr".to_string(),
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct RubricCallRecord {
+        attempt: u32,
+        image_count: usize,
+        has_raw_text: bool,
+        strict_json_only: bool,
+    }
+
+    struct RubricRecordingGateway {
+        responses: std::sync::Mutex<
+            std::collections::VecDeque<
+                Result<crate::domain::model::RubricExtractionResult, AppError>,
+            >,
+        >,
+        calls: std::sync::Mutex<Vec<RubricCallRecord>>,
+    }
+
+    impl RubricRecordingGateway {
+        fn new(
+            responses: Vec<Result<crate::domain::model::RubricExtractionResult, AppError>>,
+        ) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::services::model_gateway::ModelGateway for RubricRecordingGateway {
+        async fn get_status(&self) -> Result<crate::domain::model::ModelStatus, AppError> {
+            Ok(crate::domain::model::ModelStatus::default())
+        }
+        async fn probe_server(&self) -> Result<crate::domain::model::ModelStatus, AppError> {
+            Ok(crate::domain::model::ModelStatus::default())
+        }
+        async fn health_status(
+            &self,
+            _base_url: &str,
+        ) -> Result<crate::domain::model::ModelStatus, AppError> {
+            Ok(crate::domain::model::ModelStatus::default())
+        }
+        async fn probe_status(
+            &self,
+            _base_url: &str,
+        ) -> Result<crate::domain::model::ModelStatus, AppError> {
+            Ok(crate::domain::model::ModelStatus::default())
+        }
+        async fn extract_question_text(
+            &self,
+            _input: crate::domain::model::QuestionTextExtractionRequest,
+        ) -> Result<crate::domain::model::QuestionTextExtractionResult, AppError> {
+            unreachable!()
+        }
+        async fn draft_rubric(
+            &self,
+            input: RubricExtractionRequest,
+        ) -> Result<crate::domain::model::RubricExtractionResult, AppError> {
+            self.calls.lock().unwrap().push(RubricCallRecord {
+                attempt: input.attempt,
+                image_count: input.model_input_images.len(),
+                has_raw_text: input.raw_text.is_some(),
+                strict_json_only: input.strict_json_only,
+            });
+            match self.responses.lock().unwrap().pop_front() {
+                Some(response) => response,
+                None => Err(rubric_parse_error(AppErrorCode::RubricJsonParseFailed)),
+            }
+        }
+        async fn extract_student_answer_ocr(
+            &self,
+            _input: crate::domain::model::StudentAnswerOcrRequest,
+        ) -> Result<crate::domain::model::StudentAnswerOcrResult, AppError> {
+            unreachable!()
+        }
+        async fn suggest_student_answer_issue_correction(
+            &self,
+            _input: crate::domain::model::StudentAnswerOcrIssueCorrectionRequest,
+        ) -> Result<crate::domain::model::StudentAnswerOcrIssueCorrectionResult, AppError> {
+            unreachable!()
+        }
+        async fn extract_student_identity_ocr(
+            &self,
+            _input: crate::domain::model::StudentIdentityOcrRequest,
+        ) -> Result<crate::domain::model::StudentIdentityOcrResult, AppError> {
+            unreachable!()
+        }
+        async fn cleanup_speaking_transcript(
+            &self,
+            _input: crate::domain::model::SpeakingTranscriptCleanupRequest,
+        ) -> Result<crate::domain::model::SpeakingTranscriptCleanupResult, AppError> {
+            unreachable!()
+        }
+        async fn generate_analysis_report(
+            &self,
+            _input: crate::domain::model::AnalysisReportRequest,
+        ) -> Result<crate::domain::model::AnalysisReportResult, AppError> {
+            unreachable!()
+        }
+        async fn score_answer(
+            &self,
+            _input: crate::domain::model::ScoringRequest,
+        ) -> Result<crate::domain::model::ScoringResult, AppError> {
+            unreachable!()
+        }
+    }
+
+    fn rubric_request_for_retry(project_root: &str) -> RubricExtractionRequest {
+        let prompt_contract = build_prompt_contract(
+            crate::domain::model::ModelRequestKind::RubricDraft,
+            "rubric_extraction_v2_typed_user_data",
+            crate::domain::rubric::RUBRIC_EXTRACTION_SCHEMA_VERSION,
+            "rubric_extraction_policy_v1",
+            "prompt".to_string(),
+            serde_json::json!({"targetQuestionNumber": 1, "expectedQuestionCount": 1}),
+            default_sampling(8192),
+            Some(crate::domain::model::ModelResponseFormat::JsonSchema {
+                name: "rubric_extraction_suggestion".to_string(),
+                schema: crate::domain::rubric::canonical_rubric_extraction_schema(),
+            }),
+            None,
+        );
+        RubricExtractionRequest {
+            prompt: "prompt".to_string(),
+            prompt_contract: Some(prompt_contract),
+            raw_text: None,
+            image_path: Some("out-1.jpg".to_string()),
+            target_question_number: 1,
+            model_input_images: vec![rubric_image(1)],
+            strict_json_only: false,
+            attempt: 1,
+            project_root_path: Some(project_root.to_string()),
+            job_id: Some("job_retry_q1".to_string()),
+        }
+    }
+
+    fn write_rubric_attempt_raw_response(project_root: &str, content: &str) {
+        let dir = std::path::Path::new(project_root)
+            .join("logs")
+            .join("model_responses")
+            .join("rubric_import")
+            .join("job_retry")
+            .join("question_1")
+            .join("attempt_1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("response_raw.txt"), content).unwrap();
+    }
+
+    fn service_for_retry_tests(
+        project_store: ProjectStore,
+        model_gateway: std::sync::Arc<dyn crate::services::model_gateway::ModelGateway>,
+    ) -> RubricExtractionService {
+        let config_path = std::env::temp_dir().join(format!(
+            "rubrika-model-config-retry-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let model_config = ModelConfigService::new_with_path(config_path);
+        let runtime_gateway = std::sync::Arc::new(LlamaServerGateway::default());
+        let model_process_manager = ModelProcessManager::new_with_state_path(
+            model_config.clone(),
+            runtime_gateway,
+            std::env::temp_dir().join(format!(
+                "rubrika-model-state-retry-{}.json",
+                uuid::Uuid::new_v4()
+            )),
+        );
+        let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
+        RubricExtractionService::new(
+            project_store,
+            model_gateway,
+            std::sync::Arc::new(JobManager::new()),
+            model_runtime_service,
+            std::sync::Arc::new(crate::services::pdf_service::SystemPdfService),
+            std::sync::Arc::new(DocumentContentExtractionService::new(std::sync::Arc::new(
+                ModelInputImageService::default(),
+            ))),
+        )
+    }
+
+    #[tokio::test]
+    async fn rubric_retry_salvages_response_without_second_vision_call() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store.create_project("p".to_string(), root.clone()).unwrap();
+        // Truncated JSON: full parse fails but the single question item is
+        // deterministically salvageable.
+        write_rubric_attempt_raw_response(
+            &root,
+            r#"{"questions":[{"questionNumber":1,"maxPoints":10,"expectedAnswer":"A"}]"#,
+        );
+        let gateway = std::sync::Arc::new(RubricRecordingGateway::new(vec![Err(
+            rubric_parse_error(AppErrorCode::RubricJsonParseFailed),
+        )]));
+        let service = service_for_retry_tests(store, gateway.clone());
+        let req = rubric_request_for_retry(&root);
+        let result = service.draft_rubric_with_retry(req).await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        // Salvage success -> no second model call at all.
+        assert_eq!(calls.len(), 1);
+        let meta = result.retry_metadata.expect("retry metadata");
+        assert!(meta.salvage_used);
+        assert!(!meta.text_only_repair_used);
+        assert_eq!(result.output.questions.len(), 1);
+        assert_eq!(result.output.questions[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn rubric_retry_uses_text_only_repair_without_resending_images() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store.create_project("p".to_string(), root.clone()).unwrap();
+        // Malformed prose: not salvageable, but non-empty so text-only repair
+        // is attempted instead of resending the images.
+        write_rubric_attempt_raw_response(&root, "model produced prose, no questions array here");
+        let gateway = std::sync::Arc::new(RubricRecordingGateway::new(vec![
+            Err(rubric_parse_error(AppErrorCode::RubricJsonParseFailed)),
+            Ok(rubric_ok_result()),
+        ]));
+        let service = service_for_retry_tests(store, gateway.clone());
+        let req = rubric_request_for_retry(&root);
+        let result = service.draft_rubric_with_retry(req).await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        // Second call is text-only JSON repair: no images, strict JSON.
+        assert_eq!(calls[1].image_count, 0);
+        assert!(calls[1].has_raw_text);
+        assert!(calls[1].strict_json_only);
+        assert_eq!(calls[1].attempt, 2);
+        let meta = result.retry_metadata.expect("retry metadata");
+        assert!(meta.text_only_repair_used);
+        assert!(!meta.salvage_used);
+    }
+
+    #[tokio::test]
+    async fn rubric_retry_multimodal_resend_only_with_explicit_reason() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store.create_project("p".to_string(), root.clone()).unwrap();
+        // Neither salvage nor text-only repair succeed -> multimodal retry is
+        // the explicit last resort.
+        write_rubric_attempt_raw_response(&root, "prose not repairable by JSON");
+        let gateway = std::sync::Arc::new(RubricRecordingGateway::new(vec![
+            Err(rubric_parse_error(AppErrorCode::RubricJsonParseFailed)),
+            Err(rubric_parse_error(AppErrorCode::RubricJsonParseFailed)),
+            Ok(rubric_ok_result()),
+        ]));
+        let service = service_for_retry_tests(store, gateway.clone());
+        let req = rubric_request_for_retry(&root);
+        let result = service.draft_rubric_with_retry(req).await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        // Third call re-sends images (multimodal) and is strict.
+        assert_eq!(calls[2].image_count, 1);
+        assert!(calls[2].strict_json_only);
+        assert_eq!(calls[2].attempt, 3);
+        let meta = result.retry_metadata.expect("retry metadata");
+        assert_eq!(meta.attempts, 3);
+        assert_eq!(
+            meta.retry_reason.as_deref(),
+            Some("text_only_repair_failed:RubricJsonParseFailed")
+        );
+    }
+
+    #[tokio::test]
+    async fn rubric_retry_empty_first_response_records_explicit_reason() {
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store.create_project("p".to_string(), root.clone()).unwrap();
+        write_rubric_attempt_raw_response(&root, "   \n  ");
+        let gateway = std::sync::Arc::new(RubricRecordingGateway::new(vec![
+            Err(rubric_parse_error(AppErrorCode::ModelResponseEmpty)),
+            Ok(rubric_ok_result()),
+        ]));
+        let service = service_for_retry_tests(store, gateway.clone());
+        let req = rubric_request_for_retry(&root);
+        let result = service.draft_rubric_with_retry(req).await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].image_count, 1);
+        let meta = result.retry_metadata.expect("retry metadata");
+        assert_eq!(meta.retry_reason.as_deref(), Some("first_response_empty"));
+    }
+
+    #[tokio::test]
+    async fn rubric_retry_text_only_request_preserves_existing_strict_resend() {
+        // The text-based path has no images: on parse failure it must keep
+        // resending the text (strict) and never try the vision repair tiers.
+        let root = temp_project_root();
+        let store = ProjectStore::new();
+        store.create_project("p".to_string(), root.clone()).unwrap();
+        let gateway = std::sync::Arc::new(RubricRecordingGateway::new(vec![
+            Err(rubric_parse_error(AppErrorCode::RubricJsonParseFailed)),
+            Ok(rubric_ok_result()),
+        ]));
+        let service = service_for_retry_tests(store, gateway.clone());
+        let mut req = rubric_request_for_retry(&root);
+        req.raw_text = Some("raw rubric text".to_string());
+        req.model_input_images = vec![];
+        req.image_path = None;
+        let result = service.draft_rubric_with_retry(req).await.unwrap();
+        let calls = gateway.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].image_count, 0);
+        assert!(calls[1].strict_json_only);
+        let meta = result.retry_metadata.expect("retry metadata");
+        // The text path falls straight to the explicit-reason strict resend.
+        assert!(meta.retry_reason.is_some());
     }
 }
