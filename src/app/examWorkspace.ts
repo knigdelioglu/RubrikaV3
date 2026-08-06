@@ -1,6 +1,7 @@
 import type {
   AssessmentActivity,
   AssessmentType,
+  PerformanceStatus,
   WorkflowSnapshot,
 } from '../api/types';
 
@@ -83,12 +84,13 @@ export function deriveExamStepStatuses(
   activity: AssessmentActivity,
   workflowSnapshot?: WorkflowSnapshot | null,
   classApplicationId?: string | null,
+  performanceStatus?: PerformanceStatus | null,
 ): ExamStepState[] {
   const type = activity.assessmentType;
   const definitions = getExamStepDefinitions(type);
 
   if (type === 'performance') {
-    return derivePerformanceStepStatuses(activity, definitions);
+    return derivePerformanceStepStatuses(definitions, performanceStatus ?? null);
   }
 
   if (type === 'speaking') {
@@ -393,33 +395,27 @@ function deriveSpeakingStepStatuses(
   });
 }
 
+const PERFORMANCE_FALLBACK_MESSAGE =
+  'Görev durumu yüklenemedi; rubrik yayınlanmadan bu adıma geçilemez.';
+
+function performanceFallback(definitions: ExamStepDefinition[]): ExamStepState[] {
+  return definitions.map((def) => ({
+    definition: def,
+    status: 'blocked',
+    statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
+    blockerMessage: PERFORMANCE_FALLBACK_MESSAGE,
+  }));
+}
+
 function derivePerformanceStepStatuses(
-  activity: AssessmentActivity,
   definitions: ExamStepDefinition[],
+  status: PerformanceStatus | null,
 ): ExamStepState[] {
-  const details = activity.performanceDetails;
-  const hasTaskDetails = Boolean(
-    details && (details.theme.trim() !== '' || details.taskInstruction.trim() !== ''),
-  );
-  const versions = details?.rubricVersions ?? [];
-  const hasPublishedRubric = versions.some((rubric) => rubric.version >= 1);
-  const hasDraftRubric = versions.some((rubric) => rubric.version === 0);
-  const applications = activity.classApplications.filter(
-    (application) => application.status !== 'archived',
-  );
-  const assessments = applications.flatMap(
-    (application) => application.performanceAssessments ?? [],
-  );
-  const approvedCount = assessments.filter(
-    (assessment) => assessment.status === 'approved',
-  ).length;
-  const startedCount = assessments.filter(
-    (assessment) => assessment.status !== 'approved',
-  ).length;
-  const totalStudents = applications.reduce(
-    (sum, application) => sum + application.studentScopeIds.length,
-    0,
-  );
+  if (!status) {
+    return performanceFallback(definitions);
+  }
+  const { hasPublishedRubric, hasDraftRubric, hasTaskDetails, allApproved, approvedCount } = status;
+  const startedCount = status.inProgressCount + status.missingCount + status.notPerformedCount;
 
   return definitions.map((def) => {
     switch (def.id) {
@@ -442,7 +438,7 @@ function derivePerformanceStepStatuses(
             blockerMessage: 'Rubrik yayınlanmadan değerlendirme yapılamaz.',
           };
         }
-        if (totalStudents > 0 && approvedCount >= totalStudents) {
+        if (allApproved) {
           return { definition: def, status: 'completed', statusLabel: EXAM_STEP_STATUS_LABELS.completed };
         }
         if (startedCount > 0) {
@@ -473,8 +469,14 @@ export function resolveNextExamStep(
   activity: AssessmentActivity,
   workflowSnapshot?: WorkflowSnapshot | null,
   classApplicationId?: string | null,
+  performanceStatus?: PerformanceStatus | null,
 ): ExamStepDefinition {
-  const states = deriveExamStepStatuses(activity, workflowSnapshot, classApplicationId);
+  const states = deriveExamStepStatuses(
+    activity,
+    workflowSnapshot,
+    classApplicationId,
+    performanceStatus,
+  );
 
   // 1. Prioritize step that needs review
   const needsReviewState = states.find((s) => s.status === 'needs_review');

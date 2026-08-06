@@ -7,7 +7,7 @@ export function BlockingReasons({ reasons }: { reasons: string[] }) {
       <h4>Engeller:</h4>
       <ul>
         {reasons.map((r, i) => (
-          <li key={i} style={{ color: '#b91c1c' }}>{blockingReasonLabels[r] || r}</li>
+          <li key={i} style={{ color: '#b91c1c' }}>{blockingReasonLabels[r] || 'Bekleyen bir adım tamamlanmadı'}</li>
         ))}
       </ul>
     </div>

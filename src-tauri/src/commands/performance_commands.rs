@@ -7,8 +7,9 @@ use crate::services::audit_service::AuditEntryInput;
 use crate::services::performance_service::{
     ApprovePerformanceAssessmentInput, CreatePerformanceTaskInput, GetPerformanceReportInput,
     ListPerformanceAssessmentsInput, ListPerformanceTasksInput, PerformanceActivityIdInput,
-    PerformanceReportDto, PublishPerformanceRubricInput, SavePerformanceAssessmentInput,
-    SetPerformanceAssessmentStatusInput, UpdatePerformanceTaskInput,
+    PerformanceReportDto, PerformanceStatusDto, PublishPerformanceRubricInput,
+    SavePerformanceAssessmentInput, SetPerformanceAssessmentStatusInput,
+    UpdatePerformanceTaskInput,
 };
 use crate::AppState;
 
@@ -161,6 +162,14 @@ pub async fn get_performance_report(
     state.performance_service.get_performance_report(input)
 }
 
+#[tauri::command]
+pub async fn get_performance_status(
+    state: State<'_, AppState>,
+    input: PerformanceActivityIdInput,
+) -> Result<PerformanceStatusDto, AppError> {
+    state.performance_service.get_performance_status(input)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -168,6 +177,7 @@ mod tests {
         SetPerformanceAssessmentStatusInput,
     };
     use crate::domain::performance::{CriterionRating, PerformanceAssessmentStatus};
+    use crate::services::performance_service::PerformanceStatusDto;
 
     #[test]
     fn create_performance_task_uses_camel_case_contract() {
@@ -263,5 +273,36 @@ mod tests {
         }))
         .expect("valid publish input");
         assert_eq!(input.rubric.name, "Sözlü Performans");
+    }
+
+    #[test]
+    fn get_performance_status_uses_camel_case_contract() {
+        let input: crate::services::performance_service::PerformanceActivityIdInput =
+            serde_json::from_value(serde_json::json!({
+                "projectId": "project-1",
+                "activityId": "activity-1",
+            }))
+            .expect("valid status input");
+        assert_eq!(input.project_id, "project-1");
+        assert_eq!(input.activity_id, "activity-1");
+
+        let dto = PerformanceStatusDto {
+            has_published_rubric: true,
+            published_rubric_version: Some(2),
+            has_draft_rubric: false,
+            has_task_details: true,
+            total_students: 20,
+            approved_count: 20,
+            in_progress_count: 0,
+            missing_count: 0,
+            not_performed_count: 0,
+            all_approved: true,
+        };
+        let value = serde_json::to_value(&dto).expect("status dto should serialize");
+        assert_eq!(value["hasPublishedRubric"], true);
+        assert_eq!(value["publishedRubricVersion"], 2);
+        assert_eq!(value["totalStudents"], 20);
+        assert_eq!(value["allApproved"], true);
+        assert_eq!(value["approvedCount"], 20);
     }
 }

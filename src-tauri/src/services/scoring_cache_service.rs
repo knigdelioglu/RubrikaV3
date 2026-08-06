@@ -389,7 +389,7 @@ mod tests {
             answer_text: "İyi cevap".to_string(),
         };
         assert!(service
-            .exact_duplicate_source(&[record.clone()], &exact)
+            .exact_duplicate_source(std::slice::from_ref(&record), &exact)
             .is_some());
 
         let mut changed_raw = record;

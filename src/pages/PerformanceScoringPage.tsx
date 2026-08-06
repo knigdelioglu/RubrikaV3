@@ -19,6 +19,7 @@ import {
   Users,
 } from 'lucide-react';
 import { commands } from '../api/commands';
+import { normalizeAppError } from '../api/errors';
 import type { AppError } from '../api/errors';
 import type {
   CriterionRating,
@@ -49,6 +50,7 @@ import {
   performanceSkillAreaLabels,
   performanceWorkModeLabels,
 } from './performanceOrganizationUi';
+import { derivePerformanceActionAvailability } from './performanceScoringUi';
 
 function studentLabel(student: Student): string {
   return student.displayName?.trim() || student.number?.trim() || 'İsimsiz öğrenci';
@@ -147,21 +149,6 @@ export function PerformanceScoringPage({
     selectedStatus === 'missing' || selectedStatus === 'not_performed';
 
   useEffect(() => {
-    if (!selectedStudentId) {
-      setRatingDrafts({});
-      setFeedback('');
-      return;
-    }
-    const assessment = assessmentByStudent.get(selectedStudentId);
-    setRatingDrafts(
-      Object.fromEntries(
-        (assessment?.ratings ?? []).map((rating) => [rating.criterionId, rating.levelId]),
-      ),
-    );
-    setFeedback(assessment?.feedback ?? '');
-  }, [selectedStudentId, assessmentByStudent]);
-
-  useEffect(() => {
     if (students.length === 0) {
       setSelectedStudentId('');
       return;
@@ -212,7 +199,23 @@ export function PerformanceScoringPage({
           ? 'Değerlendirme taslağı kaydedildi; geçici toplam servis tarafından hesaplandı.'
           : 'Değerlendirme kaydedildi.',
       );
-      await refreshAssessments();
+      queryClient.setQueryData<PerformanceAssessment[]>(
+        ['performance-assessments', projectId, activityId, classApplicationId],
+        (current) => {
+          if (!Array.isArray(current)) return current;
+          const index = current.findIndex((assessment) => assessment.id === saved.id);
+          if (index >= 0) {
+            const next = [...current];
+            next[index] = saved;
+            return next;
+          }
+          return [...current, saved];
+        },
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['assessment-activity', projectId, activityId] }),
+        queryClient.invalidateQueries({ queryKey: ['project-snapshot', projectId] }),
+      ]);
     },
     onError: (caught: AppError) => setError(caught),
   });
@@ -279,13 +282,48 @@ export function PerformanceScoringPage({
     onError: (caught: AppError) => setError(caught),
   });
 
-  const canApprove =
-    Boolean(rubric) &&
-    !isApproved &&
-    !isNonRatedStatus &&
-    missingCriteria.length === 0 &&
-    Boolean(selectedAssessment) &&
-    !approveMutation.isPending;
+  const anyMutationPending =
+    saveMutation.isPending ||
+    approveMutation.isPending ||
+    statusMutation.isPending ||
+    revertStatusMutation.isPending;
+
+  useEffect(() => {
+    if (anyMutationPending) {
+      return;
+    }
+    if (!selectedStudentId) {
+      setRatingDrafts({});
+      setFeedback('');
+      return;
+    }
+    const assessment = assessmentByStudent.get(selectedStudentId);
+    setRatingDrafts(
+      Object.fromEntries(
+        (assessment?.ratings ?? []).map((rating) => [rating.criterionId, rating.levelId]),
+      ),
+    );
+    setFeedback(assessment?.feedback ?? '');
+  }, [
+    selectedStudentId,
+    assessmentByStudent,
+    anyMutationPending,
+  ]);
+
+  const actionAvailability = derivePerformanceActionAvailability({
+    rubricPresent: Boolean(rubric),
+    isApproved,
+    isNonRatedStatus,
+    hasSelectedAssessment: Boolean(selectedAssessment),
+    missingCriteriaCount: missingCriteria.length,
+    savePending: saveMutation.isPending,
+    approvePending: approveMutation.isPending,
+    statusPending: statusMutation.isPending || revertStatusMutation.isPending,
+  });
+  const canApprove = actionAvailability.canApprove;
+  const canChangeStatus = actionAvailability.canChangeStatus;
+  const canRevert = actionAvailability.canRevert;
+  const approveDisabledReason = actionAvailability.reason;
 
   const assessedStudentCount = assessments.filter(
     (assessment) => assessment.status !== 'missing' && assessment.status !== 'not_performed',
@@ -344,9 +382,9 @@ export function PerformanceScoringPage({
 
       {(error || activityQuery.error || studentsQuery.error || assessmentsQuery.error) && (
         <ErrorBanner
-          error={
-            (error || activityQuery.error || studentsQuery.error || assessmentsQuery.error) as AppError
-          }
+          error={normalizeAppError(
+            error || activityQuery.error || studentsQuery.error || assessmentsQuery.error,
+          )}
         />
       )}
       {successMessage && (
@@ -489,13 +527,18 @@ export function PerformanceScoringPage({
                   <div className="performance-non-rated-card">
                     <p>
                       {selectedStatus === 'missing'
-                        ? 'Teslim edilmemiş (Missing) olarak işaretlendi. Bu durum sıfır puanla karıştırılmaz; raporda ayrı gösterilir.'
-                        : 'Gösterilmedi (NotPerformed) olarak işaretlendi. Bu durum sıfır puanla karıştırılmaz; raporda ayrı gösterilir.'}
+                        ? 'Teslim edilmemiş olarak işaretlendi. Bu durum sıfır puanla karıştırılmaz; raporda ayrı gösterilir.'
+                        : 'Gösterilmedi olarak işaretlendi. Bu durum sıfır puanla karıştırılmaz; raporda ayrı gösterilir.'}
                     </p>
                     <LoadingButton
                       type="button"
                       className="button button--secondary"
                       loading={revertStatusMutation.isPending}
+                      disabledReason={
+                        !canRevert
+                          ? 'Kayıt sürüyor; işlem tamamlanmadan değerlendirmeye alınamaz.'
+                          : undefined
+                      }
                       onClick={() => revertStatusMutation.mutate()}
                     >
                       <ListChecks size={15} /> Değerlendirmeye al
@@ -619,23 +662,15 @@ export function PerformanceScoringPage({
                       >
                         <Save size={15} /> Taslağı kaydet
                       </LoadingButton>
-                      <LoadingButton
-                        type="button"
-                        className="button button--primary button--approve"
-                        loading={approveMutation.isPending}
-                        disabledReason={
-                          !canApprove
-                            ? missingCriteria.length > 0
-                              ? 'Tüm ölçütler seçilmeden onay verilemez.'
-                              : !selectedAssessment
-                                ? 'Önce taslağı kaydedin.'
-                                : undefined
-                            : undefined
-                        }
-                        onClick={() => approveMutation.mutate()}
-                      >
-                        <Send size={15} /> Onayla
-                      </LoadingButton>
+                    <LoadingButton
+                      type="button"
+                      className="button button--primary button--approve"
+                      loading={approveMutation.isPending}
+                      disabledReason={!canApprove ? approveDisabledReason : undefined}
+                      onClick={() => approveMutation.mutate()}
+                    >
+                      <Send size={15} /> Onayla
+                    </LoadingButton>
                     </div>
 
                     <div className="performance-non-rated-actions">
@@ -644,6 +679,11 @@ export function PerformanceScoringPage({
                         type="button"
                         className="button button--secondary"
                         loading={statusMutation.isPending}
+                        disabledReason={
+                          !canChangeStatus
+                            ? 'Kayıt sürüyor; işlem tamamlanmadan durum değiştirilemez.'
+                            : undefined
+                        }
                         onClick={() => statusMutation.mutate('missing')}
                       >
                         <MinusCircle size={14} /> Eksik (teslim etmedi)
@@ -652,6 +692,11 @@ export function PerformanceScoringPage({
                         type="button"
                         className="button button--secondary"
                         loading={statusMutation.isPending}
+                        disabledReason={
+                          !canChangeStatus
+                            ? 'Kayıt sürüyor; işlem tamamlanmadan durum değiştirilemez.'
+                            : undefined
+                        }
                         onClick={() => statusMutation.mutate('not_performed')}
                       >
                         <UserX size={14} /> Gösterilmedi
@@ -801,7 +846,7 @@ export function PerformanceResultsView({
     enabled: !!projectId && !!activityId && !!classApplicationId && !!rubric,
   });
   const report = reportQuery.data;
-  const reportError = reportQuery.error as AppError | null;
+  const reportError = reportQuery.error ? normalizeAppError(reportQuery.error) : null;
 
   useEffect(() => {
     setPrintReport(null);
@@ -964,7 +1009,7 @@ function PerformanceReportPrintView({ report }: { report: PerformanceReport }) {
         </div>
         <div>
           <span>Öğretmen</span>
-          <strong>{report.teacherId ? report.teacherId : 'Belirtilmedi'}</strong>
+          <strong>{report.teacherId ? 'Öğretmen ataması mevcut' : 'Belirtilmedi'}</strong>
         </div>
       </section>
 

@@ -6,7 +6,7 @@ import {
   getExamStepDefinitions,
   resolveNextExamStep,
 } from './examWorkspace.ts';
-import type { AssessmentActivity, WorkflowSnapshot } from '../api/types';
+import type { AssessmentActivity, PerformanceStatus, WorkflowSnapshot } from '../api/types';
 
 const baseActivity: AssessmentActivity = {
   id: 'activity_001',
@@ -211,5 +211,138 @@ test('getCanonicalWorkspaceStepPath strips project path parameters and preserves
   assert.equal(
     path,
     '/project/proj_1/activities/act_10/students?classApplicationId=app_11a&tab=grouping',
+  );
+});
+
+function performanceActivity(overrides: Partial<AssessmentActivity> = {}): AssessmentActivity {
+  return {
+    ...baseActivity,
+    id: 'activity_perf',
+    assessmentType: 'performance',
+    workflowFamily: 'performance',
+    performanceDetails: null,
+    classApplications: [],
+    ...overrides,
+  };
+}
+
+function performanceStatus(overrides: Partial<PerformanceStatus> = {}): PerformanceStatus {
+  return {
+    hasPublishedRubric: false,
+    publishedRubricVersion: null,
+    hasDraftRubric: true,
+    hasTaskDetails: true,
+    totalStudents: 2,
+    approvedCount: 0,
+    inProgressCount: 0,
+    missingCount: 0,
+    notPerformedCount: 0,
+    allApproved: false,
+    ...overrides,
+  };
+}
+
+test('performance steps fall back to blocked when the status DTO is unavailable', () => {
+  const states = deriveExamStepStatuses(performanceActivity(), null, null, null);
+  assert.equal(states.length, 3);
+  assert.deepEqual(
+    states.map((s) => s.status),
+    ['blocked', 'blocked', 'blocked'],
+  );
+  assert.match(states[1]?.blockerMessage ?? '', /rubrik/);
+});
+
+test('performance task step renders from DTO publish state', () => {
+  const draftStatus = performanceStatus();
+  const states = deriveExamStepStatuses(performanceActivity(), null, null, draftStatus);
+  const taskState = states.find((s) => s.definition.id === 'task');
+  assert.equal(taskState?.status, 'in_progress');
+
+  const publishedStatus = performanceStatus({ hasPublishedRubric: true, publishedRubricVersion: 1, hasDraftRubric: false });
+  const publishedStates = deriveExamStepStatuses(performanceActivity(), null, null, publishedStatus);
+  assert.equal(
+    publishedStates.find((s) => s.definition.id === 'task')?.status,
+    'completed',
+  );
+});
+
+test('performance assessment step blocks without published rubric and completes on allApproved', () => {
+  const draftStatus = performanceStatus();
+  const draftStates = deriveExamStepStatuses(performanceActivity(), null, null, draftStatus);
+  assert.equal(
+    draftStates.find((s) => s.definition.id === 'assessment')?.status,
+    'blocked',
+  );
+
+  const publishedStatus = performanceStatus({ hasPublishedRubric: true, publishedRubricVersion: 1, hasDraftRubric: false });
+  const readyStates = deriveExamStepStatuses(performanceActivity(), null, null, publishedStatus);
+  assert.equal(
+    readyStates.find((s) => s.definition.id === 'assessment')?.status,
+    'ready',
+  );
+
+  const inProgressStatus = performanceStatus({
+    hasPublishedRubric: true,
+    publishedRubricVersion: 1,
+    hasDraftRubric: false,
+    inProgressCount: 1,
+  });
+  const inProgressStates = deriveExamStepStatuses(performanceActivity(), null, null, inProgressStatus);
+  assert.equal(
+    inProgressStates.find((s) => s.definition.id === 'assessment')?.status,
+    'in_progress',
+  );
+
+  const allApprovedStatus = performanceStatus({
+    hasPublishedRubric: true,
+    publishedRubricVersion: 1,
+    hasDraftRubric: false,
+    approvedCount: 2,
+    allApproved: true,
+  });
+  const completedStates = deriveExamStepStatuses(performanceActivity(), null, null, allApprovedStatus);
+  assert.equal(
+    completedStates.find((s) => s.definition.id === 'assessment')?.status,
+    'completed',
+  );
+});
+
+test('performance results step renders from DTO approvedCount', () => {
+  const noneApproved = performanceStatus({ hasPublishedRubric: true, publishedRubricVersion: 1, hasDraftRubric: false });
+  const blockedStates = deriveExamStepStatuses(performanceActivity(), null, null, noneApproved);
+  assert.equal(
+    blockedStates.find((s) => s.definition.id === 'results')?.status,
+    'blocked',
+  );
+
+  const withApproval = performanceStatus({
+    hasPublishedRubric: true,
+    publishedRubricVersion: 1,
+    hasDraftRubric: false,
+    approvedCount: 1,
+  });
+  const readyStates = deriveExamStepStatuses(performanceActivity(), null, null, withApproval);
+  assert.equal(
+    readyStates.find((s) => s.definition.id === 'results')?.status,
+    'ready',
+  );
+});
+
+test('resolveNextExamStep for performance uses the status DTO', () => {
+  const publishedStatus = performanceStatus({ hasPublishedRubric: true, publishedRubricVersion: 1, hasDraftRubric: false });
+  assert.equal(
+    resolveNextExamStep(performanceActivity(), null, null, publishedStatus).id,
+    'assessment',
+  );
+  const approvedStatus = performanceStatus({
+    hasPublishedRubric: true,
+    publishedRubricVersion: 1,
+    hasDraftRubric: false,
+    approvedCount: 2,
+    allApproved: true,
+  });
+  assert.equal(
+    resolveNextExamStep(performanceActivity(), null, null, approvedStatus).id,
+    'results',
   );
 });

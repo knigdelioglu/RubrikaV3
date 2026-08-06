@@ -34,9 +34,13 @@ export function performanceReportCsvFileName(report: PerformanceReport, classSuf
 
 // Türkçe Excel uyumu: noktalı virgül ayraçlı CSV + UTF-8 BOM. Hücreler
 // `;`, `"` veya yeni satır içeriyorsa çift tırnakla sarılır (çift tırnaklar
-// iki katlanır).
+// iki katlanır). Formül enjeksiyonu riskine karşı `=`, `+`, `-`, `@`, sekme
+// ve satır başı ile başlayan hücreler tek tırnak önekiyle kaçışlanır.
 export function buildPerformanceCsv(report: PerformanceReport): string {
   const escapeCell = (value: string): string => {
+    if (/^[=+\-@\t\r]/.test(value)) {
+      return `'${value}`;
+    }
     if (/[";\n\r]/.test(value)) {
       return `"${value.replace(/"/g, '""')}"`;
     }

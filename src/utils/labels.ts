@@ -72,6 +72,8 @@ export const blockingReasonLabels: Record<string, string> = {
   STUDENT_IDENTITY_INVALID: 'Öğrenci kimliği geçersiz',
   OCR_NOT_READY: 'OCR hazırlığı tamam değil',
   STUDENT_ANSWER_OCR_NOT_READY: 'Öğrenci cevap OCR’ı henüz onaylanmadı',
+  STUDENT_ANSWER_OCR_DUPLICATE_PAIRS: 'Öğrenci cevap OCR kayıtlarında tekrarlı (öğrenci, soru) kaydı var',
+  STUDENT_ANSWER_OCR_MISSING_PAIRS: 'Öğrenci cevap OCR kayıtlarında eksik (öğrenci, soru) kapsamı var',
   SCORING_RERUN_REQUIRED: 'Notlandırma sonuçları güncel değil',
   SCORING_NOT_READY: 'Notlandırma için gerekli kontroller tamam değil',
   SCORING_RESULT_MISSING: 'Notlandırma sonucu eksik',

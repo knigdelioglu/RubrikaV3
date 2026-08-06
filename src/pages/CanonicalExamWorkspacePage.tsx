@@ -110,6 +110,12 @@ export function CanonicalExamWorkspacePage() {
     enabled: !!projectId,
   });
 
+  const performanceStatusQuery = useQuery({
+    queryKey: ['performance-status', projectId, activityId],
+    queryFn: () => commands.getPerformanceStatus({ projectId: projectId!, activityId: activityId! }),
+    enabled: !!projectId && !!activityId && activityQuery.data?.assessmentType === 'performance',
+  });
+
   const classes = classesQuery.data ?? EMPTY_CLASSES;
   const classesById = useMemo(
     () => new Map(classes.map((cls) => [cls.id, cls])),
@@ -118,6 +124,7 @@ export function CanonicalExamWorkspacePage() {
 
   const activity = activityQuery.data;
   const workflow = workflowQuery.data;
+  const performanceStatus = performanceStatusQuery.data ?? null;
 
   // Stale class state cleanup helper
   const handleSelectClassApp = (newAppId: string) => {
@@ -151,7 +158,7 @@ export function CanonicalExamWorkspacePage() {
   }
 
   const validSteps = getExamStepDefinitions(activity.assessmentType);
-  const currentStepDef = validSteps.find((s) => s.id === routeStep) || resolveNextExamStep(activity, workflow, selectedClassAppId);
+  const currentStepDef = validSteps.find((s) => s.id === routeStep) || resolveNextExamStep(activity, workflow, selectedClassAppId, performanceStatus);
   const activeStepId = currentStepDef.id;
 
   const renderStepContent = () => {
@@ -220,6 +227,7 @@ export function CanonicalExamWorkspacePage() {
         projectId={projectId}
         activity={activity}
         workflowSnapshot={workflow}
+        performanceStatus={performanceStatus}
         classesById={classesById}
         activeStepId={activeStepId}
         selectedClassApplicationId={selectedClassAppId}

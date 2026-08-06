@@ -398,6 +398,7 @@ pub fn run() {
             commands::performance_commands::set_performance_assessment_status,
             commands::performance_commands::list_performance_assessments,
             commands::performance_commands::get_performance_report,
+            commands::performance_commands::get_performance_status,
         ])
         .build(tauri::generate_context!())
         .unwrap_or_else(|error| panic!("error while building tauri application: {error}"))

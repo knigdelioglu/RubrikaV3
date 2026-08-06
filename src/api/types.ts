@@ -1291,6 +1291,7 @@ export type PerformanceReportStudentRow = {
   status?: PerformanceAssessmentStatus | null;
   criterionScores: PerformanceReportCriterionScore[];
   total?: number | null;
+  provisionalTotal?: number | null;
   feedback?: string | null;
   assessedAt?: string | null;
   approvedAt?: string | null;
@@ -1325,6 +1326,19 @@ export type PerformanceReport = {
   generatedAt: string;
   summary: PerformanceReportSummary;
   rows: PerformanceReportStudentRow[];
+};
+
+export type PerformanceStatus = {
+  hasPublishedRubric: boolean;
+  publishedRubricVersion?: number | null;
+  hasDraftRubric: boolean;
+  hasTaskDetails: boolean;
+  totalStudents: number;
+  approvedCount: number;
+  inProgressCount: number;
+  missingCount: number;
+  notPerformedCount: number;
+  allApproved: boolean;
 };
 
 export type ClassApplication = {

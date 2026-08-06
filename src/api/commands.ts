@@ -88,6 +88,7 @@ import type {
   CriterionRating,
   PerformanceAssessmentStatus,
   PerformanceReport,
+  PerformanceStatus,
   TeachingAssignment,
   UpdateCourseInfoInput,
   BatchCreateTeachingAssignmentsInput,
@@ -97,7 +98,7 @@ import type {
   StartRecoveryCopyJobOutput,
   DataLossPreflightReport,
 } from './types';
-import type { AppError } from './errors';
+import { normalizeAppError, type AppError } from './errors';
 
 function handleInvokeError(e: unknown): never {
   const msg = String(e);
@@ -109,21 +110,10 @@ function handleInvokeError(e: unknown): never {
       correlationId: crypto.randomUUID?.() || 'unknown',
       retryable: true,
       detailsAvailable: false,
-    } as AppError;
-  }
-  
-  if (typeof e === 'object' && e !== null && 'code' in e) {
-    throw e as AppError;
+    } satisfies AppError;
   }
 
-  throw {
-    code: 'UNKNOWN_ERROR',
-    safeMessage: 'Bilinmeyen bir hata oluştu.',
-    recoveryAction: undefined,
-    correlationId: crypto.randomUUID?.() || 'unknown',
-    retryable: false,
-    detailsAvailable: false,
-  } as AppError;
+  throw normalizeAppError(e);
 }
 
 export const commands = {
@@ -764,6 +754,16 @@ export const commands = {
   }): Promise<PerformanceReport> => {
     try {
       return await invoke<PerformanceReport>('get_performance_report', { input });
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getPerformanceStatus: async (input: {
+    projectId: string;
+    activityId: string;
+  }): Promise<PerformanceStatus> => {
+    try {
+      return await invoke<PerformanceStatus>('get_performance_status', { input });
     } catch (e) {
       handleInvokeError(e);
     }

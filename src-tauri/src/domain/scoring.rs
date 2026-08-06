@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use super::model::{SamplingParameters, SemanticCriterionDecision};
 use super::project::{ExamPackageFreezeStatus, Project};
@@ -395,6 +395,12 @@ pub struct ScoringReadiness {
     pub needs_review_record_count: usize,
     pub invalidated_record_count: usize,
     pub stale_record_count: usize,
+    /// Kartezyen (submission_id, question_id) kapsamında eksik kalan çiftler.
+    /// Sıralı ve tekrarsız; kapsam tamamsa boş.
+    pub missing_pairs: Vec<(String, String)>,
+    /// Gerçek OCR kayıtlarında tekrarlanan (submission_id, question_id) çifti
+    /// sayısı; count-only readiness'in yanlış "hazır" üretmesini engeller.
+    pub duplicate_pair_count: usize,
 }
 
 pub fn scoring_record_hash(record: &StudentAnswerOcrRecord) -> String {
@@ -695,12 +701,41 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
             .students
             .iter()
             .all(|student| !student_identity_is_missing(student));
-    let ocr_ready = expected_records > 0
-        && project.student_answer_ocr_records.len() == expected_records
-        && project.student_answer_ocr_records.iter().all(|record| {
-            record.status == super::student::StudentAnswerOcrStatus::TeacherApproved
-                && !record.needs_review
-        });
+
+    // Set-based OCR kapsamı (TD-11): count eşitliği yerine kartezyen ikili
+    // kümesinin gerçek kayıtlarla örtüşmesi aranır. Tekrarlı çift readiness'i
+    // bloke eder; eksik çiftler structured olarak döner.
+    let expected_pairs: HashSet<(String, String)> = project
+        .student_submissions
+        .iter()
+        .flat_map(|submission| {
+            project
+                .questions
+                .iter()
+                .map(move |question| (submission.id.clone(), question.id.clone()))
+        })
+        .collect();
+    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    let mut duplicate_pair_count = 0usize;
+    for record in &project.student_answer_ocr_records {
+        let pair = (record.submission_id.clone(), record.question_id.clone());
+        if !seen_pairs.insert(pair) {
+            duplicate_pair_count += 1;
+        }
+    }
+    let mut missing_pairs = expected_pairs
+        .iter()
+        .filter(|pair| !seen_pairs.contains(*pair))
+        .cloned()
+        .collect::<Vec<_>>();
+    missing_pairs.sort();
+
+    let ocr_pair_coverage_complete = duplicate_pair_count == 0 && missing_pairs.is_empty();
+    let ocr_status_ready = project.student_answer_ocr_records.iter().all(|record| {
+        record.status == super::student::StudentAnswerOcrStatus::TeacherApproved
+            && !record.needs_review
+    });
+    let ocr_ready = expected_records > 0 && ocr_pair_coverage_complete && ocr_status_ready;
 
     let mut blockers = Vec::new();
     if !freeze_ready {
@@ -729,7 +764,15 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
         }
     }
     if !ocr_ready {
-        blockers.push("STUDENT_ANSWER_OCR_NOT_READY".to_string());
+        if duplicate_pair_count > 0 {
+            blockers.push("STUDENT_ANSWER_OCR_DUPLICATE_PAIRS".to_string());
+        }
+        if !missing_pairs.is_empty() && !project.student_answer_ocr_records.is_empty() {
+            blockers.push("STUDENT_ANSWER_OCR_MISSING_PAIRS".to_string());
+        }
+        if project.student_answer_ocr_records.is_empty() || !ocr_status_ready {
+            blockers.push("STUDENT_ANSWER_OCR_NOT_READY".to_string());
+        }
     }
     if stale_record_count > 0 {
         blockers.push("SCORING_RERUN_REQUIRED".to_string());
@@ -747,6 +790,8 @@ pub fn scoring_readiness(project: &Project) -> ScoringReadiness {
         needs_review_record_count,
         invalidated_record_count,
         stale_record_count,
+        missing_pairs,
+        duplicate_pair_count,
     }
 }
 
@@ -1287,6 +1332,55 @@ mod tests {
             scoring_anchors: vec![],
             speaking_exams: vec![],
         }
+    }
+
+    fn approved_ocr(id: &str, submission_id: &str, question_id: &str) -> StudentAnswerOcrRecord {
+        crate::domain::student::StudentAnswerOcrRecord {
+            id: id.to_string(),
+            submission_id: submission_id.to_string(),
+            question_id: question_id.to_string(),
+            question_number: 1,
+            source_page_numbers: vec![1],
+            source_image_refs: vec![],
+            crop_refs: vec![],
+            full_page_preview_refs: vec![],
+            answer_text: "cevap".into(),
+            structured_answer: None,
+            confidence: Some(0.8),
+            uncertain_spans: vec![],
+            suggested_corrections: vec![],
+            critical_term_warnings: vec![],
+            ocr_semantic_warnings: vec![],
+            critical_keyword_uncertain: false,
+            status: StudentAnswerOcrStatus::TeacherApproved,
+            needs_review: false,
+            review_reasons: vec![],
+            warnings: vec![],
+            review_policy: None,
+            model_provenance: None,
+            model_name: None,
+            prompt_version: "v1".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            teacher_corrected_text: None,
+            teacher_reviewed_at: Some(chrono::Utc::now()),
+            parse_diagnostics: None,
+            render_diagnostics: None,
+            ..Default::default()
+        }
+    }
+
+    /// 2 submission x 2 question kartezyen kapsamı; OCR kayıtları testte
+    /// belirlenir. Okuma/identity/freeze tarafı `base_project` ile hazırdır.
+    fn two_by_two_project() -> Project {
+        let mut project = base_project();
+        let mut second_question = project.questions[0].clone();
+        second_question.id = "q-2".to_string();
+        project.questions.push(second_question);
+        let mut second_submission = project.student_submissions[0].clone();
+        second_submission.id = "submission-2".to_string();
+        project.student_submissions.push(second_submission);
+        project
     }
 
     #[test]
@@ -1898,5 +1992,65 @@ mod tests {
         assert!(outcome
             .warnings
             .contains(&"criterion_sum_exceeds_question_max".to_string()));
+    }
+
+    #[test]
+    fn scoring_readiness_detects_duplicate_ocr_pairs_even_when_count_matches() {
+        let mut project = two_by_two_project();
+        // Beklenen 4 çift; 4 kayıt var ama (s1,q1) tekrarlı ve (s1,q2) eksik.
+        project.student_answer_ocr_records = vec![
+            approved_ocr("ocr-1", "submission-1", "q-1"),
+            approved_ocr("ocr-2", "submission-1", "q-1"),
+            approved_ocr("ocr-3", "submission-2", "q-1"),
+            approved_ocr("ocr-4", "submission-2", "q-2"),
+        ];
+        let readiness = scoring_readiness(&project);
+        assert!(!readiness.ready, "duplicate pairs must block readiness");
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "STUDENT_ANSWER_OCR_DUPLICATE_PAIRS"));
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "STUDENT_ANSWER_OCR_MISSING_PAIRS"));
+        assert!(readiness
+            .missing_pairs
+            .contains(&("submission-1".to_string(), "q-2".to_string())));
+    }
+
+    #[test]
+    fn scoring_readiness_reports_missing_ocr_pairs() {
+        let mut project = two_by_two_project();
+        project.student_answer_ocr_records = vec![
+            approved_ocr("ocr-1", "submission-1", "q-1"),
+            approved_ocr("ocr-2", "submission-1", "q-2"),
+            approved_ocr("ocr-3", "submission-2", "q-2"),
+        ];
+        let readiness = scoring_readiness(&project);
+        assert!(!readiness.ready, "missing pairs must block readiness");
+        assert!(readiness
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "STUDENT_ANSWER_OCR_MISSING_PAIRS"));
+        assert!(readiness
+            .missing_pairs
+            .contains(&("submission-2".to_string(), "q-1".to_string())));
+        assert_eq!(readiness.missing_pairs.len(), 1);
+    }
+
+    #[test]
+    fn scoring_readiness_is_ready_for_full_ocr_pair_coverage() {
+        let mut project = two_by_two_project();
+        project.student_answer_ocr_records = vec![
+            approved_ocr("ocr-1", "submission-1", "q-1"),
+            approved_ocr("ocr-2", "submission-1", "q-2"),
+            approved_ocr("ocr-3", "submission-2", "q-1"),
+            approved_ocr("ocr-4", "submission-2", "q-2"),
+        ];
+        let readiness = scoring_readiness(&project);
+        assert!(readiness.ready, "full pair coverage must be ready");
+        assert!(readiness.missing_pairs.is_empty());
+        assert_eq!(readiness.expected_records, 4);
     }
 }

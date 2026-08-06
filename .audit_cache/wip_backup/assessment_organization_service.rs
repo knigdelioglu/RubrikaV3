@@ -9,7 +9,6 @@ use crate::domain::assessment::{
     ClassApplication, ClassApplicationStatus, ListeningDetails, SpeakingConfigurationSnapshot,
 };
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::domain::performance::PerformanceDetails;
 use crate::domain::project::Project;
 use crate::domain::student::Student;
 use crate::services::project_store::ProjectStore;
@@ -78,8 +77,6 @@ pub struct CreateAssessmentActivityInput {
     pub speaking_configuration: Option<SpeakingConfigurationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listening_details: Option<ListeningDetails>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance_details: Option<PerformanceDetails>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -233,9 +230,7 @@ impl AssessmentOrganizationService {
             .collect::<HashSet<_>>();
         let suggested_slots = match input.assessment_type {
             AssessmentType::Listening => vec![1],
-            AssessmentType::Written | AssessmentType::Speaking | AssessmentType::Performance => {
-                vec![1, 2]
-            }
+            AssessmentType::Written | AssessmentType::Speaking => vec![1, 2],
         };
         let mut options = suggested_slots
             .into_iter()
@@ -362,7 +357,6 @@ impl AssessmentOrganizationService {
                     document_ids: vec![],
                     student_scope_ids,
                     speaking_attempts: vec![],
-                    performance_assessments: vec![],
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 }
@@ -383,7 +377,6 @@ impl AssessmentOrganizationService {
             common_document_ids: vec![],
             listening_details: input.listening_details.clone(),
             speaking_configuration: input.speaking_configuration.clone(),
-            performance_details: input.performance_details.clone(),
             class_applications,
             created_at: now.clone(),
             updated_at: now,
@@ -557,7 +550,6 @@ impl AssessmentOrganizationService {
             document_ids: vec![],
             student_scope_ids,
             speaking_attempts: vec![],
-            performance_assessments: vec![],
             created_at: now.clone(),
             updated_at: now,
         };
@@ -647,8 +639,7 @@ impl AssessmentOrganizationService {
                 )
             })?;
         let application = &activity.class_applications[index];
-        let has_attempts = !application.performance_assessments.is_empty()
-            || !application.speaking_attempts.is_empty()
+        let has_attempts = !application.speaking_attempts.is_empty()
             || project.speaking_exams.iter().any(|exam| {
                 exam.assessment_activity_id.as_deref() == Some(&activity.id)
                     && exam.attempts.iter().any(|attempt| {
@@ -658,8 +649,8 @@ impl AssessmentOrganizationService {
         if has_attempts {
             return Err(activity_error(
                 AppErrorCode::AssessmentClassApplicationInUse,
-                "Bu sınıf uygulamasında değerlendirme kayıtları bulunduğu için kaldırılamaz.",
-                "class application has assessments or artifacts.",
+                "Bu sınıf uygulamasında konuşma kayıtları bulunduğu için kaldırılamaz.",
+                "class application has attempts or artifacts.",
             ));
         }
         let removed = activity.class_applications.remove(index);
@@ -746,22 +737,6 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
         ));
     }
     match input.assessment_type {
-        AssessmentType::Performance => {
-            if input.performance_details.is_none() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görevi için görev ayrıntıları gereklidir.",
-                    "performance_details is missing.",
-                ));
-            }
-            if input.speaking_configuration.is_some() || input.listening_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görevinde konuşma/dinleme ayarları kullanılamaz.",
-                    "speaking/listening details supplied for performance activity.",
-                ));
-            }
-        }
         AssessmentType::Speaking => {
             let Some(configuration) = input.speaking_configuration.as_ref() else {
                 return Err(activity_error(
@@ -786,13 +761,6 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
                     "invalid speaking configuration.",
                 ));
             }
-            if input.performance_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görev ayrıntıları yalnız performans görevinde kullanılabilir.",
-                    "performance_details supplied for non-performance activity.",
-                ));
-            }
         }
         AssessmentType::Written | AssessmentType::Listening => {
             if input.speaking_configuration.is_some() {
@@ -800,13 +768,6 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
                     AppErrorCode::AssessmentInvalidInput,
                     "Konuşma ayarları yalnız konuşma sınavında kullanılabilir.",
                     "speaking_configuration supplied for non-speaking activity.",
-                ));
-            }
-            if input.performance_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görev ayrıntıları yalnız performans görevinde kullanılabilir.",
-                    "performance_details supplied for non-performance activity.",
                 ));
             }
             if let Some(details) = input.listening_details.as_ref() {
@@ -853,7 +814,6 @@ impl AssessmentTypeLabel for AssessmentActivity {
             AssessmentType::Written => "written",
             AssessmentType::Listening => "listening",
             AssessmentType::Speaking => "speaking",
-            AssessmentType::Performance => "performance",
         }
     }
 }
@@ -929,7 +889,6 @@ mod tests {
                 school_class_ids: listed.iter().map(|item| item.id.clone()).collect(),
                 speaking_configuration: None,
                 listening_details: None,
-                performance_details: None,
             })
             .expect("activity should be created");
         assert_eq!(activity.class_applications.len(), 3);
@@ -990,7 +949,6 @@ mod tests {
                 }
             }),
             listening_details: None,
-            performance_details: None,
         };
         service
             .create_activity(input(AssessmentType::Written))
@@ -1072,7 +1030,6 @@ mod tests {
                     school_class_ids: vec![school_class.id.clone()],
                     speaking_configuration: None,
                     listening_details: None,
-                    performance_details: None,
                 })
                 .expect("activity should be created");
         }
@@ -1104,7 +1061,6 @@ mod tests {
             school_class_ids: vec!["class".into()],
             speaking_configuration: None,
             listening_details: None,
-            performance_details: None,
         };
         assert_eq!(
             validate_create_input(&input).unwrap_err().code,
@@ -1162,7 +1118,6 @@ mod tests {
                     rubric_snapshot: serde_json::json!({}),
                 }),
                 listening_details: None,
-                performance_details: None,
             })
             .expect("speaking activity should be created");
         let mut project = store

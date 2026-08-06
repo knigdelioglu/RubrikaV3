@@ -148,3 +148,31 @@ export function isProjectMigrationRequiredError(
 ): boolean {
   return error?.code === 'PROJECT_MIGRATION_REQUIRED';
 }
+
+const UNKNOWN_ERROR_SAFE_MESSAGE = 'Bilinmeyen bir hata oluştu.';
+
+export function isAppError(e: unknown): e is AppError {
+  if (typeof e !== 'object' || e === null) return false;
+  const candidate = e as Record<string, unknown>;
+  if (typeof candidate.code !== 'string') return false;
+  if (typeof candidate.safeMessage !== 'string') return false;
+  if (
+    candidate.recoveryAction !== undefined &&
+    typeof candidate.recoveryAction !== 'string'
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function normalizeAppError(e: unknown): AppError {
+  if (isAppError(e)) return e;
+  return {
+    code: 'UNKNOWN_ERROR',
+    safeMessage: UNKNOWN_ERROR_SAFE_MESSAGE,
+    recoveryAction: undefined,
+    correlationId: crypto.randomUUID?.() || 'unknown',
+    retryable: false,
+    detailsAvailable: false,
+  };
+}

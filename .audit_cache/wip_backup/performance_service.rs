@@ -4,7 +4,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::assessment::{AssessmentActivity, AssessmentType, ClassApplicationStatus};
+use crate::domain::assessment::{AssessmentActivity, AssessmentType};
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::performance::{
     CriterionRating, PerformanceAssessment, PerformanceAssessmentStatus, PerformanceCriterion,
@@ -157,14 +157,8 @@ pub struct PerformanceReportStudentRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<PerformanceAssessmentStatus>,
     pub criterion_scores: Vec<PerformanceReportCriterionScore>,
-    /// Yalnız onaylı (Approved) satırlarda final toplam; taslak/eksik/gösterilmedi
-    /// satırlarında `None` kalır (provisional/final ayrımı, TD-07).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u32>,
-    /// Onaylı veya InProgress satırlarda kaydın geçici toplamı; final toplamdan
-    /// ayrı taşınır, `total` onaylı satırlarda bununla aynı değeri taşır.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provisional_total: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,25 +204,6 @@ pub struct PerformanceReportDto {
     pub generated_at: String,
     pub summary: PerformanceReportSummary,
     pub rows: Vec<PerformanceReportStudentRow>,
-}
-
-/// Performans görevi için authoritative readiness snapshot'ı (TD-03).
-/// Adım durumları (task/assessment/results) frontend'de türetilmez; kararlar
-/// bu DTO üzerinden render edilir.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PerformanceStatusDto {
-    pub has_published_rubric: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_rubric_version: Option<u32>,
-    pub has_draft_rubric: bool,
-    pub has_task_details: bool,
-    pub total_students: u32,
-    pub approved_count: u32,
-    pub in_progress_count: u32,
-    pub missing_count: u32,
-    pub not_performed_count: u32,
-    pub all_approved: bool,
 }
 
 impl PerformanceService {
@@ -574,6 +549,9 @@ impl PerformanceService {
                         "student_id is not a member of the class roster.",
                     ));
                 }
+                validate_ratings(&input.ratings, &latest_rubric)?;
+                let provisional_total = compute_provisional_total(&input.ratings, &latest_rubric);
+
                 let now = chrono::Utc::now().to_rfc3339();
                 let activity = &mut project.assessment_activities[activity_index];
                 let application = activity
@@ -587,22 +565,6 @@ impl PerformanceService {
                             "application_id not found for activity.",
                         )
                     })?;
-                if let Some(assessment_id) = input.assessment_id.as_deref() {
-                    let scoped = application
-                        .performance_assessments
-                        .iter()
-                        .any(|assessment| {
-                            assessment.id == assessment_id
-                                && assessment.student_id == input.student_id
-                        });
-                    if !scoped {
-                        return Err(performance_error(
-                            AppErrorCode::AssessmentInvalidInput,
-                            "Değerlendirme kaydı bu öğrenciye veya sınıf uygulamasına ait değil.",
-                            "assessment_id does not belong to this application and student.",
-                        ));
-                    }
-                }
                 let existing = application
                     .performance_assessments
                     .iter_mut()
@@ -611,38 +573,6 @@ impl PerformanceService {
                             || (input.assessment_id.is_none()
                                 && assessment.student_id == input.student_id)
                     });
-                let details = activity.performance_details.as_ref().ok_or_else(|| {
-                    performance_error(
-                        AppErrorCode::AssessmentInvalidInput,
-                        "Görev ayrıntıları bulunamadı.",
-                        "performance_details is missing.",
-                    )
-                })?;
-                let (rating_rubric, new_rubric_id, new_rubric_version) =
-                    if let Some(existing) = existing.as_deref() {
-                        let pinned = details
-                            .rubric_versions
-                            .iter()
-                            .find(|rubric| {
-                                rubric.id == existing.rubric_id
-                                    && rubric.version == existing.rubric_version
-                            })
-                            .unwrap_or(&latest_rubric);
-                        (
-                            pinned.clone(),
-                            existing.rubric_id.clone(),
-                            existing.rubric_version,
-                        )
-                    } else {
-                        (
-                            latest_rubric.clone(),
-                            latest_rubric.id.clone(),
-                            latest_rubric.version,
-                        )
-                    };
-                validate_ratings(&input.ratings, &rating_rubric)?;
-                let provisional_total = compute_provisional_total(&input.ratings, &rating_rubric);
-
                 let assessment = if let Some(existing) = existing {
                     if existing.status == PerformanceAssessmentStatus::Approved {
                         return Err(performance_error(
@@ -654,6 +584,8 @@ impl PerformanceService {
                     existing.ratings = input.ratings.clone();
                     existing.provisional_total = provisional_total;
                     existing.feedback = normalize_optional(input.feedback.clone());
+                    existing.rubric_id = latest_rubric.id.clone();
+                    existing.rubric_version = latest_rubric.version;
                     existing.status = PerformanceAssessmentStatus::InProgress;
                     existing.assessed_at = Some(now.clone());
                     existing.updated_at = now.clone();
@@ -662,8 +594,8 @@ impl PerformanceService {
                     let assessment = PerformanceAssessment {
                         id: Uuid::new_v4().to_string(),
                         student_id: input.student_id.clone(),
-                        rubric_id: new_rubric_id,
-                        rubric_version: new_rubric_version,
+                        rubric_id: latest_rubric.id.clone(),
+                        rubric_version: latest_rubric.version,
                         ratings: input.ratings.clone(),
                         provisional_total,
                         feedback: normalize_optional(input.feedback.clone()),
@@ -843,30 +775,21 @@ impl PerformanceService {
                             "application_id not found for activity.",
                         )
                     })?;
-                let approved_record_exists = match input.assessment_id.as_deref() {
-                    Some(assessment_id) => {
-                        application
-                            .performance_assessments
-                            .iter()
-                            .any(|assessment| {
-                                assessment.id == assessment_id
-                                    && assessment.status == PerformanceAssessmentStatus::Approved
-                            })
-                    }
-                    None => application
+                if let Some(assessment_id) = input.assessment_id.as_deref() {
+                    if application
                         .performance_assessments
                         .iter()
-                        .any(|assessment| {
-                            assessment.student_id == input.student_id
-                                && assessment.status == PerformanceAssessmentStatus::Approved
-                        }),
-                };
-                if approved_record_exists {
-                    return Err(performance_error(
-                        AppErrorCode::AssessmentActivityInUse,
-                        "Onaylanmış değerlendirmenin durumu değiştirilemez.",
-                        "approved assessment status cannot be changed.",
-                    ));
+                        .find(|assessment| assessment.id == assessment_id)
+                        .is_some_and(|assessment| {
+                            assessment.status == PerformanceAssessmentStatus::Approved
+                        })
+                    {
+                        return Err(performance_error(
+                            AppErrorCode::AssessmentActivityInUse,
+                            "Onaylanmış değerlendirmenin durumu değiştirilemez.",
+                            "approved assessment status cannot be changed.",
+                        ));
+                    }
                 }
                 let now = chrono::Utc::now().to_rfc3339();
                 let latest = latest_published_rubric(&details);
@@ -1130,9 +1053,6 @@ impl PerformanceService {
                 status,
                 criterion_scores,
                 total: assessment
-                    .filter(|assessment| assessment.status == PerformanceAssessmentStatus::Approved)
-                    .map(|assessment| assessment.provisional_total),
-                provisional_total: assessment
                     .filter(|assessment| {
                         matches!(
                             assessment.status,
@@ -1181,85 +1101,6 @@ impl PerformanceService {
                 unrated_count,
             },
             rows,
-        })
-    }
-
-    /// Performans görevi için authoritative step/readiness snapshot'ı (TD-03).
-    /// Salt-okunur; adım durumu kararları frontend yerine bu DTO'dan gelir.
-    pub fn get_performance_status(
-        &self,
-        input: PerformanceActivityIdInput,
-    ) -> Result<PerformanceStatusDto, AppError> {
-        let project = self.load_project(&input.project_id)?;
-        let activity = project
-            .assessment_activities
-            .iter()
-            .find(|activity| activity.id == input.activity_id)
-            .ok_or_else(|| {
-                performance_error(
-                    AppErrorCode::AssessmentActivityNotFound,
-                    "Performans görevi bulunamadı.",
-                    "activity_id not found.",
-                )
-            })?;
-        if activity.assessment_type != AssessmentType::Performance {
-            return Err(performance_error(
-                AppErrorCode::AssessmentInvalidInput,
-                "Bu etkinlik performans görevi değil.",
-                "activity is not a performance task.",
-            ));
-        }
-        let details = activity.performance_details.as_ref();
-        let versions = details
-            .map(|details| details.rubric_versions.as_slice())
-            .unwrap_or(&[]);
-        let has_published_rubric = versions.iter().any(|rubric| rubric.version >= 1);
-        let published_rubric_version = versions
-            .iter()
-            .filter(|rubric| rubric.version >= 1)
-            .map(|rubric| rubric.version)
-            .max();
-        let has_draft_rubric = versions.iter().any(|rubric| rubric.version == 0);
-        let has_task_details = details.is_some_and(|details| {
-            !details.theme.trim().is_empty() || !details.task_instruction.trim().is_empty()
-        });
-
-        let applications = activity
-            .class_applications
-            .iter()
-            .filter(|application| application.status != ClassApplicationStatus::Archived)
-            .collect::<Vec<_>>();
-        let total_students = applications
-            .iter()
-            .map(|application| application.student_scope_ids.len() as u32)
-            .sum();
-        let mut approved_count = 0u32;
-        let mut in_progress_count = 0u32;
-        let mut missing_count = 0u32;
-        let mut not_performed_count = 0u32;
-        for application in &applications {
-            for assessment in &application.performance_assessments {
-                match assessment.status {
-                    PerformanceAssessmentStatus::Approved => approved_count += 1,
-                    PerformanceAssessmentStatus::InProgress => in_progress_count += 1,
-                    PerformanceAssessmentStatus::Missing => missing_count += 1,
-                    PerformanceAssessmentStatus::NotPerformed => not_performed_count += 1,
-                }
-            }
-        }
-        let all_approved = approved_count >= total_students && total_students > 0;
-
-        Ok(PerformanceStatusDto {
-            has_published_rubric,
-            published_rubric_version,
-            has_draft_rubric,
-            has_task_details,
-            total_students,
-            approved_count,
-            in_progress_count,
-            missing_count,
-            not_performed_count,
-            all_approved,
         })
     }
 
@@ -2347,90 +2188,5 @@ mod tests {
             .find(|row| row.status == Some(PerformanceAssessmentStatus::Approved))
             .expect("approved row should be present");
         assert!(approved_row.total.is_some());
-    }
-
-    #[test]
-    fn status_reports_authoritative_readiness_from_rubric_and_assessments() {
-        let (store, project_id, classes) = temp_project();
-        let class_id = setup_environment(store.clone(), project_id.clone(), classes.clone(), 9);
-        add_student(&store, &project_id, "student-2", "9A");
-        let service = service(store, classes);
-        let activity = create_task(&service, &project_id, &class_id, 1);
-        let application = activity.class_applications[0].id.clone();
-        let status_input = PerformanceActivityIdInput {
-            project_id: project_id.clone(),
-            activity_id: activity.id.clone(),
-        };
-
-        let before = service
-            .get_performance_status(status_input.clone())
-            .expect("status should load");
-        assert!(!before.has_published_rubric);
-        assert_eq!(before.published_rubric_version, None);
-        assert!(before.has_draft_rubric);
-        assert_eq!(before.total_students, 2);
-        assert!(!before.all_approved);
-
-        service
-            .publish_performance_rubric(PublishPerformanceRubricInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                rubric: valid_rubric(),
-            })
-            .expect("rubric should publish");
-
-        let published = service
-            .get_performance_status(status_input.clone())
-            .expect("status should load");
-        assert!(published.has_published_rubric);
-        assert_eq!(published.published_rubric_version, Some(1));
-        assert_eq!(published.total_students, 2);
-        assert!(!published.all_approved);
-
-        let saved = service
-            .save_performance_assessment(SavePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-1".into(),
-                assessment_id: None,
-                ratings: full_ratings(),
-                feedback: None,
-            })
-            .expect("draft should save");
-        service
-            .set_performance_assessment_status(SetPerformanceAssessmentStatusInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                student_id: "student-2".into(),
-                assessment_id: None,
-                status: PerformanceAssessmentStatus::Missing,
-            })
-            .expect("missing should mark");
-
-        let mixed = service
-            .get_performance_status(status_input.clone())
-            .expect("status should load");
-        assert_eq!(mixed.in_progress_count, 1);
-        assert_eq!(mixed.missing_count, 1);
-        assert_eq!(mixed.approved_count, 0);
-        assert!(!mixed.all_approved);
-
-        service
-            .approve_performance_assessment(ApprovePerformanceAssessmentInput {
-                project_id: project_id.clone(),
-                activity_id: activity.id.clone(),
-                application_id: application.clone(),
-                assessment_id: saved.id.clone(),
-            })
-            .expect("approval should succeed");
-
-        let approved = service
-            .get_performance_status(status_input)
-            .expect("status should load");
-        assert_eq!(approved.approved_count, 1);
-        assert_eq!(approved.in_progress_count, 0);
-        assert!(!approved.all_approved, "one student still unapproved");
     }
 }

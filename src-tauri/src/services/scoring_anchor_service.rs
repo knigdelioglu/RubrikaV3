@@ -623,8 +623,10 @@ mod tests {
 
     #[test]
     fn placeholder_answer_is_never_anchor_eligible() {
-        let mut record = StudentAnswerOcrRecord::default();
-        record.answer_text = "Anahtar kavramları girin...".to_string();
+        let mut record = StudentAnswerOcrRecord {
+            answer_text: "Anahtar kavramları girin...".to_string(),
+            ..StudentAnswerOcrRecord::default()
+        };
         assert!(ocr_answer_is_placeholder(&record));
 
         record.answer_text = "Gerçek öğrenci cevabı".to_string();
@@ -633,23 +635,27 @@ mod tests {
 
     #[test]
     fn structured_answer_can_supply_non_empty_content_when_text_projection_is_empty() {
-        let mut record = StudentAnswerOcrRecord::default();
-        record.structured_answer = Some(
-            crate::domain::structured_answer::StructuredAnswer::OpenText {
-                text: "Gerçek cevap".to_string(),
-            },
-        );
+        let record = StudentAnswerOcrRecord {
+            structured_answer: Some(
+                crate::domain::structured_answer::StructuredAnswer::OpenText {
+                    text: "Gerçek cevap".to_string(),
+                },
+            ),
+            ..StudentAnswerOcrRecord::default()
+        };
         assert!(!ocr_answer_is_placeholder(&record));
     }
 
     #[test]
     fn structured_placeholder_or_empty_answer_is_not_anchor_eligible() {
-        let mut record = StudentAnswerOcrRecord::default();
-        record.structured_answer = Some(
-            crate::domain::structured_answer::StructuredAnswer::OpenText {
-                text: "Anahtar kavramları girin...".to_string(),
-            },
-        );
+        let mut record = StudentAnswerOcrRecord {
+            structured_answer: Some(
+                crate::domain::structured_answer::StructuredAnswer::OpenText {
+                    text: "Anahtar kavramları girin...".to_string(),
+                },
+            ),
+            ..StudentAnswerOcrRecord::default()
+        };
         assert!(ocr_answer_is_placeholder(&record));
 
         record.structured_answer = Some(

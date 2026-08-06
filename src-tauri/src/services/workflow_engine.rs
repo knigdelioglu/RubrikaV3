@@ -381,24 +381,6 @@ pub fn evaluate_workflow_inner(
         .as_ref()
         .is_some_and(|freeze| freeze.freeze_status == ExamPackageFreezeStatus::Frozen);
 
-    if !exam_package_frozen
-        && matches!(
-            project.workflow.current_stage,
-            WorkflowStage::ExamPackageBuildReady
-                | WorkflowStage::ExamPackageBuildRunning
-                | WorkflowStage::ExamPackageReviewNeeded
-                | WorkflowStage::ExamPackageIncomplete
-                | WorkflowStage::ExamPackageReadyForQep
-        )
-    {
-        return (
-            project.workflow.current_stage.clone(),
-            project.workflow.blocking_reasons.clone(),
-            project.workflow.next_actions.clone(),
-            project.workflow.summary.text.clone(),
-        );
-    }
-
     let mut blocking_reasons = Vec::new();
     let mut next_actions = Vec::new();
 
@@ -1683,6 +1665,19 @@ mod tests {
         let snap = evaluate_workflow(&p);
         assert_eq!(snap.current_stage, WorkflowStage::StudentScansMissing);
         assert_ne!(snap.current_stage, WorkflowStage::ExamPackageReviewNeeded);
+    }
+
+    #[test]
+    fn test_live_evaluation_overrides_stale_persisted_build_stage() {
+        let mut project = question_text_and_rubric_ready_project();
+        project.workflow.current_stage = WorkflowStage::ExamPackageBuildReady;
+        project.workflow.current_stage_label = "Sınav Paketi Hazır".to_string();
+        let snap = evaluate_workflow(&project);
+        assert_eq!(
+            snap.current_stage,
+            WorkflowStage::QepReady,
+            "live evaluation must not short-circuit to a stale persisted build stage"
+        );
     }
 
     #[test]

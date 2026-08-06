@@ -885,8 +885,10 @@ mod tests {
 
     #[test]
     fn numeric_turkish_decimal_and_tolerance_are_backend_policy() {
-        let mut numeric = NumericScoringPolicy::default();
-        numeric.absolute_tolerance = 0.01;
+        let numeric = NumericScoringPolicy {
+            absolute_tolerance: 0.01,
+            ..NumericScoringPolicy::default()
+        };
         let mut policy = policy();
         policy.numeric = numeric;
         let result = DeterministicScoringService::new().score(DeterministicScoringInput {
