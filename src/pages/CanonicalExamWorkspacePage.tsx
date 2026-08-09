@@ -14,8 +14,6 @@ import { StudentAnswerOcrPage } from './StudentAnswerOcrPage';
 import { ScoringPage } from './ScoringPage';
 import { AnalysisPage } from './AnalysisPage';
 import { SpeechExamPage } from './SpeechExamPage';
-import { PerformanceOrganizationPage } from './PerformanceOrganizationPage';
-import { PerformanceResultsView, PerformanceScoringPage } from './PerformanceScoringPage';
 
 const EMPTY_CLASSES: SchoolClass[] = [];
 
@@ -109,12 +107,6 @@ export function CanonicalExamWorkspacePage() {
     enabled: !!projectId,
   });
 
-  const performanceStatusQuery = useQuery({
-    queryKey: ['performance-status', projectId, activityId],
-    queryFn: () => commands.getPerformanceStatus({ projectId: projectId!, activityId: activityId! }),
-    enabled: !!projectId && !!activityId && activityQuery.data?.assessmentType === 'performance',
-  });
-
   const classes = classesQuery.data ?? EMPTY_CLASSES;
   const classesById = useMemo(
     () => new Map(classes.map((cls) => [cls.id, cls])),
@@ -123,8 +115,6 @@ export function CanonicalExamWorkspacePage() {
 
   const activity = activityQuery.data;
   const workflow = workflowQuery.data;
-  const performanceStatus = performanceStatusQuery.data ?? null;
-
   // TD-01: entering a written/listening workspace selects it as the
   // backend-authoritative written scope so the project-level written
   // collections are isolated per activity.
@@ -167,7 +157,7 @@ export function CanonicalExamWorkspacePage() {
   }
 
   const validSteps = getExamStepDefinitions(activity.assessmentType);
-  const currentStepDef = validSteps.find((s) => s.id === routeStep) || resolveNextExamStep(activity, workflow, selectedClassAppId, performanceStatus);
+  const currentStepDef = validSteps.find((s) => s.id === routeStep) || resolveNextExamStep(activity, workflow, selectedClassAppId);
   const activeStepId = currentStepDef.id;
 
   const renderStepContent = () => {
@@ -214,17 +204,6 @@ export function CanonicalExamWorkspacePage() {
             return <AnalysisPage kind="speaking" />;
         }
 
-      case 'performance':
-        switch (activeStepId) {
-          case 'task':
-            return <PerformanceOrganizationPage activityId={activityId} />;
-          case 'assessment':
-            return <PerformanceScoringPage />;
-          case 'results':
-          default:
-            return <PerformanceResultsView projectId={projectId} activityId={activityId} />;
-        }
-
       default:
         return <ExamPackageWorkspacePage />;
     }
@@ -236,7 +215,6 @@ export function CanonicalExamWorkspacePage() {
         projectId={projectId}
         activity={activity}
         workflowSnapshot={workflow}
-        performanceStatus={performanceStatus}
         classesById={classesById}
         activeStepId={activeStepId}
         selectedClassApplicationId={selectedClassAppId}

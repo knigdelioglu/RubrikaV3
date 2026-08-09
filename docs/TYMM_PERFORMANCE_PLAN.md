@@ -1,3 +1,11 @@
+> **DURUM: RETIRED / REMOVED (2026-08-08)**
+>
+> Bu plan uygulanmış ve TYMM Performans Değerlendirme modülü RubrikaV3'ten
+> tamamen kaldırılmıştır. Bu dosya yalnız tarihsel arşivdir; aktif bir özellik
+> planı değildir. Aktif workflow'da `performance` assessment türü yoktur;
+> yalnız eski test projelerinin açılabilmesi için `AssessmentType::LegacyPerformance`
+> tombstone variantı (serde `alias = "performance"`) tutulur.
+
 # TYMM Performans Değerlendirme İş Akışı — Uygulama Planı
 
 **Kaynak:** `docs/TYMM_PERFORMANCE_SCALE_REPORT.md` (3 Ağustos 2026 araştırma raporu)

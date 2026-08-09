@@ -11,7 +11,7 @@ import { shouldShowProjectNavigation } from './assessmentMode';
 import type { AssessmentActivity, DataLossPreflightReport, JobSnapshot, ProjectListItem } from '../api/types';
 import { setActiveProject } from '../state/projectSession';
 import { projectOverviewPath } from './projectRoutes';
-import { isProjectWriteBlocked, isProjectWriteControl } from './projectSafety';
+import { isProjectWriteBlocked, isProjectWriteControl, preflightReasonLabel, resolveWriteBlockReason } from './projectSafety';
 import { formatDateTime } from '../utils/formatting';
 import {
   formatAssessmentOption,
@@ -339,36 +339,6 @@ function GlobalJobCenter({ projectId }: { projectId: string }) {
   );
 }
 
-function preflightReasonLabel(reason: string): string {
-  const labels: Record<string, string> = {
-    'verified backup yok': 'Bağımsız doğrulanmış yedek bulunamadı.',
-    'failed/unverified backup var': 'Doğrulanamayan bir yedek bulundu.',
-    'unknown orphan var': 'Ne olduğu doğrulanamayan artık dosyalar bulundu.',
-    'missing referenced artifact var': 'Kayıtlı bir dosya başvurusu eksik.',
-    'pending migration var': 'Proje için açıkça onaylanmış göç gerekiyor.',
-    'incomplete transaction var': 'Tamamlanmamış bir kayıt işlemi bulundu.',
-    'ambiguous transaction var': 'Son kayıt işleminin sonucu kesinleştirilemedi.',
-    'audit chain geçersiz': 'İşlem geçmişi doğrulanamadı.',
-    'audit/project revision divergence var': 'Proje ve işlem geçmişi aynı revision’da değil.',
-    'active audit/project revision divergence var': 'Aktif işlem geçmişi mevcut proje durumu ile eşleşmiyor.',
-    'active audit chain invalid': 'Aktif işlem geçmişi güvenli yazma için doğrulanamadı.',
-    'verified backup restore doğrulanmadı': 'Yedek alındı; restore eşitliği henüz doğrulanmadı.',
-    'process-kill proof failure': 'Ani işlem sonlandırma dayanıklılık kanıtı tamamlanmadı.',
-    'disk fault proof failure': 'Disk/izin arızası dayanıklılık kanıtı tamamlanmadı.',
-    'destructive race proof failure': 'Eşzamanlı işlem yarış kanıtı tamamlanmadı.',
-    'source byte manifest changed': 'Kaynak dosya bütünü doğrulama sırasında değişti.',
-    'Kaynak byte manifesti işlem boyunca değişti.': 'Kaynak dosya bütünü doğrulama sırasında değişti.',
-    'speaking metadata/audio mismatch var': 'Ses kaydı ile konuşma kaydı eşleşmiyor.',
-    'read-only hash guarantee doğrulanmadı': 'Okuma ön kontrolü sırasında dosya bütünü doğrulanamadı.',
-    'full validation marker yok': 'Tam doğrulama süiti henüz yeşil olarak işaretlenmedi.',
-    'symlink bulundu': 'Proje içinde güvenli olmayan sembolik bağ bulundu.',
-    'unsafe import staging var': 'Yarım kalmış içe aktarma bulundu.',
-    'unsafe restore staging var': 'Yarım kalmış geri yükleme bulundu.',
-    'ikinci writer aktif': 'Proje başka bir yazıcı işlem tarafından kullanılıyor.',
-  };
-  return labels[reason] ?? 'Veri güvenliği ön koşulu sağlanmadı.';
-}
-
 function ProjectSafetyBanner({ report, loading, failed }: {
   report?: DataLossPreflightReport;
   loading: boolean;
@@ -436,12 +406,40 @@ export function AppLayout({ children }: { children: ReactNode }) {
     enabled: !isGlobalPage && !!projectId,
   });
 
+  const effectiveProjectPath = projectPath || project?.rootPath || '';
+
   const preflightQuery = useQuery({
-    queryKey: ['data-loss-preflight', projectPath],
-    queryFn: () => commands.getDataLossPreflight(projectPath),
-    enabled: !isGlobalPage && !!projectPath,
+    queryKey: ['data-loss-preflight', effectiveProjectPath],
+    queryFn: () => commands.getDataLossPreflight(effectiveProjectPath),
+    enabled: !isGlobalPage && !!effectiveProjectPath,
     staleTime: 5_000,
   });
+
+  const writeBlocked = isProjectWriteBlocked(preflightQuery.data, {
+    isLoading: preflightQuery.isLoading,
+    isError: preflightQuery.isError,
+  });
+
+  const [writeBlockNotice, setWriteBlockNotice] = useState<string | null>(null);
+  const writeBlockNoticeTimer = useRef<number | null>(null);
+  const showWriteBlockNotice = (reason: string) => {
+    setWriteBlockNotice(reason);
+    if (writeBlockNoticeTimer.current !== null) {
+      window.clearTimeout(writeBlockNoticeTimer.current);
+    }
+    writeBlockNoticeTimer.current = window.setTimeout(() => {
+      setWriteBlockNotice(null);
+    }, 6000);
+  };
+
+  useEffect(
+    () => () => {
+      if (writeBlockNoticeTimer.current !== null) {
+        window.clearTimeout(writeBlockNoticeTimer.current);
+      }
+    },
+    [],
+  );
 
   if (isGlobalPage) return <>{children}</>;
 
@@ -520,18 +518,28 @@ export function AppLayout({ children }: { children: ReactNode }) {
             const target = event.target;
             if (!(target instanceof Element)) return;
             const button = target.closest('button');
-            const blocked = isProjectWriteBlocked(preflightQuery.data, {
-              isLoading: preflightQuery.isLoading,
-              isError: preflightQuery.isError,
-            });
             const isProjectWrite = button
               && isProjectWriteControl(button.getAttribute('data-project-write'));
-            if (isProjectWrite && blocked) {
+            if (isProjectWrite && writeBlocked) {
               event.preventDefault();
               event.stopPropagation();
+              const reason = resolveWriteBlockReason({
+                report: preflightQuery.data,
+                state: {
+                  isLoading: preflightQuery.isLoading,
+                  isError: preflightQuery.isError,
+                },
+              });
+              showWriteBlockNotice(reason ?? 'Proje şu anda değiştirilemiyor.');
             }
           }}
         >
+          {writeBlockNotice && (
+            <div className="project-safety-banner project-safety-banner--blocked" role="alert">
+              <strong>Proje şu anda değiştirilemiyor.</strong>
+              <span>{writeBlockNotice}</span>
+            </div>
+          )}
           {showProjectNavigation && <ProjectSafetyBanner report={preflightQuery.data} loading={preflightQuery.isLoading} failed={preflightQuery.isError} />}
           {children}
         </main>

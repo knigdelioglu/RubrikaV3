@@ -1,19 +1,12 @@
-export type AssessmentMode = 'written' | 'listening' | 'speaking' | 'performance';
+export type AssessmentMode = 'written' | 'listening' | 'speaking';
 
 export function getAssessmentMode(pathname: string, search = ''): AssessmentMode {
   if (/^\/project\/[^/]+\/speaking(?:\/|$)/.test(pathname)) return 'speaking';
-  if (/^\/project\/[^/]+\/performance(?:\/|$)/.test(pathname)) return 'performance';
   if (
     /^\/project\/[^/]+\/activities(?:\/|$)/.test(pathname) &&
     new URLSearchParams(search).get('assessmentType') === 'listening'
   ) {
     return 'listening';
-  }
-  if (
-    /^\/project\/[^/]+\/activities(?:\/|$)/.test(pathname) &&
-    new URLSearchParams(search).get('assessmentType') === 'performance'
-  ) {
-    return 'performance';
   }
   return 'written';
 }
@@ -24,9 +17,6 @@ export function getAssessmentModePath(mode: AssessmentMode, projectId: string): 
   }
   if (mode === 'listening' && projectId) {
     return `/project/${encodeURIComponent(projectId)}/activities?assessmentType=listening`;
-  }
-  if (mode === 'performance' && projectId) {
-    return `/project/${encodeURIComponent(projectId)}/performance`;
   }
   return projectId ? `/project/${encodeURIComponent(projectId)}/overview` : '/projects';
 }

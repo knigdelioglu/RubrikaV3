@@ -542,7 +542,6 @@ mod tests {
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: None,
-            performance_details: None,
             class_applications: vec![],
             created_at: String::new(),
             updated_at: String::new(),

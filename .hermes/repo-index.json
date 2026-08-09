@@ -1,0 +1,47 @@
+{
+  "module_index": {
+    "src/pages/PerformanceOrganizationPage.tsx": "Performans görev listesi + oluşturma/düzenleme (progressive disclosure rubrik, gelişmiş ayrıntılar katlanır)",
+    "src/pages/PerformanceScoringPage.tsx": "Öğrenci bazlı değerlendirme: liste + kompakt ölçüt satırları, Taslağı kaydet/Onayla/Onayla ve sonraki öğrenci, Missing/NotPerformed ayrı işaretleme",
+    "src/pages/performanceOrganizationUi.ts": "Saf yardımcılar: rubric overview/disclosure, performanceStatusSummary (backend DTO), level anchors, şablonlar, derivePerformanceCreateReadiness/buildCreatePerformanceTaskInput/executePerformanceCreateSubmit (create gate + submit tek kaynak), buildCreateSubmitBlockedFeedback (tıklama asla sessiz kalmaz: buton altı metin + onClick hatası tek kaynak)",
+    "src/pages/performanceScoringUi.ts": "Saf yardımcılar: action availability, student list item, nextPerformanceStudent/studentAfterApproval, readOnly",
+    "src/pages/performanceReportUi.ts": "Rapor CSV (noktalı virgül + UTF-8 BOM + enjeksiyon kaçışı), durum etiketleri",
+    "src/app/examWorkspace.ts": "PERFORMANCE_EXAM_STEPS: Görev Ayrıntısı / Öğrencileri Değerlendir / Sonuçlar"
+  },
+  "test_index": {
+    "src/pages/performanceOrganizationUi.test.ts": "create gate: sağ panel butonu → canonical handler, input builder, 0 ölçüt rubrik engellenmez, gradeLevel'sız sınıf ready göstermez, typed blocker, pending disabled, fail form korunur, success navigasyon",
+    "src/pages/performanceScoringUi.test.ts": "disclosure, status summary, student list, approve-next akışı, Missing/NotPerformed ayrımı, readonly",
+    "src/pages/performanceReportUi.test.ts": "durum etiketi + CSV"
+  },
+  "commands": {
+    "typecheck": "npm run typecheck",
+    "lint": "npm run lint (oxlint)",
+    "test": "npm test (tsc -b + node --test --experimental-strip-types; ~30 dosya)",
+    "build": "npm run build (tsc -b && vite build)"
+  },
+  "task_history": [
+    {
+      "date": "2026-08-08",
+      "task": "TYMM performans UX sadeleştirme (frontend bilgi mimarisi)",
+      "backend": "opencode 1.18.15 + deepseek-v4-flash (opencode-go free)",
+      "policy": "STRICT (read/edit whitelist; göreli+mutlak çift form zorunlu — tek formda read tool deny yiyor)",
+      "result": "9 dosya; typecheck+test(173)+lint+build geçti",
+      "note": "Backend'e dokunulmadı; rubrik doğrulama yalnız publish'te (backend kontratı); oluşturma başlığı opsiyonel"
+    },
+    {
+      "date": "2026-08-08",
+      "task": "TYMM 'Görevi oluştur' regresyonu: kök neden = gradeLevel'sız sınıfta readiness boşluğu + ham Error throw (ErrorBanner safeMessage'suz → sessiz)",
+      "backend": "antigravity (agy 1.1.11) + Gemini 3.6 Flash (High), WORKSPACE",
+      "policy": "WORKSPACE (settings.json permissions allow; --sandbox headless'ta unsandboxed auto-deny yedi → flag'siz çalıştırıldı)",
+      "result": "7 dosya + errors.ts/package.json; typecheck+test(181)+lint(6 pre-existing warning)+build geçti",
+      "note": "Backend'e dokunulmadı; create gate tek kaynak: derivePerformanceCreateReadiness; değerlendirme butonu rubrik yayınına kadar disabled; normalizeAppError ham Error → teacher-safe"
+    },
+    {
+      "date": "2026-08-08",
+      "task": "TYMM 'Görevi oluştur' görünürlük güvencesi: kullanıcı hâlâ 'tıklıyorum hiçbir şey olmuyor' — HEAD kanıtı: eski missingFields 'Tema veya görev adı'/'Geçerli rubrik' koşulları (başlık+tema boş, rubrik seçilmemiş) → canSubmit false → disabled buton (opacity 0.7 'mavi/aktif' algısı) → sessiz; yeni kod koşulları doğru kaldırdı, kullanıcı verisi canSubmit TRUE",
+      "backend": "opencode 1.18.15 + opencode-go/deepseek-v4-flash (free), STRICT",
+      "policy": "STRICT (read/edit whitelist; bash/task/webfetch deny; OPENCODE_CONFIG_CONTENT env var ile config enjeksiyonu)",
+      "result": "4 dosya: buildCreateSubmitBlockedFeedback + buton altı görünür uyarı + onClick guard (canSubmit false → ErrorBanner) + sequenceQuery.isError uyarı/retry + gradeLevel'sız sınıf uyarısı + 3 yeni test; typecheck+test(184)+lint(6, yeni yok)+build geçti",
+      "note": "Backend'e dokunulmadı; kullanıcıya Tauri'yi yeniden derleme/başlatma talimatı verildi (büyük olasılıkla eski build test ediyordu)"
+    }
+  ]
+}

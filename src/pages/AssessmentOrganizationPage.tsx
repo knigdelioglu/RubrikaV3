@@ -183,7 +183,7 @@ export function AssessmentOrganizationPage() {
   useEffect(() => {
     const queryType = searchParams.get('assessmentType');
     setFilterAssessmentType(
-      queryType === 'written' || queryType === 'listening' || queryType === 'speaking' || queryType === 'performance'
+      queryType === 'written' || queryType === 'listening' || queryType === 'speaking'
         ? queryType
         : '',
     );
@@ -374,8 +374,7 @@ export function AssessmentOrganizationPage() {
     <div className="assessment-page">
       <header className="assessment-page__header">
         <div><h2>Sınav Organizasyonu</h2><p>Ortak sınavları ve sınıf uygulamalarını yönetin.</p></div>
-        <div className="performance-page__header-actions">
-          <Link className="button button--secondary" to={`/project/${encodeURIComponent(projectId)}/performance`} data-project-write="false">Performans Görevi</Link>
+        <div className="assessment-page__header-actions">
           <button type="button" data-project-write="false" className="button button--primary" onClick={openCreateMode} disabled={!activeAssignmentsExist} title={!activeAssignmentsExist ? "Sınav oluşturabilmek için önce Ders Alanı Kurulumunda bir ders–sınıf görevlendirmesi oluşturun." : undefined}><Plus size={17} /> Yeni sınav oluştur</button>
         </div>
       </header>
@@ -399,7 +398,7 @@ export function AssessmentOrganizationPage() {
           <input aria-label="Sınav ara" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Ara…" />
           {courseOptions.length > 1 && <select aria-label="Ders filtresi" value={filterCourseId} onChange={(event) => setFilterCourseId(event.target.value)}><option value="">Ders</option>{courseOptions.map((option) => <option key={option.key} value={option.id}>{option.name}</option>)}</select>}
           <select aria-label="Dönem filtresi" value={filterTerm} onChange={(event) => setFilterTerm(event.target.value)}><option value="">Dönem</option><option value="1">1. Dönem</option><option value="2">2. Dönem</option></select>
-          <select aria-label="Tür filtresi" value={filterAssessmentType} onChange={(event) => toggleFilterType(event.target.value as AssessmentType | '')}><option value="">Tür</option><option value="written">Yazılı</option><option value="listening">Dinleme</option><option value="speaking">Konuşma</option><option value="performance">Performans</option></select>
+          <select aria-label="Tür filtresi" value={filterAssessmentType} onChange={(event) => toggleFilterType(event.target.value as AssessmentType | '')}><option value="">Tür</option><option value="written">Yazılı</option><option value="listening">Dinleme</option><option value="speaking">Konuşma</option></select>
           <button type="button" data-project-write="false" className="filter-more-button" aria-expanded={showOtherFilters} onClick={() => setShowOtherFilters((current) => !current)}>Diğer filtreler <ChevronDown size={15} /></button>
           {showOtherFilters && <><select aria-label="Sınıf düzeyi filtresi" value={filterGradeLevel} onChange={(event) => setFilterGradeLevel(event.target.value)}><option value="">Sınıf düzeyi</option>{[9, 10, 11, 12].map((grade) => <option key={grade} value={grade}>{grade}. sınıf</option>)}</select><select aria-label="Durum filtresi" value={filterStatus} onChange={(event) => setFilterStatus(event.target.value as AssessmentStatus | '')}><option value="">Durum</option><option value="draft">Taslak</option><option value="scheduled">Planlandı</option><option value="active">Aktif</option><option value="completed">Tamamlandı</option><option value="archived">Arşivlendi</option></select></>}
           {(search || filterCourseId || filterTerm || filterAssessmentType || filterStatus || filterGradeLevel) && <button type="button" data-project-write="false" className="filter-clear-button" onClick={clearFilters}>Tüm filtreleri temizle</button>}
@@ -407,16 +406,11 @@ export function AssessmentOrganizationPage() {
         {filteredActivities.length === 0 ? (
           <div className="assessment-empty-state">
             <strong>Henüz sınav oluşturulmadı</strong>
-            <span>{activeAssignmentsExist ? "Yazılı, dinleme veya konuşma sınavı oluşturabilir, aynı sınavı birden fazla sınıfa uygulayabilir veya tema ve rubrik tabanlı performans görevi hazırlayabilirsiniz." : "Sınav oluşturabilmek için önce Ders Alanı Kurulumunda bir ders–sınıf görevlendirmesi oluşturun."}</span>
+            <span>{activeAssignmentsExist ? "Yazılı, dinleme veya konuşma sınavı oluşturabilir ve aynı sınavı birden fazla sınıfa uygulayabilirsiniz." : "Sınav oluşturabilmek için önce Ders Alanı Kurulumunda bir ders–sınıf görevlendirmesi oluşturun."}</span>
             {activeAssignmentsExist ? (
-              <>
-                <button type="button" data-project-write="false" className="button button--primary" onClick={openCreateMode}>
+              <button type="button" data-project-write="false" className="button button--primary" onClick={openCreateMode}>
                   + Yeni sınav oluştur
                 </button>
-                <Link className="button button--secondary" to={`/project/${encodeURIComponent(projectId)}/performance`}>
-                  Performans görevi oluştur
-                </Link>
-              </>
             ) : (
               <Link className="button button--primary" to={`/project/${encodeURIComponent(projectId)}/classes`}>
                 Kurulumu tamamla
@@ -430,13 +424,12 @@ export function AssessmentOrganizationPage() {
               return <article key={activity.id} className="assessment-card">
                 <div className="assessment-card__heading"><div><h3>{activity.title || `${activity.term}. Dönem ${activity.sequenceNumber}. ${assessmentTypeLabels[activity.assessmentType]}`}</h3><span>{activity.courseName} · {activity.gradeLevel}. sınıf</span></div><span className="assessment-card__status">{activity.status === 'draft' ? 'Taslak' : activity.status === 'completed' ? 'Tamamlandı' : 'Planlandı'}</span></div>
                 {activity.assessmentType === 'speaking' && activity.speakingConfiguration && <p className="assessment-card__meta">{activity.speakingConfiguration.speakingType === 'prepared' ? 'Hazırlıklı' : 'Hazırlıksız'} · {formatDurationRange(activity.speakingConfiguration.minDurationSeconds, activity.speakingConfiguration.maxDurationSeconds)}</p>}
-                {activity.assessmentType === 'performance' && activity.performanceDetails && <p className="assessment-card__meta">Tema: {activity.performanceDetails.theme || '—'}</p>}
                 <p className="assessment-card__meta">{applications.length} sınıf · {applications.reduce((total, application) => total + application.studentScopeIds.length, 0)} öğrenci</p>
                 <div className="assessment-card__applications">{applications.length === 0 ? <p className="assessment-card__empty-application">Bu sınava bağlı aktif sınıf uygulaması yok.</p> : applications.map((application) => <div key={application.id}><span>{classesById.get(application.schoolClassId) ? classLabel(classesById.get(application.schoolClassId)!) : 'Sınıf bilgisi yok'}</span><small>{applicationProgress(activity, application.id)}</small>{application.status !== 'archived' && <button type="button" data-project-write="true" className="icon-button" aria-label="Sınıf uygulamasını arşivle" onClick={() => archiveMutation.mutate({ activityId: activity.id, applicationId: application.id })}><Archive size={15} /></button>}</div>)}</div>
                 <div className="assessment-card__actions">{(() => {
                   const nextStep = resolveNextExamStep(activity, projectQuery.data?.workflow);
                   return <Link className="button button--secondary" to={`/project/${encodeURIComponent(projectId)}/activities/${encodeURIComponent(activity.id)}/${nextStep.id}`}>Devam et</Link>;
-                })()}{activity.assessmentType === 'performance' ? <Link className="button button--secondary" to={`/project/${encodeURIComponent(projectId)}/performance/${encodeURIComponent(activity.id)}`}>Görevi düzenle</Link> : <button type="button" data-project-write="false" className="button button--secondary" onClick={() => openEditMode(activity)}>Düzenle</button>}</div>
+                })()}<button type="button" data-project-write="false" className="button button--secondary" onClick={() => openEditMode(activity)}>Düzenle</button></div>
               </article>;
             })}
           </div>

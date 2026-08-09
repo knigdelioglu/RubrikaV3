@@ -11,12 +11,7 @@ import {
   FileText,
   Volume2,
 } from 'lucide-react';
-import type {
-  AssessmentActivity,
-  PerformanceStatus,
-  SchoolClass,
-  WorkflowSnapshot,
-} from '../../api/types';
+import type { AssessmentActivity, SchoolClass, WorkflowSnapshot } from '../../api/types';
 import {
   deriveExamStepStatuses,
   getCanonicalWorkspaceStepPath,
@@ -29,7 +24,6 @@ type CanonicalExamWorkspaceHeaderProps = {
   projectId: string;
   activity: AssessmentActivity;
   workflowSnapshot?: WorkflowSnapshot | null;
-  performanceStatus?: PerformanceStatus | null;
   classesById: Map<string, SchoolClass>;
   activeStepId: string;
   selectedClassApplicationId: string;
@@ -65,7 +59,6 @@ export function CanonicalExamWorkspaceHeader({
   projectId,
   activity,
   workflowSnapshot,
-  performanceStatus,
   classesById,
   activeStepId,
   selectedClassApplicationId,
@@ -79,7 +72,6 @@ export function CanonicalExamWorkspaceHeader({
     activity,
     workflowSnapshot,
     selectedClassApplicationId,
-    performanceStatus,
   );
 
   const applications = activity.classApplications.filter(

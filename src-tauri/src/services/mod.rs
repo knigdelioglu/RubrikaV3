@@ -22,8 +22,6 @@ pub mod ocr_image_preprocess_service;
 pub mod page_window_service;
 pub mod pdf_preview_service;
 pub mod pdf_service;
-pub mod performance_dtos;
-pub mod performance_service;
 pub mod project_store;
 pub mod prompt_contract;
 pub mod question_text_service;

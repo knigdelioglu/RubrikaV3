@@ -458,9 +458,7 @@ impl AuditService {
                     record.operation
                 ));
             }
-            let (Some(record_previous), Some(record_next)) =
-                (record.previous_revision, record.next_revision)
-            else {
+            let Some(record_next) = record.next_revision else {
                 continue;
             };
             if !seen_revisions.insert(record_next) {
@@ -469,23 +467,27 @@ impl AuditService {
                     .reasons
                     .push(format!("duplicate audit revision: {record_next}"));
             }
-            if previous.is_some_and(|value| value != record_previous)
-                || record_next != record_previous.saturating_add(1)
-            {
-                report.project_revision_divergence_count += 1;
-                report.reasons.push(format!(
-                    "audit revision transition mismatch: {} {} -> {}",
-                    record.operation, record_previous, record_next
-                ));
-            }
-            if let Some(last) = previous {
-                if record_previous > last.saturating_add(1) {
-                    report.missing_revision_count = report
-                        .missing_revision_count
-                        .saturating_add(record_previous - last - 1);
+            if record_next == 0 {
+                previous = Some(0);
+            } else if let Some(record_previous) = record.previous_revision {
+                if previous.is_some_and(|value| value != record_previous)
+                    || record_next != record_previous.saturating_add(1)
+                {
+                    report.project_revision_divergence_count += 1;
+                    report.reasons.push(format!(
+                        "audit revision transition mismatch: {} {} -> {}",
+                        record.operation, record_previous, record_next
+                    ));
                 }
+                if let Some(last) = previous {
+                    if record_previous > last.saturating_add(1) {
+                        report.missing_revision_count = report
+                            .missing_revision_count
+                            .saturating_add(record_previous - last - 1);
+                    }
+                }
+                previous = Some(record_next);
             }
-            previous = Some(record_next);
         }
         if let Some(last) = previous {
             if last != project.storage_revision {
@@ -1194,24 +1196,17 @@ mod tests {
             )
             .expect("project fixture");
         let service = AuditService::new();
-        service
-            .append_transactionally(
-                Path::new(&project.root_path),
-                AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.")
-                    .project(&project.id),
-                None,
-                Some(0),
-            )
-            .expect("initial audit");
         store
-            .update_course_info(
-                project.id.clone(),
-                "2026-2027".to_string(),
-                "tde".to_string(),
-                "Türk Dili ve Edebiyatı".to_string(),
-                None,
+            .mutate(
+                &project.id,
+                crate::services::project_store::MutationOptions::new("legacy_unpaired")
+                    .skip_audit(),
+                |current, _| {
+                    current.course_id = Some("tde".to_string());
+                    Ok(())
+                },
             )
-            .expect("first mutation");
+            .expect("first mutation without audit");
         drop(store);
 
         service
@@ -1241,15 +1236,6 @@ mod tests {
             )
             .expect("project fixture");
         let service = AuditService::new();
-        service
-            .append_transactionally(
-                Path::new(&project.root_path),
-                AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.")
-                    .project(&project.id),
-                None,
-                Some(0),
-            )
-            .expect("initial audit");
         store
             .update_course_info(
                 project.id.clone(),
@@ -1259,22 +1245,15 @@ mod tests {
                 None,
             )
             .expect("first mutation");
-        service
-            .append_transactionally(
-                Path::new(&project.root_path),
-                AuditEntryInput::new("course_info_updated", "Ders bilgileri güncellendi.")
-                    .project(&project.id),
-                Some(0),
-                Some(1),
-            )
-            .expect("first mutation audit");
         store
-            .update_course_info(
-                project.id.clone(),
-                "2026-2027".to_string(),
-                "tde".to_string(),
-                "Türk Dili ve Edebiyatı (güncel)".to_string(),
-                None,
+            .mutate(
+                &project.id,
+                crate::services::project_store::MutationOptions::new("legacy_unpaired_latest")
+                    .skip_audit(),
+                |current, _| {
+                    current.course_name = Some("Türk Dili ve Edebiyatı (güncel)".to_string());
+                    Ok(())
+                },
             )
             .expect("missing-audit mutation");
         drop(store);

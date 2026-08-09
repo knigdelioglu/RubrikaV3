@@ -66,12 +66,7 @@ impl ScoringAnchorService {
         let correlation_id = Uuid::new_v4().to_string();
         let output = self.project_store.mutate(
             project_id,
-            MutationOptions {
-                expected_revision: None,
-                expected_fingerprint: None,
-                operation: ANCHOR_CREATE_OPERATION.to_string(),
-                correlation_id: correlation_id.clone(),
-            },
+            MutationOptions::new(ANCHOR_CREATE_OPERATION).correlation(correlation_id.clone()),
             |project, _context| {
                 let anchor = build_anchor(project, source_record_id)?;
                 if project.scoring_anchors.iter().any(|existing| {
@@ -120,12 +115,7 @@ impl ScoringAnchorService {
             .filter(|value| !value.is_empty());
         let output = self.project_store.mutate(
             project_id,
-            MutationOptions {
-                expected_revision: None,
-                expected_fingerprint: None,
-                operation: ANCHOR_REVOKE_OPERATION.to_string(),
-                correlation_id: correlation_id.clone(),
-            },
+            MutationOptions::new(ANCHOR_REVOKE_OPERATION).correlation(correlation_id.clone()),
             |project, _context| {
                 let anchor = project
                     .scoring_anchors
@@ -199,15 +189,13 @@ impl ScoringAnchorService {
             "reason": reason,
             "details": metadata,
         });
-        self.audit_service.append_transactionally(
+        self.audit_service.append(
             Path::new(&project.root_path),
             AuditEntryInput::new(operation, summary)
                 .project(&project.id)
                 .entity("scoring_anchor", &anchor.id)
                 .correlation(correlation_id)
                 .metadata(safe_metadata),
-            project.storage_revision.checked_sub(1),
-            Some(project.storage_revision),
         )?;
         Ok(())
     }

@@ -1,8 +1,7 @@
-import type { PerformanceAssessment, PerformanceDetails } from './types.performance';
 import type { SpeakingAttempt, SpeakingConfigurationSnapshot } from './types.speaking';
 
-export type AssessmentType = 'written' | 'listening' | 'speaking' | 'performance';
-export type WorkflowFamily = 'written' | 'speaking' | 'performance';
+export type AssessmentType = 'written' | 'listening' | 'speaking' | 'legacy_performance';
+export type WorkflowFamily = 'written' | 'speaking' | 'legacy_performance';
 export type AssessmentStatus = 'draft' | 'scheduled' | 'active' | 'completed' | 'archived';
 export type ClassApplicationStatus = 'scheduled' | 'active' | 'completed' | 'archived';
 
@@ -25,7 +24,6 @@ export type ClassApplication = {
   documentIds: string[];
   studentScopeIds: string[];
   speakingAttempts: SpeakingAttempt[];
-  performanceAssessments?: PerformanceAssessment[];
   createdAt: string;
   updatedAt: string;
 };
@@ -47,7 +45,6 @@ export type AssessmentActivity = {
   commonDocumentIds: string[];
   listeningDetails?: ListeningDetails | null;
   speakingConfiguration?: SpeakingConfigurationSnapshot | null;
-  performanceDetails?: PerformanceDetails | null;
   classApplications: AssessmentClassApplication[];
   createdAt: string;
   updatedAt: string;

@@ -1,4 +1,4 @@
-import { ClipboardCheck, FileText, Headphones, Mic2 } from 'lucide-react';
+import { FileText, Headphones, Mic2 } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { getAssessmentMode, getAssessmentModePath, type AssessmentMode } from '../../app/assessmentMode';
 import { useProjectContext } from '../../state/useProjectContext';
@@ -47,17 +47,6 @@ export function AssessmentModeSelector() {
       >
         <Mic2 size={15} aria-hidden="true" />
         Konuşma Sınavı
-      </button>
-      <button
-        type="button"
-        data-project-write="false"
-        className={activeMode === 'performance' ? 'is-active' : ''}
-        role="radio"
-        aria-checked={activeMode === 'performance'}
-        onClick={() => selectMode('performance')}
-      >
-        <ClipboardCheck size={15} aria-hidden="true" />
-        Performans Görevi
       </button>
     </div>
   );

@@ -22,7 +22,7 @@ export function useProjectContext(): ProjectContextSnapshot {
 
   const directProjectId = routeProjectId || queryProjectId || lastProjectId;
   const projectPathCandidate = queryProjectPath || lastProjectPath;
-  const needsLookup = !directProjectId && !!projectPathCandidate;
+  const needsLookup = (!directProjectId && !!projectPathCandidate) || (!!directProjectId && !projectPathCandidate);
 
   const { data: projectsResult, isLoading: projectsLoading } = useQuery({
     queryKey: ['projects'],

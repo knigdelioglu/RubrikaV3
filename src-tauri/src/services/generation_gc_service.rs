@@ -155,26 +155,20 @@ pub fn run_generation_gc_transaction(
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    let mut options = MutationOptions::new("generation_gc_metadata");
+    options.expected_revision = Some(plan.source_revision);
+    options.expected_fingerprint = Some(plan.source_fingerprint.clone());
     let committed = project_store
-        .mutate(
-            &project_id_owned,
-            MutationOptions {
-                expected_revision: Some(plan.source_revision),
-                expected_fingerprint: Some(plan.source_fingerprint.clone()),
-                operation: "generation_gc_metadata".to_string(),
-                correlation_id: uuid::Uuid::new_v4().to_string(),
-            },
-            move |current, _context| {
-                let current_safe = ocr_cleanup_plan(current)
-                    .into_iter()
-                    .filter(|id| candidate_ids.contains(id))
-                    .collect::<HashSet<_>>();
-                current
-                    .student_answer_ocr_generations
-                    .retain(|generation| !current_safe.contains(&generation.generation_id));
-                Ok(current_safe.into_iter().collect::<Vec<_>>())
-            },
-        )?
+        .mutate(&project_id_owned, options, move |current, _context| {
+            let current_safe = ocr_cleanup_plan(current)
+                .into_iter()
+                .filter(|id| candidate_ids.contains(id))
+                .collect::<HashSet<_>>();
+            current
+                .student_answer_ocr_generations
+                .retain(|generation| !current_safe.contains(&generation.generation_id));
+            Ok(current_safe.into_iter().collect::<Vec<_>>())
+        })?
         .result;
 
     let latest = project_store.get_project_snapshot_with_metadata(project_id)?;

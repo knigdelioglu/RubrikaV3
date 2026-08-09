@@ -1,6 +1,5 @@
 use crate::domain::errors::AppError;
 use crate::domain::project::Project;
-use crate::services::audit_service::AuditEntryInput;
 use crate::services::project_store::{ListProjectsOutput, ProjectOpenMode};
 use crate::AppState;
 use tauri::State;
@@ -65,12 +64,6 @@ pub async fn create_project(
         input.academic_year_id,
         input.course_id,
         input.course_name,
-    )?;
-    state.audit_service.append_transactionally(
-        std::path::Path::new(&project.root_path),
-        AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.").project(&project.id),
-        None,
-        Some(project.storage_revision),
     )?;
     Ok(CreateProjectOutput {
         project_path: project.root_path.clone(),

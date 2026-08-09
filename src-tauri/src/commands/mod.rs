@@ -10,7 +10,6 @@ pub mod graded_exam_review_commands;
 pub mod job_commands;
 pub mod model_commands;
 pub mod pdf_commands;
-pub mod performance_commands;
 pub mod project_commands;
 pub mod question_text_commands;
 pub mod rubric_commands;
@@ -38,17 +37,8 @@ pub(crate) fn audit_critical(
     let project = state
         .project_store
         .get_project_snapshot(project_id.to_string())?;
-    let input = input.project(project_id).revisions(
-        project.storage_revision.checked_sub(1),
-        Some(project.storage_revision),
-    );
     state
         .audit_service
-        .append_transactionally(
-            Path::new(&project.root_path),
-            input,
-            project.storage_revision.checked_sub(1),
-            Some(project.storage_revision),
-        )
+        .append(Path::new(&project.root_path), input.project(project_id))
         .map(|_| ())
 }

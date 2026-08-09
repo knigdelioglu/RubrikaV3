@@ -16,6 +16,7 @@ use crate::domain::school_class::normalize_school_class_name;
 use crate::domain::workflow::{WorkflowSnapshot, WorkflowStage};
 use crate::platform::project_paths::TrustedProjectRoot;
 use crate::platform::project_write_lease::{acquire_or_share, ProjectWriteLease};
+use crate::services::audit_service::{AuditEntryInput, AuditService};
 use crate::services::transaction_journal;
 use crate::services::workflow_engine;
 use serde_json::{Map, Value};
@@ -88,22 +89,71 @@ pub struct MutationOptions {
     pub expected_fingerprint: Option<String>,
     pub operation: String,
     pub correlation_id: String,
+    pub safe_summary: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub skip_audit: bool,
+}
+
+impl Default for MutationOptions {
+    fn default() -> Self {
+        Self {
+            expected_revision: None,
+            expected_fingerprint: None,
+            operation: "unspecified_mutation".to_string(),
+            correlation_id: Uuid::new_v4().to_string(),
+            safe_summary: None,
+            entity_type: None,
+            entity_id: None,
+            metadata: None,
+            skip_audit: false,
+        }
+    }
 }
 
 impl MutationOptions {
     pub fn new(operation: impl Into<String>) -> Self {
+        let op_str = operation.into();
+        let skip_audit = op_str == "unpaired_project_change";
         Self {
             expected_revision: None,
             expected_fingerprint: None,
-            operation: operation.into(),
+            operation: op_str,
             correlation_id: Uuid::new_v4().to_string(),
+            safe_summary: None,
+            entity_type: None,
+            entity_id: None,
+            metadata: None,
+            skip_audit,
         }
+    }
+
+    pub fn skip_audit(mut self) -> Self {
+        self.skip_audit = true;
+        self
     }
 
     /// Komut katmanının ürettiği correlation_id'yi mutation'a akıtır (TD-25).
     /// Servisler kendi id'sini üretmez; komut zincirinden gelen id'yi taşır.
     pub fn correlation(mut self, correlation_id: impl Into<String>) -> Self {
         self.correlation_id = correlation_id.into();
+        self
+    }
+
+    pub fn summary(mut self, safe_summary: impl Into<String>) -> Self {
+        self.safe_summary = Some(safe_summary.into());
+        self
+    }
+
+    pub fn entity(mut self, entity_type: impl Into<String>, entity_id: impl Into<String>) -> Self {
+        self.entity_type = Some(entity_type.into());
+        self.entity_id = Some(entity_id.into());
+        self
+    }
+
+    pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
         self
     }
 }
@@ -159,6 +209,7 @@ pub struct ProjectStore {
     mutation_conflict_count: Arc<AtomicU64>,
     external_modification_detected: Arc<AtomicBool>,
     legacy_project_without_revision: Arc<AtomicBool>,
+    audit_service: Arc<AuditService>,
 }
 
 impl Default for ProjectStore {
@@ -179,7 +230,13 @@ impl ProjectStore {
             mutation_conflict_count: Arc::new(AtomicU64::new(0)),
             external_modification_detected: Arc::new(AtomicBool::new(false)),
             legacy_project_without_revision: Arc::new(AtomicBool::new(false)),
+            audit_service: Arc::new(AuditService::new()),
         }
+    }
+
+    pub fn with_audit_service(mut self, audit_service: Arc<AuditService>) -> Self {
+        self.audit_service = audit_service;
+        self
     }
 
     pub fn create_project(&self, name: String, root_path: String) -> Result<Project, AppError> {
@@ -216,6 +273,7 @@ impl ProjectStore {
                 expected_fingerprint: None,
                 operation: "update_course_info".to_string(),
                 correlation_id: Uuid::new_v4().to_string(),
+                ..Default::default()
             },
             move |project, _context| {
                 project.academic_year_id = Some(academic_year_id);
@@ -398,6 +456,40 @@ impl ProjectStore {
             }
             return Err(error);
         }
+
+        let creation_correlation_id = Uuid::new_v4().to_string();
+        let transaction = transaction_journal::begin(
+            trusted_root.root(),
+            &project.id,
+            "project_created",
+            &creation_correlation_id,
+            None,
+            Some(project.storage_revision),
+        )?;
+
+        let mut audit_input = AuditEntryInput::new("project_created", "Yeni proje oluşturuldu.")
+            .project(&project.id)
+            .revisions(None, Some(project.storage_revision))
+            .correlation(&creation_correlation_id);
+        audit_input.transaction_id = Some(transaction.transaction_id.clone());
+
+        if let Err(error) = self.audit_service.append(trusted_root.root(), audit_input) {
+            let _ = transaction_journal::update(
+                trusted_root.root(),
+                &transaction.transaction_id,
+                "audit_missing",
+            );
+            if root_was_created {
+                let _ = std::fs::remove_dir_all(&root);
+            }
+            return Err(error);
+        }
+
+        let _ = transaction_journal::update(
+            trusted_root.root(),
+            &transaction.transaction_id,
+            "complete",
+        );
 
         self.set_trusted_root(trusted_root.clone())?;
         self.set_session_project(project.clone(), fingerprint(&content))?;
@@ -831,17 +923,17 @@ impl ProjectStore {
             current_revision: project.storage_revision,
             current_fingerprint: current.content_fingerprint.clone(),
             trusted_root: trusted_root.clone(),
-            operation: options.operation,
+            operation: options.operation.clone(),
             correlation_id: options.correlation_id.clone(),
         };
         let result = match mutation(&mut project, &context) {
             Ok(result) => result,
             Err(error) => {
-                transaction_journal::update(
+                let _ = transaction_journal::update(
                     trusted_root.root(),
                     &transaction.transaction_id,
                     "aborted",
-                )?;
+                );
                 return Err(error);
             }
         };
@@ -858,7 +950,58 @@ impl ProjectStore {
                 Some(error.to_string()),
             )
         })?;
-        trusted_root.atomic_write(&trusted_root.managed("project.json")?, &content)?;
+
+        if let Err(error) =
+            trusted_root.atomic_write(&trusted_root.managed("project.json")?, &content)
+        {
+            let _ = transaction_journal::update(
+                trusted_root.root(),
+                &transaction.transaction_id,
+                "project_write_failed",
+            );
+            return Err(error);
+        }
+
+        if !options.skip_audit {
+            let default_summary = format!("Kanonik proje mutasyonu: {}", options.operation);
+            let summary_text = options.safe_summary.as_deref().unwrap_or(&default_summary);
+
+            let mut audit_input = AuditEntryInput::new(&options.operation, summary_text)
+                .project(project_id)
+                .correlation(&options.correlation_id)
+                .revisions(Some(current.revision), Some(next_revision));
+
+            if let (Some(et), Some(ei)) = (&options.entity_type, &options.entity_id) {
+                audit_input = audit_input.entity(et, ei);
+            }
+            if let Some(meta) = options.metadata.clone() {
+                audit_input = audit_input.metadata(meta);
+            }
+            audit_input.transaction_id = Some(transaction.transaction_id.clone());
+
+            if let Err(error) = self.audit_service.append(trusted_root.root(), audit_input) {
+                let _ = transaction_journal::update(
+                    trusted_root.root(),
+                    &transaction.transaction_id,
+                    "audit_missing",
+                );
+                return Err(AppError {
+                    code: AppErrorCode::AuditWriteFailed,
+                    message: "Proje mutasyonu kaydedildi fakat denetim kaydı yazılamadı."
+                        .to_string(),
+                    recoverable: true,
+                    suggested_action: Some(
+                        "İşlemi yeniden deneyin veya proje tanılamasını çalıştırın.".to_string(),
+                    ),
+                    technical_details: Some(format!(
+                        "central audit append failed: {}",
+                        error.message
+                    )),
+                    correlation_id: options.correlation_id.clone(),
+                });
+            }
+        }
+
         transaction_journal::update(trusted_root.root(), &transaction.transaction_id, "complete")?;
         let new_fingerprint = fingerprint(&content);
         self.set_session_project(project.clone(), new_fingerprint.clone())?;
@@ -972,6 +1115,7 @@ impl ProjectStore {
                 expected_fingerprint: expected_fingerprint.filter(|value| !value.is_empty()),
                 operation: "test_fixture_replace".to_string(),
                 correlation_id: Uuid::new_v4().to_string(),
+                ..Default::default()
             },
             move |current, _| {
                 *current = candidate;
@@ -2001,7 +2145,7 @@ fn normalize_assessment_organization(
                 .to_string();
             let workflow_family = match assessment_type.as_str() {
                 "speaking" => "speaking",
-                "performance" => "performance",
+                "performance" | "legacy_performance" => "legacy_performance",
                 _ => "written",
             };
             if activity.get("workflowFamily").and_then(Value::as_str) != Some(workflow_family) {
@@ -2013,10 +2157,6 @@ fn normalize_assessment_organization(
             }
             if activity.get("title").is_none() {
                 activity.insert("title".to_string(), Value::String(String::new()));
-                changed = true;
-            }
-            if assessment_type == "performance" && activity.get("performanceDetails").is_none() {
-                activity.insert("performanceDetails".to_string(), Value::Object(Map::new()));
                 changed = true;
             }
             if let Some(applications) = activity
@@ -2039,13 +2179,6 @@ fn normalize_assessment_organization(
                     }
                     if application.get("speakingAttempts").is_none() {
                         application.insert("speakingAttempts".to_string(), Value::Array(vec![]));
-                        changed = true;
-                    }
-                    if assessment_type == "performance"
-                        && application.get("performanceAssessments").is_none()
-                    {
-                        application
-                            .insert("performanceAssessments".to_string(), Value::Array(vec![]));
                         changed = true;
                     }
                 }
@@ -3432,7 +3565,6 @@ mod tests {
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: Some(speaking_configuration(task_text)),
-            performance_details: None,
             class_applications,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -3455,7 +3587,6 @@ mod tests {
             document_ids: vec![],
             student_scope_ids: vec![],
             speaking_attempts: vec![],
-            performance_assessments: vec![],
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -4714,7 +4845,6 @@ mod tests {
                             common_document_ids: vec![],
                             listening_details: None,
                             speaking_configuration: None,
-                            performance_details: None,
                             class_applications: vec![],
                             created_at: "now".to_string(),
                             updated_at: "now".to_string(),
@@ -4787,7 +4917,6 @@ mod tests {
                 common_document_ids: vec![],
                 listening_details: None,
                 speaking_configuration: None,
-                performance_details: None,
                 class_applications: vec![],
                 created_at: "now".to_string(),
                 updated_at: "now".to_string(),
@@ -4865,6 +4994,7 @@ mod tests {
                     expected_fingerprint: None,
                     operation: "first".to_string(),
                     correlation_id: "first".to_string(),
+                    ..Default::default()
                 },
                 |project, _| {
                     project.name = "first".to_string();
@@ -4881,6 +5011,7 @@ mod tests {
                     expected_fingerprint: None,
                     operation: "stale".to_string(),
                     correlation_id: "stale".to_string(),
+                    ..Default::default()
                 },
                 |project, _| {
                     project.name = "stale overwrite".to_string();
@@ -4923,6 +5054,7 @@ mod tests {
                     expected_fingerprint: Some(snapshot.content_fingerprint),
                     operation: "after_external_change".to_string(),
                     correlation_id: "external".to_string(),
+                    ..Default::default()
                 },
                 |project, _| {
                     project.course_name = Some("must not overwrite".to_string());
@@ -5135,7 +5267,6 @@ mod tests {
                                     common_document_ids: vec![],
                                     listening_details: None,
                                     speaking_configuration: None,
-                                    performance_details: None,
                                     class_applications: vec![],
                                     created_at: "now".to_string(),
                                     updated_at: "now".to_string(),
@@ -5457,7 +5588,7 @@ mod tests {
     }
 
     #[test]
-    fn performance_activity_legacy_json_opens_with_defaults_idempotently() {
+    fn legacy_performance_activity_opens_without_crashing() {
         let root = temp_root();
         let mut project = sample_project(&root, "Performance legacy", "2026-01-01T00:00:00Z");
         project.school_classes.push(SchoolClass {
@@ -5482,29 +5613,35 @@ mod tests {
             title: "1. Performans".to_string(),
             grade_level: 9,
             term: 1,
-            assessment_type: AssessmentType::Performance,
-            workflow_family: WorkflowFamily::Performance,
+            assessment_type: AssessmentType::LegacyPerformance,
+            workflow_family: WorkflowFamily::LegacyPerformance,
             sequence_number: 1,
             status: AssessmentStatus::Draft,
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: None,
-            performance_details: Some(crate::domain::performance::PerformanceDetails::default()),
             class_applications: vec![class_application("perf-1", "app-perf", "class-9-a")],
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         });
         let mut value = serde_json::to_value(&project).unwrap();
         let activity = value["assessmentActivities"][0].as_object_mut().unwrap();
-        activity.remove("performanceDetails");
+        activity.insert(
+            "assessmentType".to_string(),
+            Value::String("performance".to_string()),
+        );
         activity.insert(
             "workflowFamily".to_string(),
-            Value::String("written".to_string()),
+            Value::String("performance".to_string()),
+        );
+        activity.insert(
+            "performanceDetails".to_string(),
+            serde_json::json!({ "theme": "Eski tema" }),
         );
         activity["classApplications"][0]
             .as_object_mut()
             .unwrap()
-            .remove("performanceAssessments");
+            .insert("performanceAssessments".to_string(), Value::Array(vec![]));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("project.json"),
@@ -5517,16 +5654,12 @@ mod tests {
             .expect("legacy performance project must remain loadable");
         assert_eq!(
             first.assessment_activities[0].assessment_type,
-            AssessmentType::Performance
+            AssessmentType::LegacyPerformance
         );
         assert_eq!(
             first.assessment_activities[0].workflow_family,
-            WorkflowFamily::Performance
+            WorkflowFamily::LegacyPerformance
         );
-        assert!(first.assessment_activities[0].performance_details.is_some());
-        assert!(first.assessment_activities[0].class_applications[0]
-            .performance_assessments
-            .is_empty());
         assert!(warnings.iter().any(|warning| warning.contains("backup")));
 
         let (second, _) = ProjectStore::new()
@@ -5535,21 +5668,14 @@ mod tests {
         assert_eq!(second.assessment_activities.len(), 1);
         assert_eq!(
             second.assessment_activities[0].workflow_family,
-            WorkflowFamily::Performance
+            WorkflowFamily::LegacyPerformance
         );
-        assert!(second.assessment_activities[0]
-            .performance_details
-            .is_some());
 
         let reopened = ProjectStore::open_project_at_path(&root).unwrap();
-        assert!(reopened.assessment_activities[0]
-            .performance_details
-            .is_some());
+        assert_eq!(reopened.assessment_activities.len(), 1);
         assert_eq!(
-            reopened.assessment_activities[0].class_applications[0]
-                .performance_assessments
-                .len(),
-            0
+            reopened.assessment_activities[0].assessment_type,
+            AssessmentType::LegacyPerformance
         );
     }
 
@@ -5569,7 +5695,6 @@ mod tests {
             common_document_ids: vec![],
             listening_details: None,
             speaking_configuration: None,
-            performance_details: None,
             class_applications: vec![class_application(id, &format!("app-{id}"), "class-9-a")],
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),

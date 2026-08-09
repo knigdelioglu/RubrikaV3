@@ -23,7 +23,6 @@ const ScoringPage = lazy(() => import('../pages/ScoringPage').then((module) => (
 const GradedExamReviewPage = lazy(() => import('../pages/GradedExamReviewPage').then((module) => ({ default: module.GradedExamReviewPage })));
 const SpeechExamPage = lazy(() => import('../pages/SpeechExamPage').then((module) => ({ default: module.SpeechExamPage })));
 const AnalysisPage = lazy(() => import('../pages/AnalysisPage').then((module) => ({ default: module.AnalysisPage })));
-const PerformanceOrganizationPage = lazy(() => import('../pages/PerformanceOrganizationPage').then((module) => ({ default: module.PerformanceOrganizationPage })));
 
 const CanonicalExamWorkspacePage = lazy(() => import('../pages/CanonicalExamWorkspacePage').then((module) => ({ default: module.CanonicalExamWorkspacePage })));
 
@@ -84,9 +83,6 @@ function AppRoutes() {
           <Route path="/project/:projectId/settings/diagnostics" element={<SettingsPage defaultTab="diagnostics" />} />
           <Route path="/project/:projectId/speaking" element={<SpeechExamPage />} />
           <Route path="/project/:projectId/speaking/analysis" element={<AnalysisPage kind="speaking" />} />
-          <Route path="/project/:projectId/performance" element={<PerformanceOrganizationPage />} />
-          <Route path="/project/:projectId/performance/new" element={<PerformanceOrganizationPage createOnly />} />
-          <Route path="/project/:projectId/performance/:performanceActivityId" element={<PerformanceOrganizationPage />} />
 
           {[
             '/documents',

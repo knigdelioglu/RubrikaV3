@@ -9,7 +9,6 @@ use crate::domain::assessment::{
     ClassApplication, ClassApplicationStatus, ListeningDetails, SpeakingConfigurationSnapshot,
 };
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::domain::performance::PerformanceDetails;
 use crate::domain::project::Project;
 use crate::domain::student::Student;
 use crate::services::project_store::ProjectStore;
@@ -78,8 +77,6 @@ pub struct CreateAssessmentActivityInput {
     pub speaking_configuration: Option<SpeakingConfigurationSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listening_details: Option<ListeningDetails>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance_details: Option<PerformanceDetails>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -233,7 +230,9 @@ impl AssessmentOrganizationService {
             .collect::<HashSet<_>>();
         let suggested_slots = match input.assessment_type {
             AssessmentType::Listening => vec![1],
-            AssessmentType::Written | AssessmentType::Speaking | AssessmentType::Performance => {
+            AssessmentType::Written
+            | AssessmentType::Speaking
+            | AssessmentType::LegacyPerformance => {
                 vec![1, 2]
             }
         };
@@ -362,7 +361,6 @@ impl AssessmentOrganizationService {
                     document_ids: vec![],
                     student_scope_ids,
                     speaking_attempts: vec![],
-                    performance_assessments: vec![],
                     created_at: now.clone(),
                     updated_at: now.clone(),
                 }
@@ -383,7 +381,6 @@ impl AssessmentOrganizationService {
             common_document_ids: vec![],
             listening_details: input.listening_details.clone(),
             speaking_configuration: input.speaking_configuration.clone(),
-            performance_details: input.performance_details.clone(),
             class_applications,
             created_at: now.clone(),
             updated_at: now,
@@ -604,7 +601,6 @@ impl AssessmentOrganizationService {
             document_ids: vec![],
             student_scope_ids,
             speaking_attempts: vec![],
-            performance_assessments: vec![],
             created_at: now.clone(),
             updated_at: now,
         };
@@ -699,8 +695,7 @@ impl AssessmentOrganizationService {
         let application = &activity.class_applications[application_index];
         let application_id = application.id.clone();
         let school_class_id = application.school_class_id.clone();
-        let has_attempts = !application.performance_assessments.is_empty()
-            || !application.speaking_attempts.is_empty()
+        let has_attempts = !application.speaking_attempts.is_empty()
             || project.speaking_exams.iter().any(|exam| {
                 exam.assessment_activity_id.as_deref() == Some(activity_id.as_str())
                     && exam.attempts.iter().any(|attempt| {
@@ -828,21 +823,12 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
         ));
     }
     match input.assessment_type {
-        AssessmentType::Performance => {
-            if input.performance_details.is_none() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görevi için görev ayrıntıları gereklidir.",
-                    "performance_details is missing.",
-                ));
-            }
-            if input.speaking_configuration.is_some() || input.listening_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görevinde konuşma/dinleme ayarları kullanılamaz.",
-                    "speaking/listening details supplied for performance activity.",
-                ));
-            }
+        AssessmentType::LegacyPerformance => {
+            return Err(activity_error(
+                AppErrorCode::AssessmentInvalidInput,
+                "Performans görevi özelliği kaldırıldı; yeni performans görevi oluşturulamaz.",
+                "legacy performance assessment type cannot be created.",
+            ));
         }
         AssessmentType::Speaking => {
             let Some(configuration) = input.speaking_configuration.as_ref() else {
@@ -868,13 +854,6 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
                     "invalid speaking configuration.",
                 ));
             }
-            if input.performance_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görev ayrıntıları yalnız performans görevinde kullanılabilir.",
-                    "performance_details supplied for non-performance activity.",
-                ));
-            }
         }
         AssessmentType::Written | AssessmentType::Listening => {
             if input.speaking_configuration.is_some() {
@@ -882,13 +861,6 @@ fn validate_create_input(input: &CreateAssessmentActivityInput) -> Result<(), Ap
                     AppErrorCode::AssessmentInvalidInput,
                     "Konuşma ayarları yalnız konuşma sınavında kullanılabilir.",
                     "speaking_configuration supplied for non-speaking activity.",
-                ));
-            }
-            if input.performance_details.is_some() {
-                return Err(activity_error(
-                    AppErrorCode::AssessmentInvalidInput,
-                    "Performans görev ayrıntıları yalnız performans görevinde kullanılabilir.",
-                    "performance_details supplied for non-performance activity.",
                 ));
             }
             if let Some(details) = input.listening_details.as_ref() {
@@ -935,7 +907,7 @@ impl AssessmentTypeLabel for AssessmentActivity {
             AssessmentType::Written => "written",
             AssessmentType::Listening => "listening",
             AssessmentType::Speaking => "speaking",
-            AssessmentType::Performance => "performance",
+            AssessmentType::LegacyPerformance => "legacy_performance",
         }
     }
 }
@@ -945,7 +917,6 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::domain::performance::{PerformanceAssessment, PerformanceAssessmentStatus};
     use crate::services::school_class_service::{
         CreateSchoolClassInput, CreateTeachingAssignmentInput, ListSchoolClassesInput,
     };
@@ -1011,7 +982,6 @@ mod tests {
                 school_class_ids: listed.iter().map(|item| item.id.clone()).collect(),
                 speaking_configuration: None,
                 listening_details: None,
-                performance_details: None,
             })
             .expect("activity should be created");
         assert_eq!(activity.class_applications.len(), 3);
@@ -1072,7 +1042,6 @@ mod tests {
                 }
             }),
             listening_details: None,
-            performance_details: None,
         };
         service
             .create_activity(input(AssessmentType::Written))
@@ -1154,7 +1123,6 @@ mod tests {
                     school_class_ids: vec![school_class.id.clone()],
                     speaking_configuration: None,
                     listening_details: None,
-                    performance_details: None,
                 })
                 .expect("activity should be created");
         }
@@ -1186,7 +1154,6 @@ mod tests {
             school_class_ids: vec!["class".into()],
             speaking_configuration: None,
             listening_details: None,
-            performance_details: None,
         };
         assert_eq!(
             validate_create_input(&input).unwrap_err().code,
@@ -1244,7 +1211,6 @@ mod tests {
                     rubric_snapshot: serde_json::json!({}),
                 }),
                 listening_details: None,
-                performance_details: None,
             })
             .expect("speaking activity should be created");
         let mut project = store
@@ -1279,79 +1245,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn class_application_with_performance_assessment_cannot_be_removed() {
-        let (store, project_id, classes) = temp_project();
-        let school_class = classes
-            .create_school_class(CreateSchoolClassInput {
-                project_id: project_id.clone(),
-                name: "11B".into(),
-                academic_year: Some("2026-2027".into()),
-                grade_level: Some(11),
-                section: Some("B".into()),
-                display_order: None,
-            })
-            .expect("class should be created");
-        classes
-            .create_teaching_assignment(CreateTeachingAssignmentInput {
-                project_id: project_id.clone(),
-                academic_year_id: "2026-2027".into(),
-                course_id: "tde".into(),
-                course_name: "Türk Dili ve Edebiyatı".into(),
-                class_section_id: school_class.id.clone(),
-                teacher_id: None,
-            })
-            .expect("assignment should be created");
-        let service = AssessmentOrganizationService::new(store.clone(), Arc::new(classes));
-        let activity = service
-            .create_activity(CreateAssessmentActivityInput {
-                project_id: project_id.clone(),
-                academic_year_id: "2026-2027".into(),
-                course_id: "tde".into(),
-                course_name: "Türk Dili ve Edebiyatı".into(),
-                title: "1. Performans Görevi".into(),
-                grade_level: 11,
-                term: 1,
-                assessment_type: AssessmentType::Performance,
-                sequence_number: 1,
-                school_class_ids: vec![school_class.id.clone()],
-                speaking_configuration: None,
-                listening_details: None,
-                performance_details: Some(PerformanceDetails::default()),
-            })
-            .expect("performance activity should be created");
-        let mut project = store
-            .get_project_snapshot(project_id.clone())
-            .expect("project should load");
-        project.assessment_activities[0].class_applications[0]
-            .performance_assessments
-            .push(PerformanceAssessment {
-                id: "performance-assessment-1".into(),
-                student_id: "student-1".into(),
-                rubric_id: "rubric-1".into(),
-                rubric_version: 1,
-                ratings: vec![],
-                provisional_total: 0,
-                feedback: None,
-                status: PerformanceAssessmentStatus::Approved,
-                assessed_at: None,
-                approved_at: Some("2026-01-01T00:00:00Z".into()),
-                created_at: "2026-01-01T00:00:00Z".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-            });
-        store.save_project(&project).expect("project should save");
-
-        let result = service.remove_class_application(ClassApplicationIdInput {
-            project_id,
-            activity_id: activity.id,
-            application_id: activity.class_applications[0].id.clone(),
-        });
-        assert_eq!(
-            result.unwrap_err().code,
-            AppErrorCode::AssessmentClassApplicationInUse
-        );
-    }
-
     fn written_activity_input(
         project_id: &str,
         class_id: &str,
@@ -1370,7 +1263,6 @@ mod tests {
             school_class_ids: vec![class_id.to_string()],
             speaking_configuration: None,
             listening_details: None,
-            performance_details: None,
         }
     }
 

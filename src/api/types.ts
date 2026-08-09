@@ -6,7 +6,6 @@ export type * from './types.gradedExam';
 export type * from './types.jobs';
 export type * from './types.model';
 export type * from './types.ocr';
-export type * from './types.performance';
 export type * from './types.project';
 export type * from './types.question';
 export type * from './types.rubric';

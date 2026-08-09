@@ -1,9 +1,4 @@
-import type {
-  AssessmentActivity,
-  AssessmentType,
-  PerformanceStatus,
-  WorkflowSnapshot,
-} from '../api/types';
+import type { AssessmentActivity, AssessmentType, WorkflowSnapshot } from '../api/types';
 
 export type ExamStepStatus =
   | 'not_started'
@@ -51,12 +46,6 @@ export const SPEAKING_EXAM_STEPS: ExamStepDefinition[] = [
   { id: 'results', index: 5, label: 'Sonuçlar', description: 'Konuşma performansı analizleri ve raporları' },
 ];
 
-export const PERFORMANCE_EXAM_STEPS: ExamStepDefinition[] = [
-  { id: 'task', index: 1, label: 'Görev ve Rubrik', description: 'Görev bilgileri, öğrenme çıktıları ve rubrik düzenleyici' },
-  { id: 'assessment', index: 2, label: 'Değerlendirme', description: 'Öğrenci başına ölçüt düzeyi seçimi, geçici toplam ve onay' },
-  { id: 'results', index: 3, label: 'Sonuçlar', description: 'Performans değerlendirme sonuçları ve durum özeti' },
-];
-
 export const EXAM_STEP_STATUS_LABELS: Record<ExamStepStatus, string> = {
   not_started: 'Başlamadı',
   ready: 'Hazır',
@@ -72,8 +61,6 @@ export function getExamStepDefinitions(type: AssessmentType): ExamStepDefinition
       return LISTENING_EXAM_STEPS;
     case 'speaking':
       return SPEAKING_EXAM_STEPS;
-    case 'performance':
-      return PERFORMANCE_EXAM_STEPS;
     case 'written':
     default:
       return WRITTEN_EXAM_STEPS;
@@ -84,14 +71,9 @@ export function deriveExamStepStatuses(
   activity: AssessmentActivity,
   workflowSnapshot?: WorkflowSnapshot | null,
   classApplicationId?: string | null,
-  performanceStatus?: PerformanceStatus | null,
 ): ExamStepState[] {
   const type = activity.assessmentType;
   const definitions = getExamStepDefinitions(type);
-
-  if (type === 'performance') {
-    return derivePerformanceStepStatuses(definitions, performanceStatus ?? null);
-  }
 
   if (type === 'speaking') {
     return deriveSpeakingStepStatuses(activity, definitions, classApplicationId);
@@ -395,87 +377,15 @@ function deriveSpeakingStepStatuses(
   });
 }
 
-const PERFORMANCE_FALLBACK_MESSAGE =
-  'Görev durumu yüklenemedi; rubrik yayınlanmadan bu adıma geçilemez.';
-
-function performanceFallback(definitions: ExamStepDefinition[]): ExamStepState[] {
-  return definitions.map((def) => ({
-    definition: def,
-    status: 'blocked',
-    statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
-    blockerMessage: PERFORMANCE_FALLBACK_MESSAGE,
-  }));
-}
-
-function derivePerformanceStepStatuses(
-  definitions: ExamStepDefinition[],
-  status: PerformanceStatus | null,
-): ExamStepState[] {
-  if (!status) {
-    return performanceFallback(definitions);
-  }
-  const { hasPublishedRubric, hasDraftRubric, hasTaskDetails, allApproved, approvedCount } = status;
-  const startedCount = status.inProgressCount + status.missingCount + status.notPerformedCount;
-
-  return definitions.map((def) => {
-    switch (def.id) {
-      case 'task': {
-        if (hasPublishedRubric) {
-          return { definition: def, status: 'completed', statusLabel: EXAM_STEP_STATUS_LABELS.completed };
-        }
-        if (hasTaskDetails || hasDraftRubric) {
-          return { definition: def, status: 'in_progress', statusLabel: EXAM_STEP_STATUS_LABELS.in_progress };
-        }
-        return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
-      }
-
-      case 'assessment': {
-        if (!hasPublishedRubric) {
-          return {
-            definition: def,
-            status: 'blocked',
-            statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
-            blockerMessage: 'Rubrik yayınlanmadan değerlendirme yapılamaz.',
-          };
-        }
-        if (allApproved) {
-          return { definition: def, status: 'completed', statusLabel: EXAM_STEP_STATUS_LABELS.completed };
-        }
-        if (startedCount > 0) {
-          return { definition: def, status: 'in_progress', statusLabel: EXAM_STEP_STATUS_LABELS.in_progress };
-        }
-        return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
-      }
-
-      case 'results': {
-        if (approvedCount > 0) {
-          return { definition: def, status: 'ready', statusLabel: EXAM_STEP_STATUS_LABELS.ready };
-        }
-        return {
-          definition: def,
-          status: 'blocked',
-          statusLabel: EXAM_STEP_STATUS_LABELS.blocked,
-          blockerMessage: 'Sonuçlar en az bir değerlendirme onaylandıktan sonra gösterilir.',
-        };
-      }
-
-      default:
-        return { definition: def, status: 'not_started', statusLabel: EXAM_STEP_STATUS_LABELS.not_started };
-    }
-  });
-}
-
 export function resolveNextExamStep(
   activity: AssessmentActivity,
   workflowSnapshot?: WorkflowSnapshot | null,
   classApplicationId?: string | null,
-  performanceStatus?: PerformanceStatus | null,
 ): ExamStepDefinition {
   const states = deriveExamStepStatuses(
     activity,
     workflowSnapshot,
     classApplicationId,
-    performanceStatus,
   );
 
   // 1. Prioritize step that needs review

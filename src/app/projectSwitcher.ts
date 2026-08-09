@@ -5,7 +5,7 @@ const compactAssessmentTypeLabels: Record<AssessmentType, string> = {
   written: 'Yazılı',
   listening: 'Dinleme',
   speaking: 'Konuşma',
-  performance: 'Performans',
+  legacy_performance: 'Performans',
 };
 
 type ProjectSwitcherActivity = Pick<AssessmentActivity, 'id' | 'term' | 'sequenceNumber' | 'assessmentType'>;

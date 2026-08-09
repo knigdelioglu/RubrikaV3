@@ -165,8 +165,38 @@ export function isAppError(e: unknown): e is AppError {
   return true;
 }
 
+export function createTeacherSafeAppError(
+  message: string,
+  recoveryAction?: string,
+  code: AppErrorCode = 'WORKFLOW_BLOCKED',
+): AppError {
+  return {
+    code,
+    safeMessage: message,
+    recoveryAction,
+    correlationId: crypto.randomUUID?.() || `client-${Date.now()}`,
+    retryable: false,
+    detailsAvailable: false,
+  };
+}
+
 export function normalizeAppError(e: unknown): AppError {
   if (isAppError(e)) return e;
+  if (e instanceof Error) {
+    const candidate = e as unknown as Record<string, unknown>;
+    const safeMessage =
+      typeof candidate.safeMessage === 'string'
+        ? candidate.safeMessage
+        : e.message || UNKNOWN_ERROR_SAFE_MESSAGE;
+    return {
+      code: 'UNKNOWN_ERROR',
+      safeMessage,
+      recoveryAction: undefined,
+      correlationId: crypto.randomUUID?.() || 'unknown',
+      retryable: false,
+      detailsAvailable: false,
+    };
+  }
   return {
     code: 'UNKNOWN_ERROR',
     safeMessage: UNKNOWN_ERROR_SAFE_MESSAGE,
