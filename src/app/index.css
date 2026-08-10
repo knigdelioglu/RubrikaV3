@@ -1446,3 +1446,30 @@ code { font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', mon
     flex: 1 1 calc(50% - 0.25rem);
   }
 }
+/* Tablet MVP connection screen */
+.mobile-mvp {
+  min-height: 100vh;
+  padding: clamp(1.25rem, 5vw, 4rem);
+  background: #f5f7fb;
+  color: #182230;
+}
+
+.mobile-mvp__header,
+.mobile-mvp__card {
+  width: min(100%, 42rem);
+  margin: 0 auto 1rem;
+}
+
+.mobile-mvp__header h1,
+.mobile-mvp__card h2 { margin: 0.25rem 0 0.5rem; }
+.mobile-mvp__header p { color: #5e6b7d; line-height: 1.5; }
+.mobile-mvp__eyebrow { color: #4666d6; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+.mobile-mvp__card { display: grid; gap: 0.85rem; padding: 1rem; border: 1px solid #dce2ec; border-radius: 1rem; background: white; box-shadow: 0 0.5rem 1.5rem rgba(26, 39, 61, 0.06); }
+.mobile-mvp__card label { display: grid; gap: 0.35rem; color: #435066; font-size: 0.9rem; font-weight: 650; }
+.mobile-mvp__card input { width: 100%; box-sizing: border-box; padding: 0.75rem; border: 1px solid #cbd4e2; border-radius: 0.55rem; font: inherit; }
+.mobile-mvp__section-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.mobile-mvp__project { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.85rem 0; border-top: 1px solid #edf0f5; }
+.mobile-mvp__project div { display: grid; gap: 0.2rem; }
+.mobile-mvp__project span, .mobile-mvp__project-id { color: #69778a; font-size: 0.82rem; }
+.mobile-mvp__error { color: #b42318; }
+.mobile-mvp__success { color: #087443; }

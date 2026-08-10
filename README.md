@@ -25,6 +25,23 @@ Start the application in development mode:
 npm run tauri:dev
 ```
 
+Tablet MVP (local network):
+
+The desktop app can expose an opt-in read-only mobile API. Start it with a
+LAN address and a temporary access token, for example:
+
+```bash
+VITE_HOST=0.0.0.0 RUBRIKA_LAN_API=1 RUBRIKA_LAN_API_HOST=0.0.0.0 RUBRIKA_LAN_API_TOKEN=change-me npm run tauri:dev
+```
+
+Then open the `.local` web address shown in MacBook → Ayarlar → Tableti bağla
+on the tablet. The tablet fills the matching `.local:8787` API address
+automatically; enter the same token once. Both devices must be on the same
+Wi‑Fi network with local network discovery enabled.
+The first MVP exposes health and project-list/project-read endpoints only;
+evaluation and file-upload endpoints remain on the desktop Tauri boundary
+until their mobile conflict and progress contracts are defined.
+
 Development mode allows disposable local projects to continue without a
 verified-backup/release-proof marker. Real project-integrity findings still
 block writes. Set `RUBRIKA_ALLOW_UNVERIFIED_PROJECT_WRITES=0` before the

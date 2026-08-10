@@ -22,6 +22,11 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
   const [preview, setPreview] = useState<ModelServerArgsPreview | null>(null);
   const [gcReport, setGcReport] = useState<GcReport | null>(null);
   const [externalConsent, setExternalConsent] = useState(false);
+  const mobileConnectionQuery = useQuery({
+    queryKey: ['mobile-connection-info'],
+    queryFn: commands.getMobileConnectionInfo,
+    enabled: activeTab === 'general',
+  });
 
   const projectQuery = useQuery({
     queryKey: ['project-snapshot', activeProjectId],
@@ -187,6 +192,25 @@ export function SettingsPage({ defaultTab }: { defaultTab?: SettingsTab }) {
 
       {activeTab === 'general' && (
         <section style={{ display: 'grid', gap: '1.25rem' }}>
+          <article style={{ padding: '1.5rem', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: '1rem' }}>
+            <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: '#0f172a' }}>Tableti bağla</h3>
+            <p style={{ color: '#475569', fontSize: '0.875rem', lineHeight: 1.5 }}>
+              IP adresi aramanıza gerek yok. Tablet ve MacBook aynı Wi‑Fi ağındayken aşağıdaki cihaz adıyla bağlanın.
+            </p>
+            {mobileConnectionQuery.data ? (
+              <div style={{ display: 'grid', gap: '0.55rem', fontSize: '0.875rem' }}>
+                <div><strong>Tablette açılacak adres:</strong> <code>{mobileConnectionQuery.data.webUrl}</code></div>
+                <div><strong>API adresi:</strong> <code>{mobileConnectionQuery.data.apiUrl}</code></div>
+                <div style={{ color: mobileConnectionQuery.data.apiEnabled && mobileConnectionQuery.data.tokenConfigured ? '#166534' : '#92400e' }}>
+                  {mobileConnectionQuery.data.apiEnabled && mobileConnectionQuery.data.tokenConfigured
+                    ? '✓ LAN API açık ve erişim anahtarı yapılandırılmış.'
+                    : 'LAN API kapalı veya erişim anahtarı eksik. README’deki başlatma komutunu kullanın.'}
+                </div>
+              </div>
+            ) : (
+              <p style={{ color: '#64748b', fontSize: '0.875rem' }}>Bağlantı bilgisi yükleniyor…</p>
+            )}
+          </article>
           <article style={{ padding: '1.5rem', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '1rem' }}>
             <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700, color: '#0f172a' }}>Ders Alanı Bilgileri</h3>
             <div style={{ marginTop: '1rem', display: 'grid', gap: '0.75rem', fontSize: '0.875rem' }}>

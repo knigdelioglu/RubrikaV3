@@ -23,6 +23,7 @@ const ScoringPage = lazy(() => import('../pages/ScoringPage').then((module) => (
 const GradedExamReviewPage = lazy(() => import('../pages/GradedExamReviewPage').then((module) => ({ default: module.GradedExamReviewPage })));
 const SpeechExamPage = lazy(() => import('../pages/SpeechExamPage').then((module) => ({ default: module.SpeechExamPage })));
 const AnalysisPage = lazy(() => import('../pages/AnalysisPage').then((module) => ({ default: module.AnalysisPage })));
+const MobileDashboardPage = lazy(() => import('../pages/MobileDashboardPage').then((module) => ({ default: module.MobileDashboardPage })));
 
 const CanonicalExamWorkspacePage = lazy(() => import('../pages/CanonicalExamWorkspacePage').then((module) => ({ default: module.CanonicalExamWorkspacePage })));
 
@@ -39,6 +40,14 @@ function LegacyProjectRedirect({ pathname }: { pathname: string }) {
 
 function AppRoutes() {
   const location = useLocation();
+
+  if (location.pathname === '/mobile') {
+    return (
+      <Suspense fallback={<div style={{ padding: '2rem' }}>Mobil istemci yükleniyor…</div>}>
+        <MobileDashboardPage />
+      </Suspense>
+    );
+  }
 
   return (
     <AppErrorBoundary key={location.key}>

@@ -2,6 +2,7 @@ pub mod commands;
 pub mod diagnostics;
 pub mod domain;
 pub mod jobs;
+pub mod mobile_server;
 pub mod platform;
 pub mod services;
 
@@ -110,6 +111,7 @@ pub fn run() {
             if std::env::var_os("RUBRIKA_SMOKE").is_some() {
                 std::process::exit(0);
             }
+            crate::mobile_server::start_if_enabled(app.handle().clone());
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -335,6 +337,7 @@ pub fn run() {
             commands::model_commands::reset_model_profile,
             commands::model_commands::preview_model_server_args,
             commands::model_commands::get_model_log_tail,
+            commands::mobile_connection_commands::get_mobile_connection_info,
             commands::question_text_commands::start_question_text_extraction,
             commands::question_text_commands::start_question_text_vision_fallback,
             commands::question_text_commands::get_question_text_extraction_status,

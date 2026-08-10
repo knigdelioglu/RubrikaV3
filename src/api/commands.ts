@@ -90,6 +90,7 @@ import type {
   StartRestoreJobOutput,
   StartRecoveryCopyJobOutput,
   DataLossPreflightReport,
+  MobileConnectionInfo,
 } from './types';
 import { normalizeAppError, type AppError } from './errors';
 
@@ -127,6 +128,13 @@ export const commands = {
   getAppStatus: async (): Promise<AppStatus> => {
     try {
       return await invoke<AppStatus>('get_app_status');
+    } catch (e) {
+      handleInvokeError(e);
+    }
+  },
+  getMobileConnectionInfo: async (): Promise<MobileConnectionInfo> => {
+    try {
+      return await invoke<MobileConnectionInfo>('get_mobile_connection_info');
     } catch (e) {
       handleInvokeError(e);
     }
