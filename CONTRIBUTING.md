@@ -84,6 +84,11 @@ Use the repository's actual scripts and package manager. The commands below are 
 - Full validation is required when the change affects shared domain logic, storage/migrations, startup, security, concurrency, packaging, or release behavior.
 - Report any skipped or failing check with its impact.
 
+For the fast local loop, use `npm run check:fast` for frontend typecheck and
+Rust compilation checks. `npm run cargo:test` prefers `cargo-nextest` when it
+is installed and clearly reports when it falls back to `cargo test`; see
+`docs/FAST_TESTING.md` for the linker and runner setup.
+
 Use this format when needed:
 
 ```text
@@ -117,7 +122,7 @@ frontend lint
 frontend full test suite
 cargo fmt --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+npm run cargo:test
 Tauri build or release smoke check
 ```
 

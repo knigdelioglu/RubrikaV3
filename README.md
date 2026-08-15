@@ -51,3 +51,8 @@ Run quality checks (typecheck, lint, formatting, tests):
 ```bash
 npm run quality
 ```
+
+For a faster development loop, use `npm run check:fast` for frontend typecheck
+and Rust compilation checks. `npm run cargo:test` prefers `cargo-nextest` when
+installed; see [Fast testing](docs/FAST_TESTING.md) for linker, test-runner,
+and security-scanner guidance.

@@ -67,3 +67,7 @@ debug = 1
 
 [profile.dev.package."*"]
 debug = 0
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3
