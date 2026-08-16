@@ -110,7 +110,6 @@ pub async fn cleanup_job_history(
 #[cfg(test)]
 mod tests {
     use super::list_jobs_for_project;
-    use crate::domain::errors::AppErrorCode;
     use crate::jobs::job_manager::JobManager;
     use uuid::Uuid;
 
@@ -123,18 +122,23 @@ mod tests {
     }
 
     #[test]
-    fn list_jobs_propagates_rehydrate_failure_instead_of_swallowing_it() {
+    fn list_jobs_quarantines_corrupt_snapshot_instead_of_failing_history() {
         let root = corrupt_job_root();
+        let corrupt_path = root.join("logs").join("jobs").join("corrupt.json");
         let manager = JobManager::new();
-        let result = list_jobs_for_project(&manager, Some(root.as_path()), "proj-1");
+        let result = list_jobs_for_project(&manager, Some(root.as_path()), "proj-1")
+            .expect("corrupt snapshot must not block job history");
 
-        let err = result.expect_err("corrupt job snapshot must surface a typed error");
-        assert_eq!(err.code, AppErrorCode::JobPersistenceCorrupt);
-        assert!(!err.message.is_empty(), "teacher-safe message required");
-        assert!(
-            err.technical_details.is_some(),
-            "raw rehydrate error must reach diagnostics"
-        );
+        assert!(result.is_empty());
+        assert!(!corrupt_path.exists(), "corrupt snapshot should be moved aside");
+        let quarantine_dir = root.join("logs").join("jobs").join("quarantine");
+        let quarantined = std::fs::read_dir(&quarantine_dir)
+            .expect("quarantine dir")
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(quarantined, 1);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
