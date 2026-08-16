@@ -903,6 +903,51 @@ pub fn job_snapshot_path(
     Ok(trusted_root.root().join(managed.as_path()))
 }
 
+fn quarantine_job_snapshot(trusted_root: &TrustedProjectRoot, path: &Path, reason: &str) {
+    let quarantine_managed = match trusted_root.managed(&format!(
+        "logs/jobs/quarantine/{}.json",
+        Uuid::new_v4()
+    )) {
+        Ok(managed) => managed,
+        Err(error) => {
+            log::warn!(
+                "Bozuk job snapshot karantina yolu oluşturulamadı: path={}; reason={}; error={}",
+                path.display(),
+                reason,
+                error
+            );
+            return;
+        }
+    };
+    let quarantine_path = match trusted_root.prepare_write_target(&quarantine_managed) {
+        Ok(path) => path,
+        Err(error) => {
+            log::warn!(
+                "Bozuk job snapshot karantina hedefi hazırlanamadı: path={}; reason={}; error={}",
+                path.display(),
+                reason,
+                error
+            );
+            return;
+        }
+    };
+
+    match std::fs::rename(path, &quarantine_path) {
+        Ok(()) => log::warn!(
+            "Bozuk job snapshot izole edildi: source={}; quarantine={}; reason={}",
+            path.display(),
+            quarantine_path.display(),
+            reason
+        ),
+        Err(error) => log::warn!(
+            "Bozuk job snapshot izole edilemedi; diğer kayıtlar yüklenmeye devam edecek: path={}; reason={}; error={}",
+            path.display(),
+            reason,
+            error
+        ),
+    }
+}
+
 pub fn load_persisted_jobs(project_root: &Path) -> Result<Vec<JobSnapshot>, AppError> {
     let trusted_root = TrustedProjectRoot::from_canonical_root(project_root.to_path_buf(), false)?;
     let jobs_managed = trusted_root.managed("logs/jobs")?;
@@ -919,36 +964,37 @@ pub fn load_persisted_jobs(project_root: &Path) -> Result<Vec<JobSnapshot>, AppE
         technical_details: Some(error.to_string()),
         correlation_id: Uuid::new_v4().to_string(),
     })? {
-        let entry = entry.map_err(|error| AppError {
-            code: AppErrorCode::FileReadFailed,
-            message: "Job log girdisi okunamadı.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Check project log permissions.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                log::warn!(
+                    "Job log girdisi okunamadı; diğer snapshot kayıtları yüklenmeye devam edecek: error={error}"
+                );
+                continue;
+            }
+        };
         let Ok(managed) = trusted_root.managed_for_path(&entry.path()) else {
             continue;
         };
         let Ok(path) = trusted_root.resolve_existing_file(&managed) else {
             continue;
         };
-        let content = std::fs::read_to_string(path).map_err(|error| AppError {
-            code: AppErrorCode::FileReadFailed,
-            message: "Job snapshot okunamadı.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Re-run the job or clear stale log files.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
-        let snapshot: JobSnapshot = serde_json::from_str(&content).map_err(|error| AppError {
-            code: AppErrorCode::JobPersistenceCorrupt,
-            message: "Job snapshot bozuk.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Re-run the job or delete the stale snapshot file.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: Uuid::new_v4().to_string(),
-        })?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(error) => {
+                let reason = format!("read_failed: {error}");
+                quarantine_job_snapshot(&trusted_root, &path, &reason);
+                continue;
+            }
+        };
+        let snapshot: JobSnapshot = match serde_json::from_str(&content) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                let reason = format!("json_invalid: {error}");
+                quarantine_job_snapshot(&trusted_root, &path, &reason);
+                continue;
+            }
+        };
         snapshots.push(snapshot);
     }
     snapshots.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -959,6 +1005,59 @@ pub fn load_persisted_jobs(project_root: &Path) -> Result<Vec<JobSnapshot>, AppE
 mod tests {
     use super::*;
     use tauri::test::mock_app;
+
+    #[test]
+    fn corrupt_job_snapshot_is_quarantined_without_blocking_valid_rehydration() {
+        let root =
+            std::env::temp_dir().join(format!("rubrika-job-mixed-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let app = mock_app();
+        let handle = app.handle();
+
+        let writer = JobManager::new();
+        let reg = writer
+            .register_or_get_active_job(
+                handle,
+                JobRegistrationInput {
+                    project_id: "proj_mixed_history".to_string(),
+                    project_root_path: Some(root.to_string_lossy().to_string()),
+                    kind: JobKind::AssessmentAnalysis,
+                    display_label: Some("Valid persisted job".to_string()),
+                    total: 1,
+                    message: "queued".to_string(),
+                    correlation_id: Some("corr-mixed-history".to_string()),
+                    idempotency_key: Some("mixed-history-valid".to_string()),
+                    duplicate_policy: DuplicatePolicy::AllowParallel,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
+        let valid_job_id = reg.snapshot.id.clone();
+
+        let corrupt_path = root.join("logs").join("jobs").join("corrupt.json");
+        std::fs::write(&corrupt_path, "{ definitely not valid json").unwrap();
+
+        let reader = JobManager::new();
+        let interrupted = reader.rehydrate_jobs(&root).unwrap();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].id, valid_job_id);
+        assert_eq!(interrupted[0].status, JobStatus::Interrupted);
+
+        let jobs = reader.list_jobs("proj_mixed_history").unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, valid_job_id);
+        assert!(!corrupt_path.exists(), "corrupt snapshot should be quarantined");
+
+        let quarantine_dir = root.join("logs").join("jobs").join("quarantine");
+        let quarantined = std::fs::read_dir(&quarantine_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(quarantined, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn proof_1_50_concurrent_duplicate_requests_single_worker_registration() {
