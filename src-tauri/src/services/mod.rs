@@ -2,6 +2,7 @@ pub mod analysis_service;
 pub mod assessment_organization_service;
 pub mod audit_service;
 pub mod backup_service;
+pub mod cancellable_model_gateway;
 pub mod cancellable_wait;
 // Domain services
 pub mod deterministic_scoring_service;
