@@ -67,6 +67,8 @@ The backend test suite enforces production proof tests covering concurrency, can
 | `proof_16` | `proof_16_exam_package_build_cancel_preserves_unfrozen_state` | `exam_package_build_service.rs` | Cancelled exam package build does not create or freeze package snapshot |
 | `proof_17` | `proof_17_real_tauri_shutdown_rehydrates_running_jobs_as_interrupted` | `job_manager.rs` | Real Tauri shutdown persists active jobs as `Interrupted` and rehydrates 0 active jobs on relaunch |
 
+Additional rehydration regression coverage verifies that a corrupt persisted job is quarantined without blocking valid job history from loading.
+
 ---
 
 ## 4. End-to-End Correlation ID Equality Chain
@@ -88,6 +90,7 @@ assert_eq!(snap.error.unwrap().correlation_id, expected_corr_id);
 - `JobManager` is the single authority for job persistence.
 - Snapshots are written atomically (`temp -> flush -> sync -> rename`) under `<project_root>/logs/jobs/<job_id>.json` using `TrustedProjectRoot`.
 - On application startup or project opening, `load_persisted_jobs` loads existing JSON snapshots into `JobManager`.
+- A single unreadable or invalid job snapshot is isolated under `<project_root>/logs/jobs/quarantine/` and skipped; other valid snapshots continue loading. Failure to read the job directory itself remains a fatal persistence error.
 - Any non-terminal jobs (`Queued` or `Running`) loaded during rehydration without an active task handle are automatically transitioned to `Interrupted`.
 
 ---
