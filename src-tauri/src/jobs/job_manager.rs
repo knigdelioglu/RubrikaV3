@@ -134,14 +134,15 @@ impl JobManager {
             .correlation_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let key = input.idempotency_key.clone().unwrap_or_else(|| {
-            format!(
-                "{}:{:?}:{}",
-                input.project_id,
-                input.kind,
-                input.display_label.as_deref().unwrap_or(&input.message)
-            )
-        });
+        let caller_key = input
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| input.display_label.clone().unwrap_or_else(|| input.message.clone()));
+        let key = crate::jobs::idempotency::scoped_idempotency_key(
+            &input.project_id,
+            &input.kind,
+            &caller_key,
+        );
 
         let mut idempotency_map = self.idempotency_map.lock().map_err(|e| AppError {
             code: AppErrorCode::UnknownError,
@@ -1151,7 +1152,6 @@ mod tests {
         assert!(cancelled_snapshot.cancellation_requested);
         assert!(reg.cancellation_token.is_cancelled());
 
-        // Simulated worker checkpoint observing token cancel
         if reg.cancellation_token.is_cancelled() {
             manager.mark_cancelled(handle, &reg.snapshot.id).unwrap();
         }
@@ -1231,7 +1231,6 @@ mod tests {
 
         manager1.set_running(handle, &reg.snapshot.id).unwrap();
 
-        // Simulate app restart by constructing a new JobManager instance reading the same directory
         let manager2 = JobManager::new();
         let rehydrated = manager2.rehydrate_jobs(root_path).unwrap();
 
@@ -1486,10 +1485,8 @@ mod tests {
         let handle = app.handle();
         let expected_corr_id = format!("corr-e2e-{}", Uuid::new_v4());
 
-        // 1. Command Correlation ID
         let command_corr_id = expected_corr_id.clone();
 
-        // 2. JobSnapshot Correlation ID
         let reg = manager
             .register_or_get_active_job(
                 handle,
@@ -1513,15 +1510,12 @@ mod tests {
 
         manager.set_running(handle, &reg.snapshot.id).unwrap();
 
-        // 3. Lease Correlation ID Context
         let lease_corr_id = reg.snapshot.correlation_id.clone();
         assert_eq!(command_corr_id, lease_corr_id);
 
-        // 4. Gateway Request Correlation ID Context
         let gateway_corr_id = lease_corr_id.clone();
         assert_eq!(command_corr_id, gateway_corr_id);
 
-        // 5. ProjectStore Commit Event Correlation ID
         let trusted_root = store.trusted_project_root(&project.id).unwrap();
         let log_file = trusted_root.managed("logs/events.jsonl").unwrap();
         let log_path = trusted_root.prepare_write_target(&log_file).unwrap();
@@ -1539,7 +1533,6 @@ mod tests {
 
         assert_eq!(command_corr_id, project_store_corr_id);
 
-        // 6. Terminal Event Recorder Correlation ID
         let err = AppError {
             code: AppErrorCode::ScoringFailed,
             message: "Scoring test failure".into(),
@@ -1585,7 +1578,6 @@ mod tests {
 
         manager.set_running(handle, &reg.snapshot.id).unwrap();
 
-        // Simulate panic recovery in task wrapper
         let panic_err = AppError {
             code: AppErrorCode::UnknownError,
             message: "Task panicked unexpectedly.".into(),
@@ -1619,7 +1611,6 @@ mod tests {
         let app = mock_app();
         let handle = app.handle();
 
-        // 1. Register and run long job
         let reg = manager
             .register_or_get_active_job(
                 handle,
@@ -1640,13 +1631,11 @@ mod tests {
             .unwrap();
         manager.set_running(handle, &reg.snapshot.id).unwrap();
 
-        // 2. Simulate Tauri ExitRequested handler (lib.rs)
         manager.shutdown_all_jobs(handle);
 
         let active_snap = manager.get_job_snapshot(&reg.snapshot.id).unwrap();
         assert_eq!(active_snap.status, JobStatus::Interrupted);
 
-        // 3. Simulate App Relaunch (fresh JobManager rehydrating disk state)
         let fresh_manager = JobManager::new();
         fresh_manager
             .rehydrate_jobs(std::path::Path::new(&project.root_path))
@@ -1657,7 +1646,6 @@ mod tests {
             .find(|j| j.id == reg.snapshot.id)
             .expect("Persisted job must be loaded on relaunch");
 
-        // 4. Invariants: Status is Interrupted, is_active is false, zero running jobs
         assert_eq!(rehydrated_target.status, JobStatus::Interrupted);
         assert!(!rehydrated_target.status.is_active());
         assert_eq!(
@@ -1673,7 +1661,6 @@ mod tests {
     fn lock_poison_returns_typed_error_instead_of_panicking() {
         let manager = JobManager::new();
 
-        // Poison the accepting_new_jobs lock by panicking while it is held.
         let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = manager.accepting_new_jobs.lock().unwrap();
             std::panic::panic_any("intentional poison");
