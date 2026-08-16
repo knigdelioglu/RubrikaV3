@@ -10,7 +10,10 @@ async function discoverTestFiles(directory) {
     const entryPath = join(directory, entry.name);
     if (entry.isDirectory()) {
       discovered.push(...(await discoverTestFiles(entryPath)));
-    } else if (entry.isFile() && entry.name.endsWith(".test.ts")) {
+    } else if (
+      entry.isFile() &&
+      (entry.name.endsWith(".test.ts") || entry.name.endsWith(".test.tsx"))
+    ) {
       discovered.push(entryPath);
     }
   }
@@ -20,7 +23,7 @@ async function discoverTestFiles(directory) {
 
 const testFiles = (await discoverTestFiles(resolve("src"))).sort();
 if (testFiles.length === 0) {
-  console.error("[frontend-tests] No *.test.ts files found under src/.");
+  console.error("[frontend-tests] No *.test.ts or *.test.tsx files found under src/.");
   process.exit(1);
 }
 
