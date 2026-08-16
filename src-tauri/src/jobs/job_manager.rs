@@ -156,26 +156,7 @@ impl JobManager {
             if let Some(existing_snapshot) = jobs.get(existing_job_id) {
                 if existing_snapshot.status.is_active() {
                     match input.duplicate_policy {
-                        DuplicatePolicy::ReturnExisting => {
-                            let tokens = self.task_tokens.lock().map_err(|e| AppError {
-                                code: AppErrorCode::UnknownError,
-                                message: "Job cancellation state could not be read.".to_string(),
-                                recoverable: false,
-                                suggested_action: None,
-                                technical_details: Some(e.to_string()),
-                                correlation_id: Uuid::new_v4().to_string(),
-                            })?;
-                            let token = tokens
-                                .get(existing_job_id)
-                                .cloned()
-                                .unwrap_or_else(CancellationToken::new);
-                            return Ok(RegisteredJob {
-                                snapshot: existing_snapshot.clone(),
-                                cancellation_token: token,
-                                is_new: false,
-                            });
-                        }
-                        DuplicatePolicy::RejectAlreadyRunning => {
+                        DuplicatePolicy::ReturnExisting | DuplicatePolicy::RejectAlreadyRunning => {
                             return Err(AppError {
                                 code: AppErrorCode::JobAlreadyRunning,
                                 message: format!(
@@ -187,7 +168,7 @@ impl JobManager {
                                     "Wait for the ongoing job to finish.".to_string(),
                                 ),
                                 technical_details: Some(format!(
-                                    "Existing job ID: {}",
+                                    "Duplicate worker registration rejected; existing job ID: {}",
                                     existing_job_id
                                 )),
                                 correlation_id,
@@ -980,16 +961,19 @@ mod tests {
     use tauri::test::mock_app;
 
     #[test]
-    fn proof_1_50_concurrent_duplicate_requests_single_job() {
+    fn proof_1_50_concurrent_duplicate_requests_single_worker_registration() {
         let manager = Arc::new(JobManager::new());
         let app = mock_app();
         let handle = app.handle();
 
+        let barrier = Arc::new(std::sync::Barrier::new(50));
         let mut threads = Vec::new();
         for _ in 0..50 {
             let m = manager.clone();
             let h = handle.clone();
+            let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
+                barrier.wait();
                 m.register_or_get_active_job(
                     &h,
                     JobRegistrationInput {
@@ -1009,27 +993,29 @@ mod tests {
             }));
         }
 
-        let results: Vec<_> = threads
-            .into_iter()
-            .map(|t| t.join().unwrap().unwrap())
-            .collect();
-        let job_ids: std::collections::HashSet<_> =
-            results.iter().map(|r| r.snapshot.id.clone()).collect();
-        let new_count = results.iter().filter(|r| r.is_new).count();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let successful: Vec<_> = results.iter().filter_map(|result| result.as_ref().ok()).collect();
+        let rejected: Vec<_> = results.iter().filter_map(|result| result.as_ref().err()).collect();
 
         assert_eq!(
-            job_ids.len(),
+            successful.len(),
             1,
-            "Exactly one unique job_id should be returned for 50 concurrent requests"
+            "Exactly one concurrent caller may own the worker registration"
         );
+        assert!(successful[0].is_new);
         assert_eq!(
-            new_count, 1,
-            "Exactly one thread should be marked is_new = true"
+            rejected.len(),
+            49,
+            "All duplicate worker registrations must be rejected"
         );
+        assert!(rejected
+            .iter()
+            .all(|error| error.code == AppErrorCode::JobAlreadyRunning));
 
         let active = manager.list_jobs("project_stress").unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].status, JobStatus::Queued);
+        assert_eq!(active[0].id, successful[0].snapshot.id);
     }
 
     #[test]
@@ -1171,7 +1157,7 @@ mod tests {
             let h = handle.clone();
             let key = format!("key-{}", i % 10);
             threads.push(std::thread::spawn(move || {
-                let reg = m.register_or_get_active_job(
+                match m.register_or_get_active_job(
                     &h,
                     JobRegistrationInput {
                         project_id: "proj_stress_100".to_string(),
@@ -1186,18 +1172,27 @@ mod tests {
                         cancellable: true,
                         retry_of_job_id: None,
                     },
-                )?;
-
-                if reg.is_new {
-                    m.set_running(&h, &reg.snapshot.id)?;
-                    m.update_progress(&h, &reg.snapshot.id, 50, 100, "Halfway".to_string())?;
-                    if i % 3 == 0 {
-                        m.partial(&h, &reg.snapshot.id, None)?;
-                    } else {
-                        m.succeed(&h, &reg.snapshot.id, None)?;
+                ) {
+                    Ok(reg) => {
+                        assert!(reg.is_new);
+                        m.set_running(&h, &reg.snapshot.id)?;
+                        m.update_progress(
+                            &h,
+                            &reg.snapshot.id,
+                            50,
+                            100,
+                            "Halfway".to_string(),
+                        )?;
+                        if i % 3 == 0 {
+                            m.partial(&h, &reg.snapshot.id, None)?;
+                        } else {
+                            m.succeed(&h, &reg.snapshot.id, None)?;
+                        }
+                        Ok::<(), AppError>(())
                     }
+                    Err(error) if error.code == AppErrorCode::JobAlreadyRunning => Ok(()),
+                    Err(error) => Err(error),
                 }
-                Ok::<(), AppError>(())
             }));
         }
 
@@ -1557,7 +1552,6 @@ mod tests {
         fresh_manager
             .rehydrate_jobs(std::path::Path::new(&project.root_path))
             .unwrap();
-
         let rehydrated_jobs = fresh_manager.list_jobs(&project.id).unwrap();
         let rehydrated_target = rehydrated_jobs
             .iter()
