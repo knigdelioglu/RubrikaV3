@@ -1,0 +1,107 @@
+diff --git a/src-tauri/src/jobs/job_manager.rs b/src-tauri/src/jobs/job_manager.rs
+--- a/src-tauri/src/jobs/job_manager.rs
++++ b/src-tauri/src/jobs/job_manager.rs
+@@ -134,13 +134,14 @@
+             .correlation_id
+             .unwrap_or_else(|| Uuid::new_v4().to_string());
+ 
+-        let key = input.idempotency_key.clone().unwrap_or_else(|| {
+-            format!(
+-                "{}:{:?}:{}",
+-                input.project_id,
+-                input.kind,
+-                input.display_label.as_deref().unwrap_or(&input.message)
+-            )
+-        });
++        let caller_key = input
++            .idempotency_key
++            .clone()
++            .unwrap_or_else(|| input.display_label.clone().unwrap_or_else(|| input.message.clone()));
++        let key = crate::jobs::idempotency::scoped_idempotency_key(
++            &input.project_id,
++            &input.kind,
++            &caller_key,
++        );
+ 
+         let mut idempotency_map = self.idempotency_map.lock().map_err(|e| AppError {
+diff --git a/src-tauri/src/services/student_answer_ocr_service.rs b/src-tauri/src/services/student_answer_ocr_service.rs
+--- a/src-tauri/src/services/student_answer_ocr_service.rs
++++ b/src-tauri/src/services/student_answer_ocr_service.rs
+@@ -26,5 +26,6 @@
+ use crate::jobs::job_manager::JobManager;
+ use crate::platform::project_paths::TrustedProjectRoot;
++use crate::services::cancellable_wait::await_with_cancellation;
+ use crate::services::model_gateway::ModelGateway;
+ use crate::services::model_input_image_service::ModelInputImageService;
+ use crate::services::model_runtime_service::{
+@@ -921,14 +922,24 @@
+             )
+             .ok();
++        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+         let runtime_request = ModelRuntimeRequest {
+             use_case: ModelUseCase::StudentAnswerOcr,
+             capability: ModelCapability::Vision,
+             requires_mmproj: true,
+             timeout_seconds: 180,
+         };
+-        let _runtime_lease = self
+-            .model_runtime_service
+-            .acquire_ready_runtime_lease(None, "student_answer_ocr", runtime_request, &job_id)
+-            .await?;
++        let runtime_lease = await_with_cancellation(
++            cancel_token.as_ref(),
++            self.model_runtime_service
++                .acquire_ready_runtime_lease(None, "student_answer_ocr", runtime_request, &job_id),
++        )
++        .await;
++        let _runtime_lease = match runtime_lease {
++            Some(result) => result?,
++            None => {
++                let _ = self.job_manager.mark_cancelled(&app, &job_id);
++                return Ok(());
++            }
++        };
+         self.job_manager
+             .update_progress(&app, &job_id, 0, total, "Model yükleniyor...".to_string())
+@@ -946,8 +957,7 @@
+         let mut succeeded = 0u32;
+         let mut failed = 0u32;
+         let mut needs_review = 0u32;
+         let mut records = Vec::new();
+ 
+-        let cancel_token = self.job_manager.get_cancellation_token(&job_id);
+         for submission in scoped_view.student_submissions.clone() {
+             for question in &scoped_view.questions {
+@@ -1036,9 +1046,7 @@
+                     Some(crate::domain::model::ModelResponseFormat::JsonObject),
+                     None,
+                 );
+-                let result = self
+-                    .model_gateway
+-                    .extract_student_answer_ocr(StudentAnswerOcrRequest {
++                let request = StudentAnswerOcrRequest {
+                         prompt,
+                         prompt_contract: Some(prompt_contract),
+                         project_root_path: Some(project.root_path.clone()),
+@@ -1056,8 +1064,19 @@
+                         region_orders: source_artifacts.region_orders.clone(),
+                         region_page_offsets: source_artifacts.region_page_offsets.clone(),
+                         model_input_images: prepared_inputs.clone(),
+-                    })
+-                    .await;
++                    };
++                let result = match await_with_cancellation(
++                    cancel_token.as_ref(),
++                    self.model_gateway.extract_student_answer_ocr(request),
++                )
++                .await
++                {
++                    Some(result) => result,
++                    None => {
++                        let _ = self.job_manager.mark_cancelled(&app, &job_id);
++                        return Ok(());
++                    }
++                };
+ 
+                 match result {
+                     Ok(result) => {
