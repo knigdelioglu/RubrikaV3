@@ -28,26 +28,28 @@ The job state machine manages all asynchronous long-running tasks in RubrikaV3.
 
 | Job Kind | Scope | Duplicate Policy | Safe Cancellation Checkpoints | Commit & Data Preservation Contract |
 |---|---|---|---|---|
-| `DocumentImport` | Project + Doc Role | `ReturnExisting` | Before copy, chunk boundaries, before validation | Partial file unlinked from disk; project `documents` list untouched |
-| `PdfPreviewRender` | Project + Doc ID | `ReturnExisting` | Before render, page loop, before manifest update | Staging directory unlinked; existing active preview generation preserved |
-| `QuestionTextExtraction` | Project + Doc ID | `ReturnExisting` | After `set_running`, vision fallback loop, before commit | Teacher-edited/confirmed question text preserved byte-for-byte; suggested text discarded |
-| `RubricPdfImport` | Project + Doc ID | `ReturnExisting` | After `set_running`, before runtime acquire, before commit | Teacher-edited/confirmed rubric state remains `Confirmed`; draft rubric discarded |
-| `ExamPackageBuild` | Project | `ReturnExisting` | Between package stages, before freeze assertion | `exam_package_freeze` snapshot is NOT created or set to `Frozen` |
-| `StudentAnswerOcr` | Project + Scope | `ReturnExisting` | Before lease acquire, item loop, before commit | Active OCR records preserved; candidate record discarded without approval |
-| `StudentIdentityOcr` | Project + Doc ID | `ReturnExisting` | Page loop, before model calls, before commit | Unconfirmed student identity mappings uncommitted; existing roster untouched |
-| `Scoring` | Project + Question | `ReturnExisting` | Before lease acquire, item loop, before commit | Existing valid score records preserved; invalid/cancelled score ignored |
-| `SpeakingEvaluation` | Project + Exam ID | `ReturnExisting` | Post `set_running`, post transcript cleanup, before commit | Teacher notes, star ratings, and readable transcript preserved byte-for-byte |
-| `AssessmentAnalysis` | Project | `ReturnExisting` | Before model call, after model call, before report save | Final report file uncommitted; `AnalysisStatus` remains untouched (not set to `Ready` or `Partial`) |
+| `DocumentImport` | Project + Doc Role | `ReturnExisting` (fail-closed duplicate rejection) | Before copy, chunk boundaries, before validation | Partial file unlinked from disk; project `documents` list untouched |
+| `PdfPreviewRender` | Project + Doc ID | `ReturnExisting` (fail-closed duplicate rejection) | Before render, page loop, before manifest update | Staging directory unlinked; existing active preview generation preserved |
+| `QuestionTextExtraction` | Project + Doc ID | `ReturnExisting` (fail-closed duplicate rejection) | After `set_running`, vision fallback loop, before commit | Teacher-edited/confirmed question text preserved byte-for-byte; suggested text discarded |
+| `RubricPdfImport` | Project + Doc ID | `ReturnExisting` (fail-closed duplicate rejection) | After `set_running`, before runtime acquire, before commit | Teacher-edited/confirmed rubric state remains `Confirmed`; draft rubric discarded |
+| `ExamPackageBuild` | Project | `ReturnExisting` (fail-closed duplicate rejection) | Between package stages, before freeze assertion | `exam_package_freeze` snapshot is NOT created or set to `Frozen` |
+| `StudentAnswerOcr` | Project + Scope | `ReturnExisting` (fail-closed duplicate rejection) | Before lease acquire, item loop, before commit | Active OCR records preserved; candidate record discarded without approval |
+| `StudentIdentityOcr` | Project + Doc ID | `ReturnExisting` (fail-closed duplicate rejection) | Page loop, before model calls, before commit | Unconfirmed student identity mappings uncommitted; existing roster untouched |
+| `Scoring` | Project + Question | `ReturnExisting` (fail-closed duplicate rejection) | Before lease acquire, item loop, before commit | Existing valid score records preserved; invalid/cancelled score ignored |
+| `SpeakingEvaluation` | Project + Exam ID | `ReturnExisting` (fail-closed duplicate rejection) | Post `set_running`, post transcript cleanup, before commit | Teacher notes, star ratings, and readable transcript preserved byte-for-byte |
+| `AssessmentAnalysis` | Project | `ReturnExisting` (fail-closed duplicate rejection) | Before model call, after model call, before report save | Final report file uncommitted; `AnalysisStatus` remains untouched (not set to `Ready` or `Partial`) |
+
+`ReturnExisting` is retained as a serialized/API compatibility value, but worker-starting registrations no longer hand the active snapshot to a second caller. An active duplicate is rejected with `JobAlreadyRunning` so only the registration winner can proceed to worker creation.
 
 ---
 
 ## 3. Production Proof Test Inventory (Phase 5C Verification)
 
-The backend test suite enforces 16 production proof tests (`proof_1` through `proof_16`) covering concurrency, cancellation, fault isolation, and retention:
+The backend test suite enforces production proof tests covering concurrency, cancellation, fault isolation, and retention:
 
 | Proof ID | Test Name | Location | Verified Behavior |
 |---|---|---|---|
-| `proof_1` | `proof_1_50_concurrent_duplicate_requests_single_job` | `job_manager.rs` | 50 concurrent requests produce exactly 1 job registration |
+| `proof_1` | `proof_1_50_concurrent_duplicate_requests_single_worker_registration` | `job_manager.rs` | 50 concurrent duplicate requests produce exactly 1 worker-owning registration; the other 49 receive `JobAlreadyRunning` |
 | `proof_2` | `proof_2_real_cancellation` | `job_manager.rs` | Cancellation token signals task to cancel cleanly |
 | `proof_3` | `proof_3_partial_is_not_succeeded` | `job_manager.rs` | Partial state is terminal and emits `job_partial`, not `job_succeeded` |
 | `proof_4` | `proof_4_restart_recovery` | `job_manager.rs` | Rehydrated active jobs transition to `Interrupted` on restart |
@@ -90,14 +92,16 @@ assert_eq!(snap.error.unwrap().correlation_id, expected_corr_id);
 
 ---
 
-## 6. Atomic Registration & Duplicate Prevention
+## 6. Atomic Registration, Worker Ownership & Duplicate Prevention
 
 - `register_or_get_active_job` executes atomic duplicate check and insertion under a single `Mutex` lock.
 - Backend computes a canonical `idempotency_key` derived from `project_id + operation_kind + scope + input_fingerprint`.
+- **Single-worker invariant:** only the caller that inserts the new job owns permission to create the worker. An already-active equivalent job must never be returned to another worker-starting caller as if it were a fresh registration.
 - Policy:
-  - `ReturnExisting`: Returns snapshot of already running job.
-  - `RejectAlreadyRunning`: Returns `AppErrorCode::JobAlreadyRunning`.
-  - `AllowParallel`: Generates unique job.
+  - `ReturnExisting`: legacy compatibility value. For an active duplicate, registration fails closed with `AppErrorCode::JobAlreadyRunning`; the existing worker remains authoritative.
+  - `RejectAlreadyRunning`: returns `AppErrorCode::JobAlreadyRunning` for an active duplicate.
+  - `AllowParallel`: explicitly permits creation of an independent job and worker.
+- The concurrency proof synchronizes 50 callers at the registration boundary and asserts exactly one successful registration and 49 typed duplicate rejections. This protects services that do not inspect `RegisteredJob.is_new` before spawning their worker.
 
 ---
 
