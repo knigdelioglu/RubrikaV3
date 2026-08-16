@@ -1,0 +1,39 @@
+name: Apply remaining stress fixes
+
+on:
+  push:
+    branches:
+      - agent/fix-remaining-stress-findings
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: agent/fix-remaining-stress-findings
+          fetch-depth: 0
+
+      - name: Apply verified patch
+        run: |
+          git apply --check scripts/remaining-stress-fixes.patch
+          git apply scripts/remaining-stress-fixes.patch
+          rustup component add rustfmt
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+
+      - name: Commit source fixes and remove bootstrap files
+        run: |
+          rm .github/workflows/apply-remaining-stress-fixes.yml
+          rm scripts/remaining-stress-fixes.patch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix remaining stress findings"
+          git push origin HEAD:agent/fix-remaining-stress-findings
