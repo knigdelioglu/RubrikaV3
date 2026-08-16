@@ -10,6 +10,7 @@ use jobs::job_manager::JobManager;
 use services::analysis_service::AnalysisService;
 use services::assessment_organization_service::AssessmentOrganizationService;
 use services::audit_service::AuditService;
+use services::cancellable_model_gateway::CancellableModelGateway;
 use services::document_content_extraction_service::DocumentContentExtractionService;
 use services::exam_package_build_service::ExamPackageBuildService;
 use services::graded_exam_review_service::GradedExamReviewService;
@@ -117,7 +118,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage({
             let model_gateway_impl = Arc::new(LlamaServerGateway::default());
-            let model_gateway: Arc<dyn ModelGateway> = model_gateway_impl.clone();
+            let job_manager = Arc::new(JobManager::new());
+            let model_gateway: Arc<dyn ModelGateway> = Arc::new(CancellableModelGateway::new(
+                model_gateway_impl.clone(),
+                job_manager.clone(),
+            ));
             let model_config_service = ModelConfigService::new();
             let model_process_manager =
                 ModelProcessManager::new(model_config_service.clone(), model_gateway_impl.clone());
@@ -131,7 +136,6 @@ pub fn run() {
                 DocumentContentExtractionService::new(model_input_image_service.clone()),
             );
             let pdf_service: Arc<dyn PdfService> = Arc::new(SystemPdfService);
-            let job_manager = Arc::new(JobManager::new());
             let speaking_engine = Arc::new(SpeakoflowEngine::new());
             let pdf_preview_service = Arc::new(PdfPreviewService::new(
                 project_store.clone(),
