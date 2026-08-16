@@ -8,7 +8,7 @@
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
     "lint": "oxlint",
-    "test": "npm run typecheck && node --test --experimental-strip-types src/api/tauriClient.test.ts src/api/errors.test.ts src/app/projectShell.test.ts src/app/projectSafety.test.ts src/app/projectSwitcher.test.ts src/app/assessmentMode.test.ts src/app/examWorkspace.test.ts src/state/projectSession.test.ts src/components/common/AppErrorBoundary.test.ts src/components/pdf/PdfPageViewer.test.ts src/components/scoring/gradedExamReviewUi.test.ts src/components/workflow/WorkflowPanel.test.ts src/pages/analysisUi.test.ts src/pages/assessmentOrganizationUi.test.ts src/pages/documentRemoval.test.ts src/pages/documentWorkspace.test.ts src/pages/examPackageWorkspace.test.ts src/pages/speechExamUi.test.ts src/pages/settingsUi.test.ts src/pages/studentOperations.test.ts src/pages/studentAnswerOcrUi.test.ts src/pages/scoringViewModel.test.ts src/utils/rubricWarnings.test.ts src/utils/rubricGuidance.test.ts src/utils/examPackageFreeze.test.ts src/utils/formatting.test.ts",
+    "test": "npm run typecheck && node scripts/run-frontend-tests.mjs",
     "tauri:dev": "node scripts/tauri-dev.mjs",
     "tauri:build": "tauri build",
     "cargo:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml --check",
