@@ -110,10 +110,7 @@ pub fn materialize_route_as_legacy_profile(
         short_fingerprint(model_fingerprint),
         short_fingerprint(&runtime_fingerprint),
     );
-    let requires_vision = route
-        .task_profile
-        .required_capabilities
-        .contains(&ModelCapabilityKind::Vision);
+    let requires_vision = route.runtime.uses_multimodal_projector(&route.model);
     let mmproj_path = route.model.mmproj_path.clone().unwrap_or_default();
     let profile = ModelProfile {
         id: profile_id.clone(),
