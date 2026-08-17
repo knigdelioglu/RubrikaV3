@@ -13,6 +13,7 @@ pub mod generation_gc_service;
 pub mod golden_ocr_metrics;
 pub mod graded_exam_review_service;
 pub mod integrity_recovery_service;
+pub mod llama_cpp_runtime_adapter;
 pub mod llama_server_gateway;
 pub mod model_config_service;
 pub mod model_gateway;
