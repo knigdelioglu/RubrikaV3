@@ -5,10 +5,10 @@ Amaç: mevcut Gemma 4 12B + llama.cpp production davranışını bozmadan Rubrik
 ## Takip Listesi
 
 - [x] Sprint 0 — Mevcut davranışı kilitle ve migration sınırını tanımla
-- [ ] Sprint 1 — `ModelDefinition`, `RuntimeDefinition` ve `TaskProfile` ayrımını getir
+- [x] Sprint 1 — `ModelDefinition`, `RuntimeDefinition` ve `TaskProfile` ayrımını getir
 - [ ] Sprint 2 — Runtime argümanlarını koddan çıkar ve `LlamaCppRuntimeAdapter` katmanını oluştur
-- [ ] Sprint 3 — Model Registry + Capability Negotiation altyapısını kur
-- [ ] Sprint 4 — Task → Model Binding ve model router katmanını devreye al
+- [x] Sprint 3 — Model Registry + Capability Negotiation altyapısını kur
+- [x] Sprint 4 — Task → Model Binding ve model router katmanını devreye al
 - [ ] Sprint 5 — Experimental / Production model yaşam döngüsü ve Model Laboratuvarı UI'sını ekle
 - [ ] Sprint 6 — Golden benchmark karşılaştırma ve promotion gate'lerini bağla
 - [ ] Sprint 7 — Gemma özel sabitleri kaldır, compatibility migration yap ve eski profilleri emekli et
@@ -52,157 +52,86 @@ Temel invariant: domain servisleri model ailesini, GGUF dosyasını, mmproj yolu
 
 **Durum: tamamlandı.** Referans: `docs/LOCAL_MODEL_PLATFORM_BASELINE.md`.
 
-Kilitlenen alanlar:
-
-- question/rubric extraction
-- student OCR + issue correction
-- semantic scoring
-- speaking cleanup/evaluation
-- analysis/general model calls
-- strict-local privacy
-- canonical rubric → Rust score mapping
-- fail-closed JSON/schema davranışı
-- prompt/schema/policy/model/runtime provenance
-- process ownership, lease ve shared-runtime davranışı
-- golden OCR/scoring corpus ve mevcut regression dokümanları
+Kilitlenen alanlar: question/rubric extraction, student OCR + issue correction, semantic scoring, speaking cleanup/evaluation, analysis/general model calls, strict-local privacy, canonical rubric → Rust score mapping, fail-closed JSON/schema davranışı, provenance, process ownership/lease ve golden corpus.
 
 ---
 
 # Sprint 1 — Domain ayrımı
 
-Yeni yapılar:
+**Durum: tamamlandı.**
 
-### `ModelDefinition`
+Uygulanan ayrım:
 
-- id, family, display name
-- model path / optional mmproj
-- format / quantization
-- declared capabilities
-- context limit
-- model fingerprint
-- lifecycle state
-- metadata
+- `ModelDefinition`: model kimliği, family, GGUF/mmproj, capability, fingerprint ve lifecycle.
+- `RuntimeDefinition`: engine, llama-server, host/port, context, GPU, batch, KV cache, reasoning ve güvenlik ayarları.
+- `TaskProfile`: use-case, gerekli capability'ler, prompt/schema/policy, sampling, timeout ve response format.
+- `TaskModelBinding`: task → model → runtime ilişkisi.
+- Legacy `ModelProfile` için lossless compatibility migration ve güvenli backup/bootstrap.
 
-### `RuntimeDefinition`
-
-- id, engine, server path
-- host/port
-- context/gpu/flash-attention
-- parallel/batch/ubatch
-- KV cache K/V
-- reasoning mode
-- güvenli allowlisted extra args
-
-### `TaskProfile`
-
-- id/use case
-- required capabilities
-- prompt/schema/policy version
-- sampling parameters
-- timeout/max tokens
-- response format
-
-Legacy `ModelProfile` hemen silinmez; compatibility migration yeni yapılara lossless dönüşüm sağlar.
-
-**Kabul:** model kimliği, runtime ve task contract birbirinden bağımsızdır; legacy kullanıcı ayarı kaybolmaz.
+Canonical Gemma kimliği `gemma4-12b`; eski üç Gemma task profili migration alias'ı olarak korunur.
 
 ---
 
 # Sprint 2 — Runtime adapter
 
-`InferenceRuntime` sözleşmesi:
+**Durum: devam ediyor.**
 
-```text
-start
-stop
-health
-probe
-capabilities
-complete
-fingerprint
-preview_args
-```
+`InferenceRuntimeAdapter` ve `LlamaCppRuntimeAdapter` eklendi. Adapter `RuntimeDefinition` üzerinden model/mmproj, GPU layers, context, batch/ubatch, KV cache, reasoning, image-token ayarları ve güvenli allowlisted extra args üretir. Strict Local host override ve tehlikeli runtime argümanları reddedilir.
 
-İlk adapter: `LlamaCppRuntimeAdapter`.
-
-Koddan çıkarılacak kararlar:
-
-- gpu layers
-- context size
-- batch/ubatch
-- KV cache
-- parallel
-- reasoning
-- image token argümanları
-- mmproj gereksinimi
-
-Güvenlik:
-
-- `extra_args` allowlist/denylist
-- strict-local host override engeli
-- deterministic runtime fingerprint
-- mevcut process identity/port ownership/lease korunur
-- speaking shared runtime korunur
+Kapanış şartı: production `ModelProcessManager` launch spec'i de doğrudan bu adapter'dan almalı; legacy `ModelRuntimePreset` yalnız migration compatibility alanı olarak kalmalıdır.
 
 ---
 
 # Sprint 3 — Registry ve capability negotiation
 
-Registry saklar:
+**Durum: tamamlandı.**
+
+Kalıcı `model_platform.json` registry şu varlıkları saklar:
 
 ```text
-ModelDefinition
-RuntimeDefinition
-CapabilityManifest
-model/runtime fingerprint
-last verified at
-benchmark status
-lifecycle state
+models[]
+runtimes[]
+task_profiles[]
+bindings[]
+capability_manifests[]
+benchmark_results[]
 ```
 
-Probe zinciri:
+Capability probe zinciri:
 
 ```text
 file validation
-→ runtime startup
-→ health
+→ llama-server flag discovery
+→ runtime startup/health
 → text completion
 → JSON object
 → JSON schema
-→ vision (gerekliyse)
+→ synthetic vision probe
 → thinking control
-→ capability manifest
+→ CapabilityManifest
 ```
 
-Capability sonucu `pass | partial | fail | unverified` olabilir. Production task için `partial/unverified` otomatik kabul edilmez. Model fingerprint değişirse eski probe geçersiz olur.
+Probe gerçek öğrenci verisi kullanmaz. Geçici process yalnız probe tarafından başlatılmışsa probe tarafından kapatılır. Model/runtime fingerprint değişirse eski doğrulama geçersiz kabul edilir.
 
 ---
 
 # Sprint 4 — Task binding ve router
 
-Örnek:
-
-```text
-student_answer_ocr   → gemma4-12b
-rubric_extraction    → gemma4-12b
-semantic_scoring     → experimental-model-x
-speaking_cleanup     → gemma4-12b
-```
+**Durum: tamamlandı.**
 
 Router sırası:
 
-1. TaskProfile
-2. binding
-3. registry entry
-4. required capabilities
-5. lifecycle/production izinleri
-6. runtime uyumu
-7. privacy policy
-8. runtime lease
+1. `TaskProfile`
+2. etkin binding
+3. registry model/runtime kaydı
+4. lifecycle ve privacy
+5. güncel capability manifest
+6. benchmark/production gate
+7. runtime lease
 
-Sessiz fallback yasaktır. Binding unavailable ise typed error + recovery action döner; model otomatik Gemma'ya değiştirilmez.
+`ModelRuntimeService::acquire_ready_runtime_lease` artık merkezi routing noktasıdır. Mevcut OCR, scoring, rubric, question-text ve speaking servisleri aynı runtime-service API'sini kullanmaya devam eder; model adı domain servislerine sızmaz.
 
-Provenance task profile, binding, model ve runtime kimliğini taşır.
+Sessiz fallback yoktur. Başlatılmış model platform config'inde binding/capability/gate problemi varsa typed hata döner; otomatik Gemma fallback yapılmaz. Legacy fallback yalnız henüz platform bootstrap edilmemiş config için korunur.
 
 ---
 
@@ -259,9 +188,7 @@ Scoring metrikleri:
 - invalid-schema rate
 - direct-score leakage/rejection
 
-Versioned `BenchmarkPolicy` task bazlı threshold taşır. Model fingerprint değişirse benchmark invalid olur.
-
-Promotion fail-closed'dur; gate PASS olmadan Production yapılamaz.
+Versioned `BenchmarkPolicy` task bazlı threshold taşır. Model fingerprint değişirse benchmark invalid olur. Promotion fail-closed'dur; gate PASS olmadan Production yapılamaz.
 
 ---
 
@@ -281,17 +208,13 @@ Canonical model:
 gemma4-12b
 ```
 
-Görevler bağımsız TaskProfile'lara taşınır.
-
 `model_profiles.json` migration:
 
 ```text
 backup → parse → model/runtime/task/binding üret → validate → atomic new config
 ```
 
-Başarısız migration eski dosyayı korur. Yeni yazımlar yalnız yeni config schema'ya gider; legacy read compatibility bir geçiş dönemi korunur.
-
-Domain servislerinde `gemma` string veya profile-ID branching kalmamalıdır.
+Başarısız migration eski dosyayı korur. Yeni yazımlar yalnız yeni config schema'ya gider; legacy read compatibility geçiş dönemi boyunca korunur. Domain servislerinde `gemma` string veya profile-ID branching kalmamalıdır.
 
 ---
 
@@ -343,47 +266,6 @@ Production gate:
 - [ ] Speaking regression
 - [ ] Rollback
 - [ ] CI
-
----
-
-## Config ve provenance hedefi
-
-Yeni config kavramsal olarak:
-
-```text
-model_platform.json
-models[]
-runtimes[]
-task_profiles[]
-bindings[]
-capability_manifests[]
-benchmark_results[]
-```
-
-Cache key en az:
-
-```text
-task_profile_id
-prompt_version
-schema_version
-policy_version
-model_fingerprint
-runtime_fingerprint
-sampling_parameters
-input_hash
-```
-
-Provenance en az:
-
-```text
-model_definition_id
-runtime_definition_id
-task_profile_id
-binding_id
-model_fingerprint
-runtime_fingerprint
-benchmark_policy_version
-```
 
 ---
 
