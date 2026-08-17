@@ -70,6 +70,7 @@ export type RuntimeDefinition = {
   kvCacheTypeK: string;
   kvCacheTypeV: string;
   reasoningMode: 'off' | 'on' | 'auto';
+  multimodalProjectorMode: 'enabled' | 'disabled' | 'auto';
   imageMinTokens?: number;
   imageMaxTokens?: number;
   cacheRamMegabytes?: number;
@@ -131,6 +132,13 @@ export type BenchmarkResultSummary = {
   generatedAt: string;
   metrics: Array<{ key: string; value: number; baselineValue?: number; pass: boolean }>;
   notes: string[];
+};
+
+export type PromotionDecision = {
+  allowed: boolean;
+  modelDefinitionId: string;
+  checkedTaskProfiles: string[];
+  reasons: string[];
 };
 
 export type ModelPlatformConfig = {
@@ -218,9 +226,24 @@ export const modelPlatformApi = {
         notes,
       },
     }),
+  submitGoldenOcrBenchmark: (
+    taskProfileId: string,
+    modelDefinitionId: string,
+    runtimeDefinitionId: string,
+    reportPath: string,
+    baselineReportPath: string,
+  ) =>
+    call<BenchmarkResultSummary>('submit_golden_ocr_benchmark_report', {
+      input: {
+        taskProfileId,
+        modelDefinitionId,
+        runtimeDefinitionId,
+        reportPath,
+        baselineReportPath,
+      },
+    }),
   promotionDecision: (modelDefinitionId: string) =>
-    call<{ allowed: boolean; modelDefinitionId: string; checkedTaskProfiles: string[]; reasons: string[] }>(
-      'get_model_promotion_decision',
-      { input: { modelDefinitionId } },
-    ),
+    call<PromotionDecision>('get_model_promotion_decision', {
+      input: { modelDefinitionId },
+    }),
 };
