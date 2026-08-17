@@ -174,6 +174,47 @@ impl ModelConfigService {
         self.get_profile(Some(profile_id))
     }
 
+    /// Adds or replaces a compatibility profile only in process memory.
+    ///
+    /// Model-platform routes use this seam so the legacy `model_profiles.json`
+    /// remains a read/migration source and is never polluted with generated
+    /// task/model/runtime profiles.
+    pub fn update_ephemeral_profile(&self, profile: ModelProfile) -> Result<(), AppError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|err| crate::domain::errors::AppError {
+                code: crate::domain::errors::AppErrorCode::ModelStateAccessFailed,
+                message: "Model konfigürasyonuna erişilemedi.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Uygulamayı yeniden başlatmayı deneyin.".to_string()),
+                technical_details: Some(format!("Mutex lock failed: {}", err)),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        if let Some(existing) = store.profiles.iter_mut().find(|p| p.id == profile.id) {
+            *existing = profile;
+        } else {
+            store.profiles.push(profile);
+        }
+        Ok(())
+    }
+
+    pub fn remove_ephemeral_profile(&self, profile_id: &str) -> Result<(), AppError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|err| crate::domain::errors::AppError {
+                code: crate::domain::errors::AppErrorCode::ModelStateAccessFailed,
+                message: "Model konfigürasyonuna erişilemedi.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Uygulamayı yeniden başlatmayı deneyin.".to_string()),
+                technical_details: Some(format!("Mutex lock failed: {}", err)),
+                correlation_id: Uuid::new_v4().to_string(),
+            })?;
+        store.profiles.retain(|profile| profile.id != profile_id);
+        Ok(())
+    }
+
     pub fn update_profile(&self, profile: ModelProfile) -> Result<(), AppError> {
         let mut store = self
             .store
