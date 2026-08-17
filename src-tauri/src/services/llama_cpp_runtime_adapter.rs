@@ -63,19 +63,31 @@ impl LlamaCppRuntimeAdapter {
             runtime.port.to_string(),
         ];
 
-        if model.capabilities.multimodal_projector_required {
+        let requires_mmproj = runtime.uses_multimodal_projector(model);
+        if requires_mmproj {
+            if !model.capabilities.vision {
+                return Err(model_error(
+                    AppErrorCode::ModelCapabilityMismatch,
+                    "Runtime multimodal projector istiyor ancak model vision capability bildirmiyor.",
+                    Some(format!("model_definition_id={}", model.id)),
+                    Some("Vision uyumlu bir model seçin veya projector kullanımını kapatın.".to_string()),
+                ));
+            }
             let mmproj = model
                 .mmproj_path
                 .as_deref()
                 .filter(|path| !path.trim().is_empty())
                 .ok_or_else(|| model_error(
-                    AppErrorCode::ModelCapabilityMismatch,
-                    "Bu model vision kullanımı için multimodal projector gerektiriyor.",
+                    AppErrorCode::ModelMmprojMissing,
+                    "Bu runtime vision kullanımı için multimodal projector gerektiriyor.",
                     Some(format!("model_definition_id={}", model.id)),
                     Some("Model için doğru mmproj dosyasını seçin.".to_string()),
                 ))?;
             args.push("--mmproj".to_string());
             args.push(mmproj.to_string());
+            if support_flags.mmproj_offload {
+                args.push("--mmproj-offload".to_string());
+            }
         }
 
         append_kv_cache_args(&mut args, runtime, support_flags)?;
@@ -87,7 +99,7 @@ impl LlamaCppRuntimeAdapter {
             }
         }
 
-        if model.capabilities.vision {
+        if requires_mmproj {
             if let Some(value) = runtime.image_min_tokens {
                 if support_flags.image_min_tokens {
                     args.push("--image-min-tokens".to_string());
@@ -202,7 +214,7 @@ impl InferenceRuntimeAdapter for LlamaCppRuntimeAdapter {
             args,
             base_url: runtime.base_url(),
             runtime_fingerprint: fingerprint_runtime_definition(runtime),
-            requires_mmproj: model.capabilities.multimodal_projector_required,
+            requires_mmproj: runtime.uses_multimodal_projector(model),
         })
     }
 }
@@ -245,7 +257,8 @@ fn flash_attention_value(value: FlashAttentionMode) -> &'static str {
 fn validate_and_normalize_extra_args(extra_args: &[String]) -> Result<Vec<String>, AppError> {
     let allowed_flags: BTreeSet<&'static str> = [
         "--threads", "--threads-batch", "--mlock", "--no-mmap", "--cont-batching",
-        "--no-cont-batching", "--prio", "--poll",
+        "--no-cont-batching", "--prio", "--poll", "--temp", "--top-p", "--top-k",
+        "--repeat-penalty", "-n", "--no-cache-prompt", "-cram", "-ctxcp",
     ]
     .into_iter()
     .collect();
