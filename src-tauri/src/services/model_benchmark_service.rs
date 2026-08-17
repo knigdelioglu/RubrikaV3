@@ -3,9 +3,7 @@ use crate::domain::model_platform::{
     fingerprint_runtime_definition, BenchmarkGateState, BenchmarkMetricValue,
     BenchmarkResultSummary, ModelLifecycleState, BENCHMARK_POLICY_VERSION,
 };
-use crate::services::model_platform_service::{
-    new_benchmark_result_id, ModelPlatformService,
-};
+use crate::services::model_platform_service::{new_benchmark_result_id, ModelPlatformService};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -122,7 +120,7 @@ impl ModelBenchmarkService {
                     notes.push(format!("required benchmark metric missing: {}", rule.key));
                     metrics.push(BenchmarkMetricValue {
                         key: rule.key.to_string(),
-                        value: f64::NAN,
+                        value: 0.0,
                         baseline_value: None,
                         pass: false,
                     });
@@ -139,11 +137,7 @@ impl ModelBenchmarkService {
             model_fingerprint: model.model_fingerprint.clone(),
             runtime_fingerprint: fingerprint_runtime_definition(runtime),
             policy_version: BENCHMARK_POLICY_VERSION.to_string(),
-            state: if all_pass {
-                BenchmarkGateState::Pass
-            } else {
-                BenchmarkGateState::Fail
-            },
+            state: if all_pass { BenchmarkGateState::Pass } else { BenchmarkGateState::Fail },
             generated_at: Utc::now().to_rfc3339(),
             metrics,
             notes,
@@ -156,15 +150,13 @@ impl ModelBenchmarkService {
                 ModelLifecycleState::Experimental | ModelLifecycleState::Compatible
             )
         {
-            let _ = self.platform.set_model_lifecycle(
-                &model.id,
-                ModelLifecycleState::BenchmarkVerified,
-            );
+            let _ = self
+                .platform
+                .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkVerified);
         } else if !all_pass && model.lifecycle_state != ModelLifecycleState::Production {
-            let _ = self.platform.set_model_lifecycle(
-                &model.id,
-                ModelLifecycleState::BenchmarkFailed,
-            );
+            let _ = self
+                .platform
+                .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkFailed);
         }
         Ok(result)
     }
@@ -194,7 +186,7 @@ fn policy_for_task(task_profile_id: &str) -> Vec<MetricRule> {
         | "rubric_extraction" => vec![
             rule("critical_token_missing", Compare::Equal, 0.0),
             rule("printed_question_leakage", Compare::Equal, 0.0),
-            rule("schema_failure_rate", Compare::LessOrEqual, 0.05),
+            regression_rule("schema_failure_rate", 0.0),
             regression_rule("cer", 0.03),
             regression_rule("wer", 0.05),
         ],
@@ -202,34 +194,24 @@ fn policy_for_task(task_profile_id: &str) -> Vec<MetricRule> {
             rule("unknown_criterion_id", Compare::Equal, 0.0),
             rule("invalid_canonical_level_id", Compare::Equal, 0.0),
             rule("positive_score_without_exact_evidence", Compare::Equal, 0.0),
-            rule("schema_failure_rate", Compare::LessOrEqual, 0.05),
+            regression_rule("schema_failure_rate", 0.0),
             rule("golden_agreement", Compare::GreaterOrEqual, 0.95),
         ],
         "speaking_transcript_cleanup" => vec![
             rule("segment_coverage", Compare::GreaterOrEqual, 1.0),
             rule("semantic_change_rate", Compare::LessOrEqual, 0.0),
-            rule("schema_failure_rate", Compare::LessOrEqual, 0.05),
+            regression_rule("schema_failure_rate", 0.0),
         ],
-        _ => vec![rule("schema_failure_rate", Compare::LessOrEqual, 0.05)],
+        _ => vec![regression_rule("schema_failure_rate", 0.0)],
     }
 }
 
 fn rule(key: &'static str, compare: Compare, threshold: f64) -> MetricRule {
-    MetricRule {
-        key,
-        compare,
-        threshold,
-        required: true,
-    }
+    MetricRule { key, compare, threshold, required: true }
 }
 
 fn regression_rule(key: &'static str, threshold: f64) -> MetricRule {
-    MetricRule {
-        key,
-        compare: Compare::RegressionLessOrEqual,
-        threshold,
-        required: true,
-    }
+    MetricRule { key, compare: Compare::RegressionLessOrEqual, threshold, required: true }
 }
 
 fn benchmark_error(
