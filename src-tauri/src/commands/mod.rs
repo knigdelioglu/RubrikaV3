@@ -10,6 +10,7 @@ pub mod graded_exam_review_commands;
 pub mod job_commands;
 pub mod mobile_connection_commands;
 pub mod model_commands;
+pub mod model_platform_commands;
 pub mod pdf_commands;
 pub mod project_commands;
 pub mod question_text_commands;
