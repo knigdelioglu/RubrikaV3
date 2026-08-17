@@ -31,6 +31,7 @@ pub mod ocr_image_preprocess_service;
 pub mod page_window_service;
 pub mod pdf_preview_service;
 pub mod pdf_service;
+pub mod platform_launch_registry;
 pub mod project_store;
 pub mod prompt_contract;
 pub mod question_text_service;
