@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const MODEL_PLATFORM_SCHEMA_VERSION: &str = "rubrika.model-platform.v1";
+pub const MODEL_PLATFORM_SCHEMA_VERSION: &str = "rubrika.model-platform.v2";
 pub const DEFAULT_LLAMA_RUNTIME_ID: &str = "llama-local-default";
 pub const CANONICAL_GEMMA4_12B_MODEL_ID: &str = "gemma4-12b";
 pub const BENCHMARK_POLICY_VERSION: &str = "model_benchmark_policy_v1";
@@ -83,9 +83,7 @@ impl ModelCapabilities {
             ModelCapabilityKind::StructuredJson => self.structured_json,
             ModelCapabilityKind::JsonSchema => self.json_schema,
             ModelCapabilityKind::ThinkingControl => self.thinking_control,
-            ModelCapabilityKind::MultimodalProjector => {
-                self.multimodal_projector_required
-            }
+            ModelCapabilityKind::MultimodalProjector => self.multimodal_projector_required,
         }
     }
 }
@@ -173,6 +171,15 @@ pub enum FlashAttentionMode {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MultimodalProjectorMode {
+    Enabled,
+    Disabled,
+    #[default]
+    Auto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeDefinition {
@@ -190,6 +197,8 @@ pub struct RuntimeDefinition {
     pub kv_cache_type_k: String,
     pub kv_cache_type_v: String,
     pub reasoning_mode: ReasoningMode,
+    #[serde(default)]
+    pub multimodal_projector_mode: MultimodalProjectorMode,
     #[serde(default)]
     pub image_min_tokens: Option<u32>,
     #[serde(default)]
@@ -219,10 +228,22 @@ impl RuntimeDefinition {
             kv_cache_type_k: "q8_0".to_string(),
             kv_cache_type_v: "q8_0".to_string(),
             reasoning_mode: ReasoningMode::Off,
+            multimodal_projector_mode: MultimodalProjectorMode::Enabled,
             image_min_tokens: Some(1120),
             image_max_tokens: Some(1120),
             cache_ram_megabytes: Some(0),
-            extra_args: vec![],
+            extra_args: vec![
+                "--temp".to_string(),
+                "0".to_string(),
+                "--top-p".to_string(),
+                "1".to_string(),
+                "--top-k".to_string(),
+                "1".to_string(),
+                "--repeat-penalty".to_string(),
+                "1.0".to_string(),
+                "-n".to_string(),
+                "768".to_string(),
+            ],
             privacy_mode: profile.privacy_mode,
             managed: matches!(profile.mode, ModelMode::Managed),
         }
@@ -237,17 +258,26 @@ impl RuntimeDefinition {
             port: profile.port,
             context_size: 8192,
             gpu_layers: 99,
-            flash_attention: FlashAttentionMode::On,
+            flash_attention: FlashAttentionMode::Auto,
             parallel: 1,
-            batch_size: 1024,
-            ubatch_size: 512,
+            batch_size: 512,
+            ubatch_size: 256,
             kv_cache_type_k: "turbo3".to_string(),
             kv_cache_type_v: "turbo3".to_string(),
             reasoning_mode: ReasoningMode::Off,
+            multimodal_projector_mode: MultimodalProjectorMode::Disabled,
             image_min_tokens: None,
             image_max_tokens: None,
             cache_ram_megabytes: None,
-            extra_args: vec![],
+            extra_args: vec![
+                "--repeat-penalty".to_string(),
+                "1.05".to_string(),
+                "--no-cache-prompt".to_string(),
+                "-cram".to_string(),
+                "0".to_string(),
+                "-ctxcp".to_string(),
+                "0".to_string(),
+            ],
             privacy_mode: profile.privacy_mode,
             managed: matches!(profile.mode, ModelMode::Managed),
         }
@@ -255,6 +285,17 @@ impl RuntimeDefinition {
 
     pub fn base_url(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
+    }
+
+    pub fn uses_multimodal_projector(&self, model: &ModelDefinition) -> bool {
+        match self.multimodal_projector_mode {
+            MultimodalProjectorMode::Enabled => true,
+            MultimodalProjectorMode::Disabled => false,
+            MultimodalProjectorMode::Auto => {
+                model.capabilities.multimodal_projector_required
+                    && (self.image_min_tokens.is_some() || self.image_max_tokens.is_some())
+            }
+        }
     }
 }
 
