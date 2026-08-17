@@ -19,6 +19,7 @@ pub mod model_benchmark_service;
 pub mod model_capability_probe_service;
 pub mod model_config_service;
 pub mod model_gateway;
+pub mod model_golden_benchmark_bridge;
 pub mod model_input_image_service;
 pub mod model_platform_migration_service;
 pub mod model_platform_service;
