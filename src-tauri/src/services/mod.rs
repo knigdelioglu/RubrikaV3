@@ -21,6 +21,7 @@ pub mod model_gateway;
 pub mod model_input_image_service;
 pub mod model_platform_service;
 pub mod model_process_manager;
+pub mod model_router_service;
 pub mod model_runtime_service;
 pub mod ocr_image_geometry_service;
 pub mod ocr_image_preprocess_service;
