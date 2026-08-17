@@ -1010,6 +1010,14 @@ pub fn build_model_server_args(
     profile: &ModelProfile,
     support_flags: &SupportFlags,
 ) -> Result<Vec<String>, AppError> {
+    // Compatibility seam: platform-generated profiles never use a legacy
+    // runtime preset as the source of truth. Their full model/runtime
+    // definitions live only in memory and the canonical llama.cpp adapter
+    // owns validation plus argument generation.
+    if let Some(launch) = crate::services::platform_launch_registry::get(&profile.id) {
+        return crate::services::llama_cpp_runtime_adapter::LlamaCppRuntimeAdapter::default()
+            .build_args(&launch.runtime, &launch.model, support_flags);
+    }
     if profile.runtime_preset == ModelRuntimePreset::SpeakoflowTextCleanup {
         return build_speakoflow_text_cleanup_args(profile, support_flags);
     }
