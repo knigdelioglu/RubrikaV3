@@ -18,6 +18,8 @@ use services::llama_server_gateway::LlamaServerGateway;
 use services::model_config_service::ModelConfigService;
 use services::model_gateway::ModelGateway;
 use services::model_input_image_service::ModelInputImageService;
+use services::model_platform_migration_service::ModelPlatformMigrationService;
+use services::model_platform_service::ModelPlatformService;
 use services::model_process_manager::ModelProcessManager;
 use services::model_runtime_service::ModelRuntimeService;
 use services::ocr_image_preprocess_service::OcrImagePreprocessService;
@@ -45,6 +47,7 @@ pub struct AppState {
     pub model_gateway: Arc<dyn ModelGateway>,
     pub model_gateway_impl: Arc<LlamaServerGateway>,
     pub model_config_service: ModelConfigService,
+    pub model_platform_service: ModelPlatformService,
     pub model_process_manager: ModelProcessManager,
     pub model_runtime_service: ModelRuntimeService,
     pub model_input_image_service: Arc<ModelInputImageService>,
@@ -77,10 +80,6 @@ pub fn run() {
         std::process::exit(0);
     }
 
-    // The managed-asset protocol can receive a request while the builder is
-    // still completing startup. Register this state before installing the
-    // protocol so an early preview request cannot call `state()` before
-    // `manage()` has run. The AppState below keeps the same shared store.
     let project_store = ProjectStore::new();
 
     tauri::Builder::default()
@@ -124,12 +123,24 @@ pub fn run() {
                 job_manager.clone(),
             ));
             let model_config_service = ModelConfigService::new();
+            let model_platform_service = ModelPlatformService::new();
+            let migration_service = ModelPlatformMigrationService::new(
+                model_platform_service.clone(),
+                model_config_service.clone(),
+            );
+            if let Err(error) = migration_service.bootstrap_if_needed() {
+                log::error!(
+                    "Model platform migration failed safely; legacy runtime remains available: {}",
+                    error
+                );
+            }
             let model_process_manager =
                 ModelProcessManager::new(model_config_service.clone(), model_gateway_impl.clone());
             let model_runtime_service = ModelRuntimeService::new(
                 model_config_service.clone(),
                 model_process_manager.clone(),
-            );
+            )
+            .with_model_platform(model_platform_service.clone());
             let model_input_image_service = Arc::new(ModelInputImageService::default());
             let ocr_image_preprocess_service = Arc::new(OcrImagePreprocessService);
             let document_content_extraction_service = Arc::new(
@@ -212,6 +223,7 @@ pub fn run() {
                 model_gateway: model_gateway.clone(),
                 model_gateway_impl,
                 model_config_service,
+                model_platform_service,
                 model_process_manager,
                 model_runtime_service: model_runtime_service.clone(),
                 model_input_image_service,
@@ -341,6 +353,16 @@ pub fn run() {
             commands::model_commands::reset_model_profile,
             commands::model_commands::preview_model_server_args,
             commands::model_commands::get_model_log_tail,
+            commands::model_platform_commands::get_model_platform_snapshot,
+            commands::model_platform_commands::import_local_model,
+            commands::model_platform_commands::upsert_model_runtime,
+            commands::model_platform_commands::probe_local_model,
+            commands::model_platform_commands::bind_model_task,
+            commands::model_platform_commands::disable_model_task_binding,
+            commands::model_platform_commands::set_model_lifecycle,
+            commands::model_platform_commands::submit_model_benchmark,
+            commands::model_platform_commands::get_model_promotion_decision,
+            commands::model_platform_commands::resolve_model_route_preview,
             commands::mobile_connection_commands::get_mobile_connection_info,
             commands::question_text_commands::start_question_text_extraction,
             commands::question_text_commands::start_question_text_vision_fallback,
