@@ -1,16 +1,17 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelMode, ModelProfile, ModelStatus, PrivacyMode};
-use crate::domain::model_platform::ModelTaskKind;
+use crate::domain::model_platform::{fingerprint_runtime_definition, ModelTaskKind};
 use crate::services::llama_server_gateway::validate_base_url_for_privacy;
 use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_platform_migration_service::materialize_route_as_legacy_profile;
 use crate::services::model_platform_service::ModelPlatformService;
 use crate::services::model_process_manager::{ModelProcessManager, RuntimeLeaseGrant};
 use crate::services::model_router_service::{ModelRouterService, ResolvedModelRoute, RouteUsageMode};
+use crate::services::platform_launch_registry;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,6 +55,8 @@ impl ModelUseCase {
     }
 
     fn platform_task(&self, requested_profile_id: Option<&str>) -> ModelTaskKind {
+        // One-release read compatibility for callers that still pass the old
+        // speaking profile ids. New callers should use the explicit use case.
         if requested_profile_id == Some("speaking_transcript_cleanup_12b") {
             return ModelTaskKind::SpeakingTranscriptCleanup;
         }
@@ -136,6 +139,13 @@ pub struct ModelRouteLeaseMetadata {
     pub runtime_definition_id: String,
     pub model_fingerprint: String,
     pub runtime_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlatformRuntimeSelection {
+    profile_id: String,
+    model_fingerprint: String,
+    runtime_fingerprint: String,
 }
 
 pub struct ModelRuntimeLease {
@@ -242,6 +252,7 @@ pub struct ModelRuntimeService {
     config_service: ModelConfigService,
     process_manager: ModelProcessManager,
     platform_service: Option<ModelPlatformService>,
+    platform_runtime_selection: Arc<Mutex<Option<PlatformRuntimeSelection>>>,
 }
 
 impl ModelRuntimeService {
@@ -250,6 +261,7 @@ impl ModelRuntimeService {
             config_service,
             process_manager,
             platform_service: None,
+            platform_runtime_selection: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -267,6 +279,12 @@ impl ModelRuntimeService {
     ) -> Result<ModelRuntimeLease, AppError> {
         let (effective_profile_id, profile, route) =
             self.resolve_effective_profile(profile_id, &operation, correlation_id)?;
+        if let (Some(materialized_id), Some(resolved_route)) =
+            (effective_profile_id.as_deref(), route.as_ref())
+        {
+            self.prepare_platform_runtime(materialized_id, resolved_route, correlation_id)
+                .await?;
+        }
         if profile.server_path.trim().is_empty()
             && profile.model_path.trim().is_empty()
             && profile.mmproj_path.trim().is_empty()
@@ -317,6 +335,11 @@ impl ModelRuntimeService {
                 error.correlation_id = correlation_id.to_string();
                 normalize_model_error(error)
             })?;
+        if let (Some(materialized_id), Some(resolved_route)) =
+            (effective_profile_id.as_deref(), route.as_ref())
+        {
+            self.remember_platform_runtime(materialized_id, resolved_route)?;
+        }
         Ok(ModelRuntimeLease {
             manager: self.process_manager.clone(),
             grant,
@@ -358,6 +381,97 @@ impl ModelRuntimeService {
             })?;
         let profile = self.config_service.get_profile(Some(&materialized_id))?;
         Ok((Some(materialized_id), profile, Some(route)))
+    }
+
+    async fn prepare_platform_runtime(
+        &self,
+        profile_id: &str,
+        route: &ResolvedModelRoute,
+        correlation_id: &str,
+    ) -> Result<(), AppError> {
+        let desired = platform_selection(profile_id, route);
+        let current = self
+            .platform_runtime_selection
+            .lock()
+            .map_err(|error| runtime_state_error(error.to_string(), correlation_id))?
+            .clone();
+
+        if let Some(current) = current.filter(|current| current != &desired) {
+            let active_leases = self.process_manager.active_lease_count()?;
+            if active_leases > 0 {
+                return Err(AppError {
+                    code: AppErrorCode::ModelRuntimeProfileBusy,
+                    message: "Etkin model işlemi sürerken model/runtime değiştirilemez.".to_string(),
+                    recoverable: true,
+                    suggested_action: Some("Etkin model işlemlerinin tamamlanmasını bekleyin.".to_string()),
+                    technical_details: Some(format!(
+                        "active_leases={active_leases}; current_profile={}; requested_profile={profile_id}",
+                        current.profile_id
+                    )),
+                    correlation_id: correlation_id.to_string(),
+                });
+            }
+            self.process_manager
+                .stop_server(Some(&current.profile_id))
+                .await
+                .map_err(|mut error| {
+                    error.correlation_id = correlation_id.to_string();
+                    error
+                })?;
+            self.config_service.remove_ephemeral_profile(&current.profile_id)?;
+            platform_launch_registry::remove(&current.profile_id);
+            let mut guard = self
+                .platform_runtime_selection
+                .lock()
+                .map_err(|error| runtime_state_error(error.to_string(), correlation_id))?;
+            if guard.as_ref() == Some(&current) {
+                *guard = None;
+            }
+        }
+
+        let status = self
+            .process_manager
+            .get_model_status(Some(profile_id))
+            .await
+            .map_err(|mut error| {
+                error.correlation_id = correlation_id.to_string();
+                error
+            })?;
+        if route.runtime.managed && status.server_running && !status.started_by_app {
+            return Err(AppError {
+                code: AppErrorCode::ModelRuntimePortOccupied,
+                message: "Seçili managed runtime portu doğrulanmamış başka bir süreç tarafından kullanılıyor."
+                    .to_string(),
+                recoverable: true,
+                suggested_action: Some(
+                    "Çakışan süreci kapatın veya model runtime için başka bir port seçin.".to_string(),
+                ),
+                technical_details: Some(format!(
+                    "profile_id={profile_id}; base_url={}; managed=true; started_by_app=false",
+                    status.base_url
+                )),
+                correlation_id: correlation_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn remember_platform_runtime(
+        &self,
+        profile_id: &str,
+        route: &ResolvedModelRoute,
+    ) -> Result<(), AppError> {
+        let selection = platform_selection(profile_id, route);
+        let mut guard = self.platform_runtime_selection.lock().map_err(|error| AppError {
+            code: AppErrorCode::ModelStateAccessFailed,
+            message: "Model platform runtime seçimi kaydedilemedi.".to_string(),
+            recoverable: false,
+            suggested_action: Some("Uygulamayı yeniden başlatın.".to_string()),
+            technical_details: Some(error.to_string()),
+            correlation_id: uuid::Uuid::new_v4().to_string(),
+        })?;
+        *guard = Some(selection);
+        Ok(())
     }
 
     pub async fn get_runtime_status(
@@ -486,6 +600,14 @@ impl ModelRuntimeService {
     }
 }
 
+fn platform_selection(profile_id: &str, route: &ResolvedModelRoute) -> PlatformRuntimeSelection {
+    PlatformRuntimeSelection {
+        profile_id: profile_id.to_string(),
+        model_fingerprint: route.model.model_fingerprint.clone(),
+        runtime_fingerprint: fingerprint_runtime_definition(&route.runtime),
+    }
+}
+
 fn route_lease_metadata(route: &ResolvedModelRoute) -> ModelRouteLeaseMetadata {
     ModelRouteLeaseMetadata {
         task_profile_id: route.task_profile.id.clone(),
@@ -493,9 +615,18 @@ fn route_lease_metadata(route: &ResolvedModelRoute) -> ModelRouteLeaseMetadata {
         model_definition_id: route.model.id.clone(),
         runtime_definition_id: route.runtime.id.clone(),
         model_fingerprint: route.model.model_fingerprint.clone(),
-        runtime_fingerprint: crate::domain::model_platform::fingerprint_runtime_definition(
-            &route.runtime,
-        ),
+        runtime_fingerprint: fingerprint_runtime_definition(&route.runtime),
+    }
+}
+
+fn runtime_state_error(details: String, correlation_id: &str) -> AppError {
+    AppError {
+        code: AppErrorCode::ModelStateAccessFailed,
+        message: "Model platform runtime durumuna erişilemedi.".to_string(),
+        recoverable: false,
+        suggested_action: Some("Uygulamayı yeniden başlatın.".to_string()),
+        technical_details: Some(details),
+        correlation_id: correlation_id.to_string(),
     }
 }
 
