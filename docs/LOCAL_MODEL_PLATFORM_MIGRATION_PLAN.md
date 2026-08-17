@@ -1,10 +1,10 @@
 # RubrikaV3 — Local Model Platform Migration Plan
 
-Bu plan, RubrikaV3'ün mevcut Gemma 4 12B + llama.cpp entegrasyonunu bozmadan; yeni yerel modellerin kod değişikliği gerektirmeden eklenebildiği, görev bazında seçilebildiği, capability probe ve golden benchmark ile doğrulandığı model-bağımsız bir platform yapısına geçişi tanımlar.
+Amaç: mevcut Gemma 4 12B + llama.cpp production davranışını bozmadan RubrikaV3'ü model-bağımsız, görev bazlı, capability-probe ve benchmark-gated bir local inference platformuna dönüştürmek.
 
 ## Takip Listesi
 
-- [ ] Sprint 0 — Mevcut davranışı kilitle ve migration sınırını tanımla
+- [x] Sprint 0 — Mevcut davranışı kilitle ve migration sınırını tanımla
 - [ ] Sprint 1 — `ModelDefinition`, `RuntimeDefinition` ve `TaskProfile` ayrımını getir
 - [ ] Sprint 2 — Runtime argümanlarını koddan çıkar ve `LlamaCppRuntimeAdapter` katmanını oluştur
 - [ ] Sprint 3 — Model Registry + Capability Negotiation altyapısını kur
@@ -14,16 +14,16 @@ Bu plan, RubrikaV3'ün mevcut Gemma 4 12B + llama.cpp entegrasyonunu bozmadan; y
 - [ ] Sprint 7 — Gemma özel sabitleri kaldır, compatibility migration yap ve eski profilleri emekli et
 - [ ] Sprint 8 — Final regression, rollback doğrulaması ve production gate
 
+> Test kuralı: Sprint 0–7 kod ve dokümantasyon işi tamamlanmadan test/regression çalıştırılmaz. Testler yalnız Sprint 8'de toplu çalıştırılır.
+
 ---
 
-## 1. Hedef Mimari
-
-Geçiş sonunda hedef akış:
+## Hedef Mimari
 
 ```text
 Rubrika Domain
     ↓
-Task Contract
+Task Contract / TaskProfile
     ↓
 Model Router
     ↓
@@ -33,7 +33,7 @@ Model Registry
     ↓
 Capability Negotiation
     ↓
-Inference Runtime
+InferenceRuntime
     ↓
 LlamaCppRuntimeAdapter
     ↓
@@ -42,534 +42,232 @@ llama-server
 Local Model
 ```
 
-İleride aynı `InferenceRuntime` sözleşmesinin altına başka adapter'lar eklenebilir:
+Gelecekte aynı runtime sözleşmesinin altına `MlxRuntimeAdapter` veya explicit-consent external adapter eklenebilir. Production/default runtime llama.cpp olarak kalır.
 
-```text
-InferenceRuntime
-├── LlamaCppRuntimeAdapter   ← production/default
-├── MlxRuntimeAdapter        ← gelecekte opsiyonel
-└── ExternalCompatibleAdapter← yalnız açık izinli kullanım
-```
-
-Bu migration'ın temel ilkesi şudur:
-
-> Domain servisleri hiçbir model ailesini, GGUF dosyasını, mmproj yolunu veya llama.cpp argümanını bilmemelidir.
+Temel invariant: domain servisleri model ailesini, GGUF dosyasını, mmproj yolunu veya llama.cpp argümanlarını bilmez.
 
 ---
 
-# Sprint 0 — Mevcut davranışı kilitle ve migration sınırını tanımla
+# Sprint 0 — Baseline ve migration sınırı
 
-## Amaç
+**Durum: tamamlandı.** Referans: `docs/LOCAL_MODEL_PLATFORM_BASELINE.md`.
 
-Mevcut Gemma 4 12B production davranışını referans kabul ederek migration sırasında sessiz regresyon oluşmasını engellemek.
+Kilitlenen alanlar:
 
-## Yapılacaklar
-
-- Mevcut model akışlarının envanterini çıkar:
-  - Question text extraction
-  - Rubric extraction
-  - Student answer OCR
-  - OCR issue correction
-  - Semantic scoring
-  - Speaking transcript cleanup
-  - Speaking rubric evaluation
-  - General/analysis model calls
-- Mevcut profile ID, prompt version, schema version, policy version ve runtime fingerprint ilişkilerini dokümante et.
-- `Gemma 4 12B` mevcut production baseline olarak işaretlensin.
-- `MODEL_GATEWAY.md`, `MODEL_RUNTIME_OWNERSHIP.md`, golden benchmark ve ilgili testler migration reference olarak sabitlensin.
-- Migration boyunca değiştirilmemesi gereken güvenlik invariant'larını açıkça yaz:
-  - UI model endpoint'ine doğrudan çağrı yapmaz.
-  - Student-data çağrıları strict-local sınırını korur.
-  - Model skoru doğrudan persist edilmez.
-  - Semantic scoring canonical rubric level → Rust score mapping kullanır.
-  - OCR/scoring invalid JSON veya schema mismatch durumunda fail-closed kalır.
-  - Prompt/schema/policy/model/runtime provenance kaybolmaz.
-
-## Kabul Kriterleri
-
-- Mevcut Gemma production davranışı baseline olarak kaydedilmiş olmalı.
-- Migration sonrasında karşılaştırılacak regression fixture/golden set listesi net olmalı.
-- Hiçbir domain davranışı bu sprintte değişmemeli.
+- question/rubric extraction
+- student OCR + issue correction
+- semantic scoring
+- speaking cleanup/evaluation
+- analysis/general model calls
+- strict-local privacy
+- canonical rubric → Rust score mapping
+- fail-closed JSON/schema davranışı
+- prompt/schema/policy/model/runtime provenance
+- process ownership, lease ve shared-runtime davranışı
+- golden OCR/scoring corpus ve mevcut regression dokümanları
 
 ---
 
-# Sprint 1 — `ModelDefinition`, `RuntimeDefinition` ve `TaskProfile` ayrımını getir
+# Sprint 1 — Domain ayrımı
 
-## Amaç
-
-Bugünkü `ModelProfile` içinde birleşmiş olan üç farklı sorumluluğu ayırmak:
-
-1. Modelin kimliği ve yetenekleri
-2. Runtime'ın nasıl çalıştırılacağı
-3. Görevin modelden ne beklediği
-
-## Yeni Domain Yapıları
+Yeni yapılar:
 
 ### `ModelDefinition`
 
-Örnek alanlar:
-
-```text
-id
-family
-display_name
-model_path
-mmproj_path?
-format
-quantization?
-capabilities
-context_limit?
-metadata
-model_fingerprint
-lifecycle_state
-```
-
-`capabilities` en az şu alanları desteklemeli:
-
-```text
-text
-vision
-structured_json
-json_schema
-thinking_control
-multimodal_projector_required
-```
+- id, family, display name
+- model path / optional mmproj
+- format / quantization
+- declared capabilities
+- context limit
+- model fingerprint
+- lifecycle state
+- metadata
 
 ### `RuntimeDefinition`
 
-Örnek alanlar:
-
-```text
-id
-engine
-server_path
-host
-port
-context_size
-gpu_layers
-flash_attention
-parallel
-batch_size
-ubatch_size
-kv_cache_type_k
-kv_cache_type_v
-reasoning_mode
-extra_args
-```
+- id, engine, server path
+- host/port
+- context/gpu/flash-attention
+- parallel/batch/ubatch
+- KV cache K/V
+- reasoning mode
+- güvenli allowlisted extra args
 
 ### `TaskProfile`
 
-Örnek görev alanları:
+- id/use case
+- required capabilities
+- prompt/schema/policy version
+- sampling parameters
+- timeout/max tokens
+- response format
 
-```text
-id
-use_case
-required_capabilities
-prompt_version
-schema_version
-policy_version
-temperature
-top_k
-top_p
-seed
-max_tokens
-timeout_seconds
-response_format
-```
+Legacy `ModelProfile` hemen silinmez; compatibility migration yeni yapılara lossless dönüşüm sağlar.
 
-## Migration Kuralı
-
-Mevcut `ModelProfile` hemen silinmemeli.
-
-Geçici compatibility adapter kullanılmalı:
-
-```text
-Legacy ModelProfile
-        ↓
-ProfileMigrationAdapter
-        ↓
-ModelDefinition + RuntimeDefinition
-```
-
-## Kabul Kriterleri
-
-- Domain katmanında model kimliği ile runtime preset ayrılmış olmalı.
-- Mevcut Gemma profilinin yeni yapılara lossless dönüşümü mümkün olmalı.
-- Legacy config açıldığında kullanıcı ayarı kaybolmamalı.
+**Kabul:** model kimliği, runtime ve task contract birbirinden bağımsızdır; legacy kullanıcı ayarı kaybolmaz.
 
 ---
 
-# Sprint 2 — Runtime argümanlarını koddan çıkar ve `LlamaCppRuntimeAdapter` katmanını oluştur
+# Sprint 2 — Runtime adapter
 
-## Amaç
-
-`build_model_server_args()` ve preset tabanlı Gemma/runtime özel davranışlarını veri odaklı hale getirmek.
-
-## Yeni Arayüz
+`InferenceRuntime` sözleşmesi:
 
 ```text
-InferenceRuntime
-├── start(runtime, model)
-├── stop(instance)
-├── health(instance)
-├── probe(instance)
-├── capabilities(instance)
-├── complete(request)
-├── fingerprint(instance)
-└── preview_args(runtime, model)
+start
+stop
+health
+probe
+capabilities
+complete
+fingerprint
+preview_args
 ```
 
-İlk implementasyon:
+İlk adapter: `LlamaCppRuntimeAdapter`.
 
-```text
-LlamaCppRuntimeAdapter
-```
+Koddan çıkarılacak kararlar:
 
-## Koddan Çıkarılacak Sabit Davranışlar
+- gpu layers
+- context size
+- batch/ubatch
+- KV cache
+- parallel
+- reasoning
+- image token argümanları
+- mmproj gereksinimi
 
-- `-ngl 99`
-- sabit context size
-- sabit batch / ubatch
-- KV cache tipi
-- `--parallel`
-- `--reasoning off`
-- image min/max token argümanları
-- mmproj kullanım zorunluluğu
-- preset'e bağlı runtime farkları
+Güvenlik:
 
-Bunlar `RuntimeDefinition` ve capability negotiation üzerinden üretilmeli.
-
-## Güvenlik Kuralları
-
-- Kullanıcı tarafından verilen keyfi `extra_args` doğrudan çalıştırılmamalı.
-- Allowlist/denylist uygulanmalı.
-- `--host` strict-local modda loopback dışına çıkamamalı.
-- Port ownership ve managed-process identity mekanizması korunmalı.
-- Runtime fingerprint argümanlardan deterministik üretilmeli.
-
-## Kabul Kriterleri
-
-- Gemma 4 mevcut production server args çıktısı semantik olarak eşdeğer kalmalı.
-- `ModelRuntimePreset` production karar mekanizması olmaktan çıkarılmalı.
-- Speaking cleanup ve speaking evaluation için ayrı model process başlatılmamalı; mevcut shared-runtime davranışı korunmalı.
+- `extra_args` allowlist/denylist
+- strict-local host override engeli
+- deterministic runtime fingerprint
+- mevcut process identity/port ownership/lease korunur
+- speaking shared runtime korunur
 
 ---
 
-# Sprint 3 — Model Registry + Capability Negotiation altyapısını kur
+# Sprint 3 — Registry ve capability negotiation
 
-## Amaç
-
-Yeni bir GGUF/model eklendiğinde Rubrika'nın modeli tanıyıp görev uyumluluğunu otomatik belirleyebilmesi.
-
-## Model Registry
-
-Registry en az şunları saklamalı:
+Registry saklar:
 
 ```text
-model_definition
-runtime_definition
-capability_probe_result
-model_fingerprint
-runtime_fingerprint
-last_verified_at
-benchmark_status
-lifecycle_state
+ModelDefinition
+RuntimeDefinition
+CapabilityManifest
+model/runtime fingerprint
+last verified at
+benchmark status
+lifecycle state
 ```
 
-## Capability Probe
-
-Yeni model için sıralı probe:
+Probe zinciri:
 
 ```text
 file validation
-    ↓
-runtime startup
-    ↓
-health probe
-    ↓
-text completion probe
-    ↓
-structured JSON probe
-    ↓
-JSON schema probe
-    ↓
-vision probe (model vision bildiriyorsa)
-    ↓
-thinking/reasoning behavior probe
-    ↓
-capability manifest
+→ runtime startup
+→ health
+→ text completion
+→ JSON object
+→ JSON schema
+→ vision (gerekliyse)
+→ thinking control
+→ capability manifest
 ```
 
-## Capability Sonuçları
+Capability sonucu `pass | partial | fail | unverified` olabilir. Production task için `partial/unverified` otomatik kabul edilmez. Model fingerprint değişirse eski probe geçersiz olur.
+
+---
+
+# Sprint 4 — Task binding ve router
 
 Örnek:
 
 ```text
-text: pass
-vision: pass
-structured_json: pass
-json_schema: partial
-thinking_control: pass
+student_answer_ocr   → gemma4-12b
+rubric_extraction    → gemma4-12b
+semantic_scoring     → experimental-model-x
+speaking_cleanup     → gemma4-12b
 ```
 
-`partial` capability production görevi için otomatik kabul edilmemeli.
+Router sırası:
 
-## Kabul Kriterleri
+1. TaskProfile
+2. binding
+3. registry entry
+4. required capabilities
+5. lifecycle/production izinleri
+6. runtime uyumu
+7. privacy policy
+8. runtime lease
 
-- Yeni model registry'ye eklenebilmeli.
-- Model kod değişikliği olmadan capability probe'dan geçebilmeli.
-- Uyumlu olmadığı task'lar otomatik olarak seçilemez olmalı.
-- Probe sonucu model fingerprint ile ilişkilendirilmeli; model dosyası değişirse doğrulama geçersizleşmeli.
+Sessiz fallback yasaktır. Binding unavailable ise typed error + recovery action döner; model otomatik Gemma'ya değiştirilmez.
+
+Provenance task profile, binding, model ve runtime kimliğini taşır.
 
 ---
 
-# Sprint 4 — Task → Model Binding ve model router katmanını devreye al
+# Sprint 5 — Model yaşam döngüsü ve Model Laboratuvarı
 
-## Amaç
-
-Her görevin bağımsız model seçebilmesini sağlamak.
-
-## Yeni Binding Modeli
+Lifecycle:
 
 ```text
-student_answer_ocr        → gemma4-12b
-ocr_issue_correction      → gemma4-12b
-rubric_extraction         → gemma4-12b
-semantic_scoring          → gemma4-12b
-speaking_cleanup          → gemma4-12b
-speaking_evaluation       → gemma4-12b
+Imported → Probing → Compatible → Experimental → BenchmarkVerified → Production
 ```
 
-Yeni model eklendiğinde örneğin yalnız scoring değiştirilebilmeli:
+Alternatif durumlar:
 
 ```text
-semantic_scoring          → experimental-model-x
+Unsupported | ProbeFailed | BenchmarkFailed | Disabled
 ```
 
-Diğer görevler Gemma'da kalmalı.
+Ayarlar > Yerel Modeller yüzeyi:
 
-## Router Sorumlulukları
+- Modeller
+- Runtime
+- Görev Atamaları
+- Benchmark
 
-Router şu kontrolleri yapmalı:
+Model kartında model/family/path/quantization/vision/mmproj/capabilities/lifecycle/verification/benchmark/task bindings gösterilir.
 
-1. TaskProfile bulunuyor mu?
-2. Task için binding var mı?
-3. Model registry'de mevcut mu?
-4. Model gerekli capability'lere sahip mi?
-5. Model production kullanımına izinli mi?
-6. Runtime uygun mu?
-7. Privacy policy izin veriyor mu?
-8. Runtime lease alınabiliyor mu?
+İşlemler: model ekle, GGUF/mmproj seç, runtime seç, probe, benchmark, experimental, production promotion, disable, task binding değiştir.
 
-Herhangi biri başarısızsa typed error + recovery action üretmeli.
-
-## Fallback Politikası
-
-Sessiz fallback yapılmamalı.
-
-Örnek:
-
-```text
-scoring → Model X
-Model X unavailable
-```
-
-sistem otomatik Gemma'ya dönmemeli.
-
-Doğru davranış:
-
-```text
-MODEL_BINDING_UNAVAILABLE
-Suggested action:
-- Gemma'ya geç
-- Model X'i başlat
-- Binding'i değiştir
-```
-
-Bu karar audit/provenance açısından görünür kalmalı.
-
-## Kabul Kriterleri
-
-- Aynı exam pipeline içinde farklı görevlerde farklı modeller kullanılabilmeli.
-- Provenance hangi task'ın hangi model/runtime ile çalıştığını açıkça göstermeli.
-- Kullanıcı onayı olmadan silent model substitution yapılmamalı.
+Imported/Probing/Compatible/Unsupported modeller gerçek öğrenci production verisi alamaz. Experimental kullanım explicit deney seçimi gerektirir.
 
 ---
 
-# Sprint 5 — Experimental / Production model yaşam döngüsü ve Model Laboratuvarı UI'sını ekle
+# Sprint 6 — Benchmark ve promotion gate
 
-## Amaç
+Mevcut golden altyapısı yeniden kullanılır.
 
-Yeni modelleri gerçek öğrenci akışına girmeden güvenli biçimde denemek.
+OCR metrikleri:
 
-## Lifecycle
+- CER/WER
+- critical-token missing
+- printed-question leakage
+- structured-field exact
+- schema success
+- retry/model-call count
+- p50/p95 latency
+- peak memory mevcutsa
 
-```text
-Imported
-  ↓
-Probing
-  ↓
-Compatible
-  ↓
-Experimental
-  ↓
-Benchmark Verified
-  ↓
-Production
-```
+Scoring metrikleri:
 
-Alternatif son durumlar:
+- canonical level agreement
+- criterion ID validity
+- exact-evidence validity
+- review rate
+- invalid-schema rate
+- direct-score leakage/rejection
 
-```text
-Unsupported
-Probe Failed
-Benchmark Failed
-Disabled
-```
+Versioned `BenchmarkPolicy` task bazlı threshold taşır. Model fingerprint değişirse benchmark invalid olur.
 
-## Model Laboratuvarı UI
-
-Ayarlar altında yeni yüzey:
-
-```text
-Ayarlar
-└── Yerel Modeller
-    ├── Modeller
-    ├── Runtime
-    ├── Görev Atamaları
-    └── Benchmark
-```
-
-### Model Kartı
-
-Gösterilecek bilgiler:
-
-- Model adı
-- Model ailesi
-- GGUF path
-- Quantization
-- Dosya boyutu
-- Vision/mmproj durumu
-- Capability sonuçları
-- Lifecycle state
-- Son doğrulama zamanı
-- Benchmark durumu
-- Kullanıldığı görevler
-
-### İşlemler
-
-- Model ekle
-- Model dosyası seç
-- mmproj seç
-- Runtime seç
-- Probe çalıştır
-- Benchmark çalıştır
-- Experimental yap
-- Production'a yükselt
-- Devre dışı bırak
-- Task binding değiştir
-
-## Güvenlik
-
-Gerçek öğrenci verisi `Imported`, `Probing`, `Compatible` veya `Unsupported` model durumlarına gönderilmemeli.
-
-Experimental model gerçek öğrenci verisinde ancak açıkça seçilmiş güvenli deney modu varsa kullanılmalı; varsayılan production akışına otomatik girmemeli.
-
-## Kabul Kriterleri
-
-- Yeni model UI üzerinden eklenebilmeli.
-- Kullanıcı kod veya config JSON düzenlemek zorunda kalmamalı.
-- Production modeli tek tıkla yanlışlıkla değiştirilememeli.
+Promotion fail-closed'dur; gate PASS olmadan Production yapılamaz.
 
 ---
 
-# Sprint 6 — Golden benchmark karşılaştırma ve promotion gate'lerini bağla
+# Sprint 7 — Legacy/Gemma özel yapıları emekli et
 
-## Amaç
-
-Yeni model seçimini sezgisel değil, ölçülebilir kalite verisine bağlamak.
-
-## Kullanılacak Mevcut Metrikler
-
-- CER
-- WER
-- Critical-token missing
-- Printed-question leakage
-- Structured-field exact match
-- Schema success rate
-- Retry count
-- Model call count
-- p50 latency
-- p95 latency
-- Peak memory (ölçülebiliyorsa)
-
-Scoring için ek metrikler:
-
-- Golden level agreement
-- Criterion ID validity
-- Exact-evidence validity
-- Review rate
-- Invalid-schema rate
-- Direct-score leakage/rejection count
-
-## Benchmark Sonucu
-
-Örnek karşılaştırma:
-
-```text
-Metric                 Gemma 4 12B    Model X
-OCR CER p50             0.00           0.01
-OCR WER p50             0.00           0.02
-Critical token miss     0              0
-Schema success          83%            100%
-Scoring agreement       94%            96%
-Latency p50             51 s           27 s
-Peak memory             9.8 GB         7.1 GB
-```
-
-## Promotion Gate
-
-Model `Production` statüsüne geçmeden önce task bazlı threshold uygulanmalı.
-
-Örneğin OCR için:
-
-```text
-critical token missing == 0
-printed leakage == 0
-schema failure <= threshold
-CER/WER baseline regression <= threshold
-```
-
-Scoring için:
-
-```text
-unknown criterion ID == 0
-invalid canonical level ID == 0
-positive score without exactEvidence == 0
-schema failure <= threshold
-golden agreement >= threshold
-```
-
-Threshold'lar kod içine dağılmamalı; versioned benchmark policy olmalı.
-
-## Kabul Kriterleri
-
-- Model benchmark sonucu registry'ye kaydedilmeli.
-- Model fingerprint değişirse eski benchmark geçersiz sayılmalı.
-- Task bazlı production promotion gate uygulanmalı.
-- Kullanıcı Gemma ile yeni modeli aynı ekranda karşılaştırabilmeli.
-
----
-
-# Sprint 7 — Gemma özel sabitleri kaldır, compatibility migration yap ve eski profilleri emekli et
-
-## Amaç
-
-Yeni mimari production'da kanıtlandıktan sonra eski model-spesifik yapıları kaldırmak.
-
-## Kaldırılacak / Dönüştürülecek Yapılar
-
-Aşağıdaki gibi model ve görevi birbirine bağlayan sabit kimlikler migration sonrası compatibility dışında kullanılmamalı:
+Eski model+task birleşik kimlikleri yalnız migration alias'ı olur:
 
 ```text
 gemma4-ocr-q8
@@ -577,203 +275,92 @@ speaking_transcript_cleanup_12b
 speaking_rubric_evaluation_12b
 ```
 
-Yerine:
+Canonical model:
 
 ```text
-ModelDefinition:
-  gemma4-12b
-
-TaskProfile:
-  student_answer_ocr
-  speaking_transcript_cleanup
-  speaking_rubric_evaluation
+gemma4-12b
 ```
 
-## Config Migration
+Görevler bağımsız TaskProfile'lara taşınır.
 
-Mevcut `model_profiles.json` için:
+`model_profiles.json` migration:
 
 ```text
-legacy config
-   ↓
-backup
-   ↓
-parse
-   ↓
-ModelDefinition oluştur
-   ↓
-RuntimeDefinition oluştur
-   ↓
-Task binding oluştur
-   ↓
-validate
-   ↓
-new config atomic write
+backup → parse → model/runtime/task/binding üret → validate → atomic new config
 ```
 
-Migration başarısız olursa eski dosya korunmalı ve uygulama fail-safe recovery ekranı göstermeli.
+Başarısız migration eski dosyayı korur. Yeni yazımlar yalnız yeni config schema'ya gider; legacy read compatibility bir geçiş dönemi korunur.
 
-## Deprecation
-
-- `ModelRuntimePreset` önce deprecated yapılmalı.
-- Bir release boyunca read compatibility korunmalı.
-- Yeni config yazımı yalnız yeni schema ile yapılmalı.
-- Sonraki cleanup fazında legacy serializer kaldırılmalı.
-
-## Kabul Kriterleri
-
-- Gemma yalnızca registry'deki bir model olarak kalmalı.
-- Domain servislerinde `gemma` string/sabit bağımlılığı kalmamalı.
-- Legacy kullanıcı config'i veri kaybı olmadan migrate olmalı.
+Domain servislerinde `gemma` string veya profile-ID branching kalmamalıdır.
 
 ---
 
-# Sprint 8 — Final regression, rollback doğrulaması ve production gate
+# Sprint 8 — Final regression ve production gate
 
-## Amaç
+Kod işi bittikten sonra ilk kez toplu test/regression çalıştırılır.
 
-Yeni model platformunun mevcut Rubrika güvenlik/kalite davranışını bozmadığını kanıtlamak.
+Doğrulanacak paketler:
 
-## Regression Paketleri
-
-### Model Gateway
-
-- Health probe
-- Completion probe
-- Vision probe
-- Structured JSON
-- JSON schema
-- Reasoning-only response
-- Empty response
-- Invalid JSON
-- Invalid schema
-- Timeout
-- Oversized request/response
-- Redirect rejection
-- Strict-local enforcement
+### Gateway
+health/completion/vision/JSON/schema/reasoning-only/empty/invalid/timeout/size/redirect/strict-local.
 
 ### Runtime
-
-- Managed process identity
-- Port ownership
-- Start/stop
-- Lease lifecycle
-- Drain behavior
-- Shared runtime reuse
-- Model fingerprint
-- Runtime fingerprint
-- Crash recovery
+process identity, port ownership, start-stop, lease/drain, shared runtime, fingerprints, crash recovery.
 
 ### OCR
-
-- Golden OCR corpus
-- CER/WER
-- Critical token
-- leakage
-- structured answer
-- review policy
+Golden corpus, CER/WER, critical-token, leakage, structured answer, review policy.
 
 ### Scoring
-
-- Canonical criterion ID enforcement
-- Canonical level mapping
-- Exact evidence
-- Direct score rejection
-- Invalid schema fail-closed
-- Deterministic answer types → Rust-only scoring
+canonical criterion/level, exact evidence, direct-score rejection, invalid-schema fail-closed, deterministic Rust-only types.
 
 ### Speaking
+text-only, no-mmproj, shared runtime, evidence, deterministic ceilings.
 
-- Text-only cleanup
-- No mmproj invariant
-- Shared runtime
-- Speaking rubric evidence
-- Deterministic ceilings
-
-## Rollback Testi
-
-Aşağıdaki senaryo özellikle doğrulanmalı:
+### Rollback
 
 ```text
 Gemma Production
-    ↓
-Model X Experimental
-    ↓
-Model X task binding
-    ↓
-Model X failure
-    ↓
-User explicitly switches binding back
-    ↓
-Gemma Production
+→ Model X Experimental
+→ task binding Model X
+→ failure
+→ explicit binding rollback
+→ Gemma Production
 ```
 
-Rollback'ta:
+Rollback model dosyasını yeniden seçtirmemeli; provenance/cache model kimliğini doğru ayırmalıdır.
 
-- eski model dosyası yeniden seçilmek zorunda kalmamalı,
-- prompt/schema/policy değişmemeli,
-- provenance doğru kalmalı,
-- cache yanlış model sonucunu reuse etmemeli.
+Production gate:
 
-## Production Gate
-
-Migration tamamlandı sayılmadan önce:
-
-```text
-[PASS] Legacy config migration
-[PASS] Gemma baseline regression
-[PASS] Model registry
-[PASS] Capability negotiation
-[PASS] Task router
-[PASS] Runtime adapter
-[PASS] Strict-local privacy
-[PASS] Golden OCR benchmark
-[PASS] Golden scoring benchmark
-[PASS] Speaking regression
-[PASS] Rollback
-[PASS] CI
-```
+- [ ] Legacy config migration
+- [ ] Gemma baseline regression
+- [ ] Model registry
+- [ ] Capability negotiation
+- [ ] Task router
+- [ ] Runtime adapter
+- [ ] Strict-local privacy
+- [ ] Golden OCR benchmark
+- [ ] Golden scoring benchmark
+- [ ] Speaking regression
+- [ ] Rollback
+- [ ] CI
 
 ---
 
-# Veri ve Config Şeması Önerisi
+## Config ve provenance hedefi
 
-Önerilen yeni config yapısı kavramsal olarak:
+Yeni config kavramsal olarak:
 
 ```text
 model_platform.json
-
 models[]
 runtimes[]
 task_profiles[]
 bindings[]
+capability_manifests[]
 benchmark_results[]
-active_runtime_instances[]   # yalnız runtime state için; kalıcı olmaması tercih edilir
 ```
 
-Örnek ilişki:
-
-```text
-ModelDefinition
-  id = gemma4-12b
-
-RuntimeDefinition
-  id = llama-local-default
-
-TaskProfile
-  id = student_answer_ocr
-
-Binding
-  task = student_answer_ocr
-  model = gemma4-12b
-  runtime = llama-local-default
-```
-
----
-
-# Cache ve Provenance Kuralları
-
-Yeni mimaride cache key en az şunları içermeli:
+Cache key en az:
 
 ```text
 task_profile_id
@@ -786,9 +373,7 @@ sampling_parameters
 input_hash
 ```
 
-Model binding değiştiğinde eski model sonucu yeni model sonucu gibi reuse edilmemeli.
-
-`ModelProvenance` geriye dönük izlenebilirliği korumalı ve mümkünse aşağıdaki kimlikleri açıkça taşımalı:
+Provenance en az:
 
 ```text
 model_definition_id
@@ -802,69 +387,49 @@ benchmark_policy_version
 
 ---
 
-# Hata Taksonomisine Eklenecek Önerilen Kodlar
+## Typed error hedefleri
 
-```text
-MODEL_REGISTRY_ENTRY_NOT_FOUND
-MODEL_CAPABILITY_MISMATCH
-MODEL_CAPABILITY_UNVERIFIED
-MODEL_BINDING_NOT_FOUND
-MODEL_BINDING_UNAVAILABLE
-MODEL_NOT_PRODUCTION_APPROVED
-MODEL_PROBE_FAILED
-MODEL_BENCHMARK_REQUIRED
-MODEL_BENCHMARK_FAILED
-MODEL_CONFIG_MIGRATION_FAILED
-MODEL_RUNTIME_ADAPTER_UNSUPPORTED
-```
+- `MODEL_REGISTRY_ENTRY_NOT_FOUND`
+- `MODEL_CAPABILITY_MISMATCH`
+- `MODEL_CAPABILITY_UNVERIFIED`
+- `MODEL_BINDING_NOT_FOUND`
+- `MODEL_BINDING_UNAVAILABLE`
+- `MODEL_NOT_PRODUCTION_APPROVED`
+- `MODEL_PROBE_FAILED`
+- `MODEL_BENCHMARK_REQUIRED`
+- `MODEL_BENCHMARK_FAILED`
+- `MODEL_CONFIG_MIGRATION_FAILED`
+- `MODEL_RUNTIME_ADAPTER_UNSUPPORTED`
 
-Mevcut typed error yaklaşımı korunmalı; kullanıcıya teknik kod yerine recovery action gösterilmeli.
+Teknik kodlar developer diagnostics'te kalır; teacher-facing yüzey recovery action gösterir.
 
 ---
 
-# Non-Goals
-
-Bu migration kapsamında ilk aşamada yapılmayacaklar:
+## Non-goals
 
 - llama.cpp production runtime'ını kaldırmak
-- Cloud LLM'i varsayılan yapmak
-- Scoring karar yetkisini modele vermek
-- Modelin verdiği sayısal skoru doğrudan persist etmek
-- Prompt/schema validation'ı modele bırakmak
-- Tüm modelleri tek görev için otomatik ensemble yapmak
-- Otomatik silent fallback
-- Gerçek öğrenci verisini benchmark corpus'u yapmak
+- Cloud LLM'i default yapmak
+- scoring kararını modele devretmek
+- modelin sayısal skorunu doğrudan persist etmek
+- validation'ı modele bırakmak
+- automatic ensemble
+- silent fallback
+- gerçek öğrenci verisini benchmark corpus'u yapmak
 
----
+## Başarı Tanımı
 
-# Başarı Tanımı
-
-Migration başarılı sayıldığında aşağıdaki kullanım mümkün olmalı:
+Yeni model ekleme akışı:
 
 ```text
-Yeni model indir
-    ↓
-Rubrika > Yerel Modeller > Model Ekle
-    ↓
 GGUF seç
-    ↓
-Gerekirse mmproj seç
-    ↓
-Capability probe
-    ↓
-Golden benchmark
-    ↓
-Experimental
-    ↓
-Task için seç
-    ↓
-Karşılaştır
-    ↓
-Promotion gate PASS
-    ↓
-Production
+→ gerekirse mmproj seç
+→ capability probe
+→ golden benchmark
+→ Experimental
+→ task binding
+→ karşılaştırma
+→ promotion gate PASS
+→ Production
 ```
 
-Yeni model eklemek için artık Rust koduna yeni bir Gemma/Qwen/model-ailesi özel `enum`, profile ID veya `build_*_args()` dalı eklemek gerekmemelidir.
-
-Mevcut Gemma 4 12B modeli ise bu geçiş sonunda özel durum olmaktan çıkar ve aynı registry/runtime/task sözleşmelerini kullanan doğrulanmış production model olarak çalışmaya devam eder.
+Yeni model için Rust'a model-ailesi özel enum, hard-coded profile ID veya yeni `build_*_args()` dalı eklemek gerekmemelidir.
