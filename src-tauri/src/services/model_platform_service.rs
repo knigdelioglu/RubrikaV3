@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+const MODEL_PLATFORM_SCHEMA_V1: &str = "rubrika.model-platform.v1";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportModelInput {
@@ -90,7 +92,7 @@ impl ModelPlatformService {
     pub fn replace_config(&self, config: ModelPlatformConfig) -> Result<(), AppError> {
         if config.schema_version != MODEL_PLATFORM_SCHEMA_VERSION {
             return Err(platform_error(
-                AppErrorCode::ModelConfigMissing,
+                AppErrorCode::ModelConfigMigrationFailed,
                 "Model platform config sürümü desteklenmiyor.",
                 Some(format!("schema_version={}", config.schema_version)),
                 Some("Model platform ayarlarını yeniden oluşturun.".to_string()),
@@ -149,7 +151,7 @@ impl ModelPlatformService {
             format: crate::domain::model_platform::ModelFormat::Gguf,
             quantization: input.quantization,
             capabilities: crate::domain::model_platform::ModelCapabilities {
-                text: input.declared_text || true,
+                text: true,
                 vision: input.declared_vision,
                 structured_json: input.declared_structured_json,
                 json_schema: input.declared_json_schema,
@@ -195,7 +197,12 @@ impl ModelPlatformService {
         );
         let mut store = self.lock()?;
         if let Some(existing) = store.models.iter_mut().find(|item| item.id == model.id) {
-            *existing = model;
+            let fingerprint_changed = existing.model_fingerprint != model.model_fingerprint;
+            *existing = model.clone();
+            if fingerprint_changed {
+                store.capability_manifests.retain(|item| item.model_definition_id != model.id);
+                store.benchmark_results.retain(|item| item.model_definition_id != model.id);
+            }
         } else {
             store.models.push(model);
         }
@@ -211,11 +218,23 @@ impl ModelPlatformService {
                 Some("Runtime için benzersiz bir kimlik girin.".to_string()),
             ));
         }
+        let runtime_id = runtime.id.clone();
+        let new_fingerprint = fingerprint_runtime_definition(&runtime);
         let mut store = self.lock()?;
-        if let Some(existing) = store.runtimes.iter_mut().find(|item| item.id == runtime.id) {
+        let mut fingerprint_changed = false;
+        if let Some(existing) = store.runtimes.iter_mut().find(|item| item.id == runtime_id) {
+            fingerprint_changed = fingerprint_runtime_definition(existing) != new_fingerprint;
             *existing = runtime;
         } else {
             store.runtimes.push(runtime);
+        }
+        if fingerprint_changed {
+            store
+                .capability_manifests
+                .retain(|item| item.runtime_definition_id != runtime_id);
+            store
+                .benchmark_results
+                .retain(|item| item.runtime_definition_id != runtime_id);
         }
         self.save_locked(&store)
     }
@@ -264,7 +283,7 @@ impl ModelPlatformService {
             .iter_mut()
             .find(|item| item.id == binding_id)
             .ok_or_else(|| platform_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelBindingNotFound,
                 "Model görev ataması bulunamadı.",
                 Some(format!("binding_id={binding_id}")),
                 Some("Görev atamalarını yenileyin.".to_string()),
@@ -281,7 +300,7 @@ impl ModelPlatformService {
             || fingerprint_runtime_definition(runtime) != manifest.runtime_fingerprint
         {
             return Err(platform_error(
-                AppErrorCode::ModelConfigMissing,
+                AppErrorCode::ModelCapabilityUnverified,
                 "Capability sonucu güncel model/runtime fingerprint'i ile eşleşmiyor.",
                 Some(format!("model_definition_id={}", manifest.model_definition_id)),
                 Some("Capability probe'u yeniden çalıştırın.".to_string()),
@@ -304,7 +323,7 @@ impl ModelPlatformService {
             || fingerprint_runtime_definition(runtime) != result.runtime_fingerprint
         {
             return Err(platform_error(
-                AppErrorCode::ModelConfigMissing,
+                AppErrorCode::ModelBenchmarkRequired,
                 "Benchmark sonucu güncel fingerprint ile eşleşmiyor.",
                 Some(format!("benchmark_id={}", result.id)),
                 Some("Benchmark'ı güncel model/runtime ile yeniden çalıştırın.".to_string()),
@@ -328,7 +347,7 @@ impl ModelPlatformService {
             let decision = self.production_promotion_decision(model_definition_id)?;
             if !decision.allowed {
                 return Err(platform_error(
-                    AppErrorCode::ModelConfigMissing,
+                    AppErrorCode::ModelNotProductionApproved,
                     "Model production promotion gate'ini geçemedi.",
                     Some(decision.reasons.join("; ")),
                     Some("Eksik capability probe veya benchmark adımlarını tamamlayın.".to_string()),
@@ -342,7 +361,7 @@ impl ModelPlatformService {
             .iter_mut()
             .find(|item| item.id == model_definition_id)
             .ok_or_else(|| platform_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelRegistryEntryNotFound,
                 "Model registry kaydı bulunamadı.",
                 Some(format!("model_definition_id={model_definition_id}")),
                 Some("Modeli yeniden ekleyin.".to_string()),
@@ -448,7 +467,7 @@ impl ModelPlatformService {
             .iter_mut()
             .find(|item| item.id == model_definition_id)
             .ok_or_else(|| platform_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelRegistryEntryNotFound,
                 "Model registry kaydı bulunamadı.",
                 Some(format!("model_definition_id={model_definition_id}")),
                 Some("Modeli yeniden ekleyin.".to_string()),
@@ -498,21 +517,94 @@ fn load_store(path: &Path) -> Result<ModelPlatformConfig, AppError> {
         Some(error.to_string()),
         Some("Ayar dosyasını kontrol edin.".to_string()),
     ))?;
-    let config: ModelPlatformConfig = serde_json::from_str(&content).map_err(|error| platform_error(
-        AppErrorCode::ModelConfigMissing,
+    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|error| platform_error(
+        AppErrorCode::ModelConfigMigrationFailed,
         "Model platform ayar dosyası bozuk.",
+        Some(error.to_string()),
+        Some("Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string()),
+    ))?;
+    let original_schema = value
+        .get("schemaVersion")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if original_schema == MODEL_PLATFORM_SCHEMA_V1 {
+        migrate_v1_to_v2(&mut value)?;
+    }
+    let config: ModelPlatformConfig = serde_json::from_value(value).map_err(|error| platform_error(
+        AppErrorCode::ModelConfigMigrationFailed,
+        "Model platform ayarları yeni şemaya dönüştürülemedi.",
         Some(error.to_string()),
         Some("Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string()),
     ))?;
     if config.schema_version != MODEL_PLATFORM_SCHEMA_VERSION {
         return Err(platform_error(
-            AppErrorCode::ModelConfigMissing,
+            AppErrorCode::ModelConfigMigrationFailed,
             "Model platform config sürümü desteklenmiyor.",
             Some(format!("schema_version={}", config.schema_version)),
             Some("Model platform migration'ını çalıştırın.".to_string()),
         ));
     }
+    if original_schema == MODEL_PLATFORM_SCHEMA_V1 {
+        let migrated = serde_json::to_string_pretty(&config).map_err(|error| platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Dönüştürülen model platform ayarları serileştirilemedi.",
+            Some(error.to_string()),
+            None,
+        ))?;
+        atomic_write(path, &migrated).map_err(|error| platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Dönüştürülen model platform ayarları kaydedilemedi.",
+            Some(error.to_string()),
+            Some("Disk izinlerini kontrol edin.".to_string()),
+        ))?;
+    }
     Ok(config)
+}
+
+fn migrate_v1_to_v2(value: &mut serde_json::Value) -> Result<(), AppError> {
+    let object = value.as_object_mut().ok_or_else(|| platform_error(
+        AppErrorCode::ModelConfigMigrationFailed,
+        "Model platform config kökü nesne değil.",
+        None,
+        None,
+    ))?;
+    let runtimes = object
+        .get_mut("runtimes")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Model platform runtime listesi okunamadı.",
+            None,
+            None,
+        ))?;
+    for runtime in runtimes {
+        let Some(runtime_object) = runtime.as_object_mut() else {
+            continue;
+        };
+        if runtime_object.contains_key("multimodalProjectorMode") {
+            continue;
+        }
+        let has_image_tokens = runtime_object
+            .get("imageMinTokens")
+            .is_some_and(|value| !value.is_null())
+            || runtime_object
+                .get("imageMaxTokens")
+                .is_some_and(|value| !value.is_null());
+        runtime_object.insert(
+            "multimodalProjectorMode".to_string(),
+            serde_json::Value::String(if has_image_tokens {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            }),
+        );
+    }
+    object.insert(
+        "schemaVersion".to_string(),
+        serde_json::Value::String(MODEL_PLATFORM_SCHEMA_VERSION.to_string()),
+    );
+    Ok(())
 }
 
 fn model_platform_config_path() -> PathBuf {
@@ -533,7 +625,7 @@ fn require_task_profile<'a>(
     id: &str,
 ) -> Result<&'a TaskProfile, AppError> {
     store.task_profiles.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelProfileNotFound,
+        AppErrorCode::ModelRegistryEntryNotFound,
         "Task profile bulunamadı.",
         Some(format!("task_profile_id={id}")),
         Some("Model platform ayarlarını yenileyin.".to_string()),
@@ -545,7 +637,7 @@ fn require_model<'a>(
     id: &str,
 ) -> Result<&'a ModelDefinition, AppError> {
     store.models.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelProfileNotFound,
+        AppErrorCode::ModelRegistryEntryNotFound,
         "Model registry kaydı bulunamadı.",
         Some(format!("model_definition_id={id}")),
         Some("Modeli yeniden ekleyin.".to_string()),
@@ -557,7 +649,7 @@ fn require_runtime<'a>(
     id: &str,
 ) -> Result<&'a RuntimeDefinition, AppError> {
     store.runtimes.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelProfileNotFound,
+        AppErrorCode::ModelRegistryEntryNotFound,
         "Runtime registry kaydı bulunamadı.",
         Some(format!("runtime_definition_id={id}")),
         Some("Runtime ayarını yeniden oluşturun.".to_string()),
@@ -606,9 +698,6 @@ fn fingerprint_file(path: &Path) -> Result<String, AppError> {
         Some("Model dosyası izinlerini kontrol edin.".to_string()),
     ))?;
 
-    // Multi-gigabyte GGUF files are fingerprinted from stable identity signals
-    // plus the first/last 1 MiB. This detects normal replacement/update cases
-    // without hashing the entire model every time the settings screen opens.
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update(metadata.len().to_le_bytes());
