@@ -1,5 +1,5 @@
-import { SettingsPage } from './SettingsPage';
+import { ModelLabPage } from './ModelLabPage';
 
 export function ModelStatusPage() {
-  return <SettingsPage defaultTab="models" />;
+  return <ModelLabPage />;
 }
