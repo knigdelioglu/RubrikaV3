@@ -3,10 +3,11 @@ use crate::domain::model_platform::{
     CapabilityManifest, ModelDefinition, ModelLifecycleState, ModelPlatformConfig, ModelTaskKind,
     RuntimeDefinition, TaskModelBinding,
 };
-use crate::services::model_benchmark_service::{
-    BenchmarkSubmission, ModelBenchmarkService,
-};
+use crate::services::model_benchmark_service::{BenchmarkSubmission, ModelBenchmarkService};
 use crate::services::model_capability_probe_service::ModelCapabilityProbeService;
+use crate::services::model_golden_benchmark_bridge::{
+    GoldenOcrBenchmarkFileInput, ModelGoldenBenchmarkBridge,
+};
 use crate::services::model_platform_service::{
     BindTaskInput, ImportModelInput, ModelPlatformService, PromotionDecision,
 };
@@ -94,6 +95,14 @@ pub fn submit_model_benchmark(
 ) -> Result<crate::domain::model_platform::BenchmarkResultSummary, AppError> {
     let platform = ModelPlatformService::new();
     ModelBenchmarkService::new(platform).evaluate_and_record(input)
+}
+
+#[tauri::command]
+pub fn submit_golden_ocr_benchmark_report(
+    input: GoldenOcrBenchmarkFileInput,
+) -> Result<crate::domain::model_platform::BenchmarkResultSummary, AppError> {
+    let platform = ModelPlatformService::new();
+    ModelGoldenBenchmarkBridge::new(platform).evaluate_ocr_files(input)
 }
 
 #[tauri::command]
