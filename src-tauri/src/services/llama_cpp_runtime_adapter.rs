@@ -63,14 +63,13 @@ impl LlamaCppRuntimeAdapter {
             runtime.port.to_string(),
         ];
 
-        let requires_mmproj = model.capabilities.multimodal_projector_required;
-        if requires_mmproj {
+        if model.capabilities.multimodal_projector_required {
             let mmproj = model
                 .mmproj_path
                 .as_deref()
                 .filter(|path| !path.trim().is_empty())
                 .ok_or_else(|| model_error(
-                    AppErrorCode::ModelMmprojPathMissing,
+                    AppErrorCode::ModelCapabilityMismatch,
                     "Bu model vision kullanımı için multimodal projector gerektiriyor.",
                     Some(format!("model_definition_id={}", model.id)),
                     Some("Model için doğru mmproj dosyasını seçin.".to_string()),
@@ -105,27 +104,20 @@ impl LlamaCppRuntimeAdapter {
 
         if support_flags.reasoning_off {
             match runtime.reasoning_mode {
-                ReasoningMode::Off => {
-                    args.push("--reasoning".to_string());
-                    args.push("off".to_string());
-                }
-                ReasoningMode::On => {
-                    args.push("--reasoning".to_string());
-                    args.push("on".to_string());
-                }
+                ReasoningMode::Off => args.extend(["--reasoning".to_string(), "off".to_string()]),
+                ReasoningMode::On => args.extend(["--reasoning".to_string(), "on".to_string()]),
                 ReasoningMode::Auto => {}
             }
         } else if matches!(runtime.reasoning_mode, ReasoningMode::Off | ReasoningMode::On) {
             return Err(model_error(
-                AppErrorCode::ModelServerUnsupportedFlags,
+                AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Seçili llama-server reasoning kontrolünü desteklemiyor.",
                 Some("missing --reasoning support".to_string()),
                 Some("Güncel llama-server binary kullanın veya reasoning ayarını Auto yapın.".to_string()),
             ));
         }
 
-        let safe_extra_args = validate_and_normalize_extra_args(&runtime.extra_args)?;
-        args.extend(safe_extra_args);
+        args.extend(validate_and_normalize_extra_args(&runtime.extra_args)?);
         Ok(args)
     }
 
@@ -136,7 +128,7 @@ impl LlamaCppRuntimeAdapter {
     ) -> Result<(), AppError> {
         if runtime.engine != RuntimeEngine::LlamaCpp {
             return Err(model_error(
-                AppErrorCode::ModelServerStartFailed,
+                AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Runtime adapter bu engine'i desteklemiyor.",
                 Some(format!("runtime_engine={:?}", runtime.engine)),
                 Some("llama.cpp runtime seçin.".to_string()),
@@ -144,7 +136,7 @@ impl LlamaCppRuntimeAdapter {
         }
         if runtime.server_path.trim().is_empty() {
             return Err(model_error(
-                AppErrorCode::ModelServerPathMissing,
+                AppErrorCode::ModelBinaryMissing,
                 "llama-server binary yolu eksik.",
                 Some(format!("runtime_definition_id={}", runtime.id)),
                 Some("Runtime için llama-server binary dosyasını seçin.".to_string()),
@@ -152,7 +144,7 @@ impl LlamaCppRuntimeAdapter {
         }
         if model.model_path.trim().is_empty() {
             return Err(model_error(
-                AppErrorCode::ModelModelPathMissing,
+                AppErrorCode::ModelFileMissing,
                 "Model dosyası yolu eksik.",
                 Some(format!("model_definition_id={}", model.id)),
                 Some("GGUF model dosyasını seçin.".to_string()),
@@ -170,7 +162,7 @@ impl LlamaCppRuntimeAdapter {
         }
         if runtime.parallel == 0 || runtime.batch_size == 0 || runtime.ubatch_size == 0 {
             return Err(model_error(
-                AppErrorCode::ModelServerStartFailed,
+                AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Runtime batch/parallel değerleri sıfır olamaz.",
                 Some(format!(
                     "parallel={}; batch={}; ubatch={}",
@@ -181,12 +173,9 @@ impl LlamaCppRuntimeAdapter {
         }
         if runtime.ubatch_size > runtime.batch_size {
             return Err(model_error(
-                AppErrorCode::ModelServerStartFailed,
+                AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Ubatch değeri batch değerinden büyük olamaz.",
-                Some(format!(
-                    "batch={}; ubatch={}",
-                    runtime.batch_size, runtime.ubatch_size
-                )),
+                Some(format!("batch={}; ubatch={}", runtime.batch_size, runtime.ubatch_size)),
                 Some("Ubatch değerini batch değerinden küçük veya eşit yapın.".to_string()),
             ));
         }
@@ -225,24 +214,20 @@ fn append_kv_cache_args(
 ) -> Result<(), AppError> {
     if support_flags.cache_short_flags {
         args.extend([
-            "-ctk".to_string(),
-            runtime.kv_cache_type_k.clone(),
-            "-ctv".to_string(),
-            runtime.kv_cache_type_v.clone(),
+            "-ctk".to_string(), runtime.kv_cache_type_k.clone(),
+            "-ctv".to_string(), runtime.kv_cache_type_v.clone(),
         ]);
         return Ok(());
     }
     if support_flags.cache_type_flags {
         args.extend([
-            "--cache-type-k".to_string(),
-            runtime.kv_cache_type_k.clone(),
-            "--cache-type-v".to_string(),
-            runtime.kv_cache_type_v.clone(),
+            "--cache-type-k".to_string(), runtime.kv_cache_type_k.clone(),
+            "--cache-type-v".to_string(), runtime.kv_cache_type_v.clone(),
         ]);
         return Ok(());
     }
     Err(model_error(
-        AppErrorCode::ModelServerUnsupportedFlags,
+        AppErrorCode::ModelRuntimeAdapterUnsupported,
         "Bu llama-server sürümü KV cache bayraklarını desteklemiyor.",
         Some("missing KV cache flags".to_string()),
         Some("KV cache desteği olan güncel llama-server binary kullanın.".to_string()),
@@ -259,29 +244,14 @@ fn flash_attention_value(value: FlashAttentionMode) -> &'static str {
 
 fn validate_and_normalize_extra_args(extra_args: &[String]) -> Result<Vec<String>, AppError> {
     let allowed_flags: BTreeSet<&'static str> = [
-        "--threads",
-        "--threads-batch",
-        "--mlock",
-        "--no-mmap",
-        "--cont-batching",
-        "--no-cont-batching",
-        "--prio",
-        "--poll",
+        "--threads", "--threads-batch", "--mlock", "--no-mmap", "--cont-batching",
+        "--no-cont-batching", "--prio", "--poll",
     ]
     .into_iter()
     .collect();
     let forbidden_flags: BTreeSet<&'static str> = [
-        "-m",
-        "--model",
-        "--mmproj",
-        "--host",
-        "--port",
-        "--api-key",
-        "--api-key-file",
-        "--ssl-key-file",
-        "--ssl-cert-file",
-        "--chat-template-file",
-        "--rpc",
+        "-m", "--model", "--mmproj", "--host", "--port", "--api-key", "--api-key-file",
+        "--ssl-key-file", "--ssl-cert-file", "--chat-template-file", "--rpc",
     ]
     .into_iter()
     .collect();
@@ -290,10 +260,10 @@ fn validate_and_normalize_extra_args(extra_args: &[String]) -> Result<Vec<String
         if token.contains('\n') || token.contains('\r') || token.contains('\0') {
             return Err(unsafe_extra_arg(token));
         }
-        if token.starts_with('-') {
-            if forbidden_flags.contains(token.as_str()) || !allowed_flags.contains(token.as_str()) {
-                return Err(unsafe_extra_arg(token));
-            }
+        if token.starts_with('-')
+            && (forbidden_flags.contains(token.as_str()) || !allowed_flags.contains(token.as_str()))
+        {
+            return Err(unsafe_extra_arg(token));
         }
     }
     Ok(extra_args.to_vec())
@@ -301,7 +271,7 @@ fn validate_and_normalize_extra_args(extra_args: &[String]) -> Result<Vec<String
 
 fn unsafe_extra_arg(token: &str) -> AppError {
     model_error(
-        AppErrorCode::ModelServerStartFailed,
+        AppErrorCode::ModelRuntimeAdapterUnsupported,
         "Runtime extra arg güvenlik politikası tarafından reddedildi.",
         Some(format!("rejected_extra_arg={token}")),
         Some("Yalnız desteklenen gelişmiş runtime seçeneklerini kullanın.".to_string()),
@@ -309,10 +279,11 @@ fn unsafe_extra_arg(token: &str) -> AppError {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    matches!(
-        host.trim().trim_matches(['[', ']']).to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "::1" | "localhost"
-    )
+    let normalized = host
+        .trim()
+        .trim_matches(|character| character == '[' || character == ']')
+        .to_ascii_lowercase();
+    matches!(normalized.as_str(), "127.0.0.1" | "::1" | "localhost")
 }
 
 fn model_error(
