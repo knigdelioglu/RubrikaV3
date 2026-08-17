@@ -6,7 +6,7 @@ use crate::domain::model_platform::{
 use crate::services::model_platform_service::{new_benchmark_result_id, ModelPlatformService};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -65,7 +65,7 @@ impl ModelBenchmarkService {
             .iter()
             .find(|item| item.id == submission.task_profile_id)
             .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelRegistryEntryNotFound,
                 "Benchmark task profile bulunamadı.",
                 Some(format!("task_profile_id={}", submission.task_profile_id)),
                 None,
@@ -75,7 +75,7 @@ impl ModelBenchmarkService {
             .iter()
             .find(|item| item.id == submission.model_definition_id)
             .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelRegistryEntryNotFound,
                 "Benchmark modeli registry'de bulunamadı.",
                 Some(format!("model_definition_id={}", submission.model_definition_id)),
                 None,
@@ -85,7 +85,7 @@ impl ModelBenchmarkService {
             .iter()
             .find(|item| item.id == submission.runtime_definition_id)
             .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelProfileNotFound,
+                AppErrorCode::ModelRegistryEntryNotFound,
                 "Benchmark runtime'ı registry'de bulunamadı.",
                 Some(format!("runtime_definition_id={}", submission.runtime_definition_id)),
                 None,
@@ -97,7 +97,8 @@ impl ModelBenchmarkService {
             .map(|item| (item.key.as_str(), item))
             .collect();
         let rules = policy_for_task(&task.id);
-        let mut metrics = Vec::with_capacity(rules.len());
+        let policy_keys: BTreeSet<&str> = rules.iter().map(|rule| rule.key).collect();
+        let mut metrics = Vec::with_capacity(rules.len() + submission.observations.len());
         let mut notes = submission.notes;
         let mut all_pass = true;
 
@@ -127,6 +128,25 @@ impl ModelBenchmarkService {
                 }
                 None => {}
             }
+        }
+
+        // Performance/diagnostic observations are retained for side-by-side
+        // comparison but never silently become a quality gate. Only the
+        // versioned policy rules above can change `all_pass`.
+        for observation in &submission.observations {
+            if policy_keys.contains(observation.key.as_str()) {
+                continue;
+            }
+            metrics.push(BenchmarkMetricValue {
+                key: observation.key.clone(),
+                value: observation.value,
+                baseline_value: observation.baseline_value,
+                pass: observation.value.is_finite()
+                    && observation
+                        .baseline_value
+                        .map(|value| value.is_finite())
+                        .unwrap_or(true),
+            });
         }
 
         let result = BenchmarkResultSummary {
