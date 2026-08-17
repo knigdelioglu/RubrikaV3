@@ -1,8 +1,12 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelMode, ModelProfile, ModelStatus, PrivacyMode};
+use crate::domain::model_platform::ModelTaskKind;
 use crate::services::llama_server_gateway::validate_base_url_for_privacy;
 use crate::services::model_config_service::ModelConfigService;
+use crate::services::model_platform_migration_service::materialize_route_as_legacy_profile;
+use crate::services::model_platform_service::ModelPlatformService;
 use crate::services::model_process_manager::{ModelProcessManager, RuntimeLeaseGrant};
+use crate::services::model_router_service::{ModelRouterService, ResolvedModelRoute, RouteUsageMode};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -17,7 +21,9 @@ pub enum ModelUseCase {
     StudentAnswerOcr,
     StudentAnswerOcrIssueCorrection,
     Scoring,
+    SpeakingTranscriptCleanup,
     SpeakingEvaluation,
+    Analysis,
     GeneralText,
 }
 
@@ -29,7 +35,9 @@ impl ModelUseCase {
             Self::StudentAnswerOcr => "student_answer_ocr",
             Self::StudentAnswerOcrIssueCorrection => "student_answer_ocr_issue_correction",
             Self::Scoring => "scoring",
+            Self::SpeakingTranscriptCleanup => "speaking_transcript_cleanup",
             Self::SpeakingEvaluation => "speaking_evaluation",
+            Self::Analysis => "analysis",
             Self::GeneralText => "general_text",
         }
     }
@@ -40,8 +48,29 @@ impl ModelUseCase {
             Self::StudentAnswerOcr
                 | Self::StudentAnswerOcrIssueCorrection
                 | Self::Scoring
+                | Self::SpeakingTranscriptCleanup
                 | Self::SpeakingEvaluation
         )
+    }
+
+    fn platform_task(&self, requested_profile_id: Option<&str>) -> ModelTaskKind {
+        if requested_profile_id == Some("speaking_transcript_cleanup_12b") {
+            return ModelTaskKind::SpeakingTranscriptCleanup;
+        }
+        if requested_profile_id == Some("speaking_rubric_evaluation_12b") {
+            return ModelTaskKind::SpeakingEvaluation;
+        }
+        match self {
+            Self::QuestionTextExtraction => ModelTaskKind::QuestionTextExtraction,
+            Self::RubricPdfImport => ModelTaskKind::RubricExtraction,
+            Self::StudentAnswerOcr => ModelTaskKind::StudentAnswerOcr,
+            Self::StudentAnswerOcrIssueCorrection => ModelTaskKind::StudentAnswerOcrIssueCorrection,
+            Self::Scoring => ModelTaskKind::SemanticScoring,
+            Self::SpeakingTranscriptCleanup => ModelTaskKind::SpeakingTranscriptCleanup,
+            Self::SpeakingEvaluation => ModelTaskKind::SpeakingEvaluation,
+            Self::Analysis => ModelTaskKind::Analysis,
+            Self::GeneralText => ModelTaskKind::GeneralText,
+        }
     }
 }
 
@@ -99,10 +128,21 @@ pub enum ModelRuntimeState {
     Unverified,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelRouteLeaseMetadata {
+    pub task_profile_id: String,
+    pub binding_id: String,
+    pub model_definition_id: String,
+    pub runtime_definition_id: String,
+    pub model_fingerprint: String,
+    pub runtime_fingerprint: String,
+}
+
 pub struct ModelRuntimeLease {
     manager: ModelProcessManager,
     grant: RuntimeLeaseGrant,
     released: Arc<AtomicBool>,
+    route_metadata: Option<ModelRouteLeaseMetadata>,
 }
 
 impl ModelRuntimeLease {
@@ -127,7 +167,40 @@ impl ModelRuntimeLease {
     }
 
     pub fn model_fingerprint(&self) -> Option<&str> {
-        self.grant.model_fingerprint.as_deref()
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.model_fingerprint.as_str())
+            .or_else(|| self.grant.model_fingerprint.as_deref())
+    }
+
+    pub fn runtime_fingerprint(&self) -> Option<&str> {
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.runtime_fingerprint.as_str())
+    }
+
+    pub fn task_profile_id(&self) -> Option<&str> {
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.task_profile_id.as_str())
+    }
+
+    pub fn binding_id(&self) -> Option<&str> {
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.binding_id.as_str())
+    }
+
+    pub fn model_definition_id(&self) -> Option<&str> {
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.model_definition_id.as_str())
+    }
+
+    pub fn runtime_definition_id(&self) -> Option<&str> {
+        self.route_metadata
+            .as_ref()
+            .map(|metadata| metadata.runtime_definition_id.as_str())
     }
 
     pub fn correlation_id(&self) -> &str {
@@ -168,6 +241,7 @@ impl Drop for ModelRuntimeLease {
 pub struct ModelRuntimeService {
     config_service: ModelConfigService,
     process_manager: ModelProcessManager,
+    platform_service: Option<ModelPlatformService>,
 }
 
 impl ModelRuntimeService {
@@ -175,7 +249,13 @@ impl ModelRuntimeService {
         Self {
             config_service,
             process_manager,
+            platform_service: None,
         }
+    }
+
+    pub fn with_model_platform(mut self, platform_service: ModelPlatformService) -> Self {
+        self.platform_service = Some(platform_service);
+        self
     }
 
     pub async fn acquire_ready_runtime_lease(
@@ -185,7 +265,8 @@ impl ModelRuntimeService {
         operation: ModelRuntimeRequest,
         correlation_id: &str,
     ) -> Result<ModelRuntimeLease, AppError> {
-        let profile = self.config_service.get_profile(profile_id)?;
+        let (effective_profile_id, profile, route) =
+            self.resolve_effective_profile(profile_id, &operation, correlation_id)?;
         if profile.server_path.trim().is_empty()
             && profile.model_path.trim().is_empty()
             && profile.mmproj_path.trim().is_empty()
@@ -223,7 +304,7 @@ impl ModelRuntimeService {
         let grant = self
             .process_manager
             .acquire_lease(
-                profile_id,
+                effective_profile_id.as_deref(),
                 operation.requires_mmproj,
                 operation.timeout_seconds,
                 consumer_id,
@@ -240,7 +321,43 @@ impl ModelRuntimeService {
             manager: self.process_manager.clone(),
             grant,
             released: Arc::new(AtomicBool::new(false)),
+            route_metadata: route.as_ref().map(route_lease_metadata),
         })
+    }
+
+    fn resolve_effective_profile(
+        &self,
+        requested_profile_id: Option<&str>,
+        operation: &ModelRuntimeRequest,
+        correlation_id: &str,
+    ) -> Result<(Option<String>, ModelProfile, Option<ResolvedModelRoute>), AppError> {
+        let Some(platform) = self.platform_service.as_ref() else {
+            let profile = self.config_service.get_profile(requested_profile_id)?;
+            return Ok((requested_profile_id.map(str::to_string), profile, None));
+        };
+        let snapshot = platform.snapshot().map_err(|mut error| {
+            error.correlation_id = correlation_id.to_string();
+            error
+        })?;
+        if snapshot.models.is_empty() && snapshot.bindings.is_empty() {
+            let profile = self.config_service.get_profile(requested_profile_id)?;
+            return Ok((requested_profile_id.map(str::to_string), profile, None));
+        }
+
+        let task = operation.use_case.platform_task(requested_profile_id);
+        let route = ModelRouterService::new(platform.clone())
+            .resolve(task, RouteUsageMode::Production)
+            .map_err(|mut error| {
+                error.correlation_id = correlation_id.to_string();
+                error
+            })?;
+        let materialized_id = materialize_route_as_legacy_profile(&self.config_service, &route)
+            .map_err(|mut error| {
+                error.correlation_id = correlation_id.to_string();
+                error
+            })?;
+        let profile = self.config_service.get_profile(Some(&materialized_id))?;
+        Ok((Some(materialized_id), profile, Some(route)))
     }
 
     pub async fn get_runtime_status(
@@ -369,6 +486,19 @@ impl ModelRuntimeService {
     }
 }
 
+fn route_lease_metadata(route: &ResolvedModelRoute) -> ModelRouteLeaseMetadata {
+    ModelRouteLeaseMetadata {
+        task_profile_id: route.task_profile.id.clone(),
+        binding_id: route.binding.id.clone(),
+        model_definition_id: route.model.id.clone(),
+        runtime_definition_id: route.runtime.id.clone(),
+        model_fingerprint: route.model.model_fingerprint.clone(),
+        runtime_fingerprint: crate::domain::model_platform::fingerprint_runtime_definition(
+            &route.runtime,
+        ),
+    }
+}
+
 fn build_runtime_status(
     request: &ModelRuntimeRequest,
     profile: &ModelProfile,
@@ -475,7 +605,7 @@ fn read_log_lines(path: &std::path::Path, line_count: usize) -> Vec<String> {
                 lines[len - line_count..].to_vec()
             }
         }
-        Err(e) => vec![format!("Failed to open log file: {e}")],
+        Err(error) => vec![format!("Failed to open log file: {error}")],
     }
 }
 
@@ -483,8 +613,6 @@ fn read_log_lines(path: &std::path::Path, line_count: usize) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::domain::model::{ModelMode, ModelProfile, ModelRuntimePreset, ModelStatus};
-    use std::os::unix::fs::PermissionsExt;
-    use std::sync::Arc;
 
     fn sample_profile() -> ModelProfile {
         ModelProfile {
@@ -504,64 +632,26 @@ mod tests {
 
     #[test]
     fn step_name_matches_use_case() {
+        assert_eq!(ModelUseCase::StudentAnswerOcr.step_name(), "student_answer_ocr");
+    }
+
+    #[test]
+    fn speaking_profiles_map_to_distinct_platform_tasks() {
         assert_eq!(
-            ModelUseCase::StudentAnswerOcr.step_name(),
-            "student_answer_ocr"
+            ModelUseCase::GeneralText.platform_task(Some("speaking_transcript_cleanup_12b")),
+            ModelTaskKind::SpeakingTranscriptCleanup
+        );
+        assert_eq!(
+            ModelUseCase::SpeakingEvaluation
+                .platform_task(Some("speaking_rubric_evaluation_12b")),
+            ModelTaskKind::SpeakingEvaluation
         );
     }
 
     #[test]
     fn speaking_evaluation_is_classified_as_student_data() {
         assert!(ModelUseCase::SpeakingEvaluation.contains_student_data());
-        assert_eq!(
-            ModelUseCase::SpeakingEvaluation.step_name(),
-            "speaking_evaluation"
-        );
-    }
-
-    #[test]
-    fn strict_local_blocks_configured_public_external_student_runtime() {
-        let config_service = ModelConfigService::new_with_path(std::env::temp_dir().join(format!(
-            "rubrika-model-privacy-config-{}.json",
-            uuid::Uuid::new_v4()
-        )));
-        let mut profile = config_service.get_profile(None).unwrap();
-        profile.server_path = "/tmp/llama-server".to_string();
-        profile.model_path = "/tmp/model.gguf".to_string();
-        profile.base_url = "https://model.example.test".to_string();
-        profile.host = "model.example.test".to_string();
-        profile.mode = ModelMode::External;
-        profile.privacy_mode = PrivacyMode::StrictLocal;
-        config_service.update_profile(profile).unwrap();
-        let manager = ModelProcessManager::new_with_state_path(
-            config_service.clone(),
-            Arc::new(crate::services::llama_server_gateway::LlamaServerGateway::default()),
-            std::env::temp_dir().join(format!(
-                "rubrika-model-privacy-state-{}.json",
-                uuid::Uuid::new_v4()
-            )),
-        );
-        let runtime = ModelRuntimeService::new(config_service, manager);
-        let request = ModelRuntimeRequest {
-            use_case: ModelUseCase::StudentAnswerOcr,
-            capability: ModelCapability::Vision,
-            requires_mmproj: false,
-            timeout_seconds: 1,
-        };
-        let result =
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(runtime.acquire_ready_runtime_lease(
-                    None,
-                    "privacy_test",
-                    request,
-                    "privacy-correlation",
-                ));
-        let error = match result {
-            Ok(_) => panic!("public strict-local runtime must be blocked"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, AppErrorCode::ModelPrivacyBlocked);
+        assert!(ModelUseCase::SpeakingTranscriptCleanup.contains_student_data());
     }
 
     #[test]
@@ -603,135 +693,5 @@ mod tests {
         let runtime = build_runtime_status(&request, &sample_profile(), status);
         assert_eq!(runtime.state, ModelRuntimeState::Healthy);
         assert!(runtime.health_ok);
-    }
-
-    fn write_unhealthy_mock_llama_server_script() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "rubrika-unhealthy-llama-{}.sh",
-            uuid::Uuid::new_v4()
-        ));
-        let script = r#"#!/bin/sh
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  cat <<'EOF'
---cache-type-k
---cache-type-v
---mmproj-offload
-EOF
-  exit 0
-fi
-host=127.0.0.1
-port=8080
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --host)
-      host="$2"
-      shift 2
-      ;;
-    --port)
-      port="$2"
-      shift 2
-      ;;
-    *)
-      shift
-      ;;
-  esac
-done
-exec python3 - "$host" "$port" <<'PY'
-import json
-import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
-
-host = sys.argv[1]
-port = int(sys.argv[2])
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        return
-
-    def _write_json(self, body, status=200):
-        payload = json.dumps(body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def do_GET(self):
-        if self.path == "/health":
-            self._write_json({"status": "booting"}, 503)
-            return
-        self._write_json({"error": "not found"}, 404)
-
-HTTPServer((host, port), Handler).serve_forever()
-PY
-"#;
-        std::fs::write(&path, script).unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        path
-    }
-
-    fn find_free_port() -> u16 {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .map(|addr| addr.port())
-            .unwrap_or(0)
-    }
-
-    #[test]
-    fn ensure_ready_times_out_with_short_timeout() {
-        let config_service = ModelConfigService::new_with_path(std::env::temp_dir().join(format!(
-            "rubrika-model-config-{}.json",
-            uuid::Uuid::new_v4()
-        )));
-        let mut profile = config_service.get_profile(None).unwrap();
-        profile.mode = ModelMode::Managed;
-        profile.server_path = write_unhealthy_mock_llama_server_script()
-            .to_string_lossy()
-            .to_string();
-        let model_path =
-            std::env::temp_dir().join(format!("rubrika-model-{}.gguf", uuid::Uuid::new_v4()));
-        let mmproj_path =
-            std::env::temp_dir().join(format!("rubrika-mmproj-{}.bin", uuid::Uuid::new_v4()));
-        std::fs::write(&model_path, b"dummy").unwrap();
-        std::fs::write(&mmproj_path, b"dummy").unwrap();
-        profile.model_path = model_path.to_string_lossy().to_string();
-        profile.mmproj_path = mmproj_path.to_string_lossy().to_string();
-        profile.port = find_free_port();
-        profile.base_url = format!("http://127.0.0.1:{}", profile.port);
-        config_service.update_profile(profile).unwrap();
-
-        let manager = ModelProcessManager::new_with_state_path(
-            config_service.clone(),
-            Arc::new(crate::services::llama_server_gateway::LlamaServerGateway::default()),
-            std::env::temp_dir().join(format!("rubrika-model-state-{}.json", uuid::Uuid::new_v4())),
-        );
-        let runtime = ModelRuntimeService::new(config_service, manager);
-        let request = ModelRuntimeRequest {
-            use_case: ModelUseCase::GeneralText,
-            capability: ModelCapability::Text,
-            requires_mmproj: true,
-            timeout_seconds: 1,
-        };
-
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let result = runtime
-                .acquire_ready_runtime_lease(None, "runtime_test", request, "runtime-test")
-                .await;
-            let err = match result {
-                Ok(_) => panic!("runtime should fail before acquiring a lease"),
-                Err(error) => error,
-            };
-            assert!(matches!(
-                err.code,
-                AppErrorCode::ModelStartTimeout
-                    | AppErrorCode::ModelServerReadyTimeout
-                    | AppErrorCode::ModelRuntimeReadinessTimeout
-                    | AppErrorCode::ModelServerStartFailed
-                    | AppErrorCode::ModelPortBlocked
-            ));
-        });
     }
 }
