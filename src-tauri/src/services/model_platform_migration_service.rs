@@ -4,11 +4,13 @@ use crate::domain::model_platform::{
     default_task_profiles, fingerprint_runtime_definition, migrate_legacy_profile,
     CapabilityManifest, CapabilityProbeResult, CapabilitySupport, ModelCapabilityKind,
     ModelDefinition, ModelLifecycleState, ModelPlatformConfig, ModelTaskKind, RuntimeDefinition,
-    TaskModelBinding, CANONICAL_GEMMA4_12B_MODEL_ID, MODEL_PLATFORM_SCHEMA_VERSION,
+    TaskModelBinding, CANONICAL_GEMMA4_12B_MODEL_ID, LEGACY_GEMMA_PROFILE_IDS,
+    MODEL_PLATFORM_SCHEMA_VERSION,
 };
 use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_platform_service::ModelPlatformService;
 use crate::services::model_router_service::ResolvedModelRoute;
+use crate::services::platform_launch_registry;
 use chrono::Utc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -84,11 +86,7 @@ impl ModelPlatformMigrationService {
         if let Ok(active) = self.legacy.get_profile(None) {
             profiles.push(active);
         }
-        for id in [
-            "gemma4-ocr-q8",
-            "speaking_transcript_cleanup_12b",
-            "speaking_rubric_evaluation_12b",
-        ] {
+        for id in LEGACY_GEMMA_PROFILE_IDS {
             if let Ok(profile) = self.legacy.get_model_profile(id) {
                 if !profiles.iter().any(|existing| existing.id == profile.id) {
                     profiles.push(profile);
@@ -103,9 +101,14 @@ pub fn materialize_route_as_legacy_profile(
     legacy: &ModelConfigService,
     route: &ResolvedModelRoute,
 ) -> Result<String, AppError> {
+    let runtime_fingerprint = fingerprint_runtime_definition(&route.runtime);
+    let model_fingerprint = &route.model.model_fingerprint;
     let profile_id = format!(
-        "platform-{}-{}",
-        route.task_profile.id, route.model.id
+        "platform-{}-{}-{}-{}",
+        sanitize_id(&route.model.id),
+        sanitize_id(&route.runtime.id),
+        short_fingerprint(model_fingerprint),
+        short_fingerprint(&runtime_fingerprint),
     );
     let requires_vision = route
         .task_profile
@@ -114,7 +117,7 @@ pub fn materialize_route_as_legacy_profile(
     let mmproj_path = route.model.mmproj_path.clone().unwrap_or_default();
     let profile = ModelProfile {
         id: profile_id.clone(),
-        display_name: format!("{} — {}", route.model.display_name, route.task_profile.id),
+        display_name: format!("{} — {}", route.model.display_name, route.runtime.id),
         mode: if route.runtime.managed {
             ModelMode::Managed
         } else {
@@ -133,7 +136,12 @@ pub fn materialize_route_as_legacy_profile(
         },
         privacy_mode: route.runtime.privacy_mode,
     };
-    legacy.update_profile(profile)?;
+    platform_launch_registry::register(
+        profile_id.clone(),
+        route.model.clone(),
+        route.runtime.clone(),
+    );
+    legacy.update_ephemeral_profile(profile)?;
     Ok(profile_id)
 }
 
@@ -150,14 +158,7 @@ fn build_platform_config_from_legacy(profiles: &[ModelProfile]) -> Result<ModelP
 
     let canonical_profiles: Vec<&ModelProfile> = profiles
         .iter()
-        .filter(|profile| {
-            matches!(
-                profile.id.as_str(),
-                "gemma4-ocr-q8"
-                    | "speaking_transcript_cleanup_12b"
-                    | "speaking_rubric_evaluation_12b"
-            )
-        })
+        .filter(|profile| LEGACY_GEMMA_PROFILE_IDS.contains(&profile.id.as_str()))
         .collect();
 
     if !canonical_profiles.is_empty() {
@@ -167,7 +168,7 @@ fn build_platform_config_from_legacy(profiles: &[ModelProfile]) -> Result<ModelP
         if let Some(profile) = canonical_profiles
             .iter()
             .copied()
-            .find(|profile| profile.id == "gemma4-ocr-q8")
+            .find(|profile| profile.id == LEGACY_GEMMA_PROFILE_IDS[0])
         {
             let mut runtime = migrate_legacy_profile(profile).runtime;
             runtime.id = VISION_RUNTIME_ID.to_string();
@@ -193,12 +194,7 @@ fn build_platform_config_from_legacy(profiles: &[ModelProfile]) -> Result<ModelP
     }
 
     for profile in profiles.iter().filter(|profile| {
-        !matches!(
-            profile.id.as_str(),
-            "gemma4-ocr-q8"
-                | "speaking_transcript_cleanup_12b"
-                | "speaking_rubric_evaluation_12b"
-        )
+        !LEGACY_GEMMA_PROFILE_IDS.contains(&profile.id.as_str())
     }) {
         let migration = migrate_legacy_profile(profile);
         let mut model = migration.model;
@@ -237,7 +233,7 @@ fn merge_gemma_model(profiles: &[&ModelProfile]) -> ModelDefinition {
     let base = profiles
         .iter()
         .copied()
-        .find(|profile| profile.id == "gemma4-ocr-q8")
+        .find(|profile| profile.id == LEGACY_GEMMA_PROFILE_IDS[0])
         .unwrap_or(profiles[0]);
     let mut migration = migrate_legacy_profile(base).model;
     migration.id = CANONICAL_GEMMA4_12B_MODEL_ID.to_string();
@@ -432,6 +428,10 @@ fn legacy_config_path() -> PathBuf {
         .join("model_profiles.json")
 }
 
+fn short_fingerprint(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
+}
+
 fn sanitize_id(value: &str) -> String {
     value
         .chars()
@@ -449,7 +449,7 @@ fn sanitize_id(value: &str) -> String {
 
 fn migration_error(message: &str, technical_details: Option<String>) -> AppError {
     AppError {
-        code: AppErrorCode::ModelConfigMissing,
+        code: AppErrorCode::ModelConfigMigrationFailed,
         message: message.to_string(),
         recoverable: true,
         suggested_action: Some(
