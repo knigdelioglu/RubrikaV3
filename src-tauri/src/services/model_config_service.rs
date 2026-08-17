@@ -1,9 +1,10 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{
     default_model_profile, speaking_asr_cleanup_model_profile, speaking_rubric_model_profile,
-    ModelMode, ModelProfile, PrivacyMode,
+    ModelMode, ModelProfile, ModelRuntimePreset, PrivacyMode,
 };
 use crate::platform::file_access::atomic_write;
+use crate::services::model_platform_service::ModelPlatformService;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -170,7 +171,17 @@ impl ModelConfigService {
         store.active_profile_id.clone()
     }
 
+    /// Read compatibility for the three pre-platform profile ids.
+    ///
+    /// Once model-platform bindings exist, callers using an old profile id see
+    /// a synthetic view of the currently bound model/runtime rather than stale
+    /// `model_profiles.json` data. The synthetic profile is never persisted.
     pub fn get_model_profile(&self, profile_id: &str) -> Result<ModelProfile, AppError> {
+        if let Some(task_profile_id) = legacy_alias_task(profile_id) {
+            if let Some(profile) = current_platform_compatibility_profile(profile_id, task_profile_id)? {
+                return Ok(profile);
+            }
+        }
         self.get_profile(Some(profile_id))
     }
 
@@ -240,6 +251,89 @@ impl ModelConfigService {
 impl Default for ModelConfigService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn legacy_alias_task(profile_id: &str) -> Option<&'static str> {
+    match profile_id {
+        "gemma4-ocr-q8" => Some("student_answer_ocr"),
+        "speaking_transcript_cleanup_12b" => Some("speaking_transcript_cleanup"),
+        "speaking_rubric_evaluation_12b" => Some("speaking_evaluation"),
+        _ => None,
+    }
+}
+
+fn current_platform_compatibility_profile(
+    legacy_profile_id: &str,
+    task_profile_id: &str,
+) -> Result<Option<ModelProfile>, AppError> {
+    let snapshot = ModelPlatformService::new().snapshot()?;
+    if snapshot.models.is_empty() && snapshot.bindings.is_empty() {
+        return Ok(None);
+    }
+    let binding = snapshot
+        .bindings
+        .iter()
+        .find(|binding| binding.enabled && binding.task_profile_id == task_profile_id)
+        .ok_or_else(|| compatibility_error(
+            AppErrorCode::ModelBindingNotFound,
+            "Legacy profil karşılığı olan etkin model ataması bulunamadı.",
+            format!("legacy_profile_id={legacy_profile_id}; task_profile_id={task_profile_id}"),
+            "Model Laboratuvarı > Görev Atamaları bölümünden bu göreve model atayın.",
+        ))?;
+    let model = snapshot
+        .models
+        .iter()
+        .find(|model| model.id == binding.model_definition_id)
+        .ok_or_else(|| compatibility_error(
+            AppErrorCode::ModelRegistryEntryNotFound,
+            "Göreve atanmış model registry'de bulunamadı.",
+            format!("model_definition_id={}", binding.model_definition_id),
+            "Görev atamasını geçerli bir modele değiştirin.",
+        ))?;
+    let runtime = snapshot
+        .runtimes
+        .iter()
+        .find(|runtime| runtime.id == binding.runtime_definition_id)
+        .ok_or_else(|| compatibility_error(
+            AppErrorCode::ModelRegistryEntryNotFound,
+            "Göreve atanmış runtime registry'de bulunamadı.",
+            format!("runtime_definition_id={}", binding.runtime_definition_id),
+            "Görev atamasını geçerli bir runtime'a değiştirin.",
+        ))?;
+    let uses_projector = runtime.uses_multimodal_projector(model);
+    Ok(Some(ModelProfile {
+        id: legacy_profile_id.to_string(),
+        display_name: format!("{} — compatibility", model.display_name),
+        mode: if runtime.managed { ModelMode::Managed } else { ModelMode::External },
+        server_path: runtime.server_path.clone(),
+        model_path: model.model_path.clone(),
+        mmproj_path: model.mmproj_path.clone().unwrap_or_default(),
+        host: runtime.host.clone(),
+        port: runtime.port,
+        base_url: runtime.base_url(),
+        runtime_preset: if uses_projector {
+            ModelRuntimePreset::Standard
+        } else {
+            ModelRuntimePreset::SpeakingRubricText
+        },
+        privacy_mode: runtime.privacy_mode,
+    }))
+}
+
+fn compatibility_error(
+    code: AppErrorCode,
+    message: &str,
+    details: String,
+    action: &str,
+) -> AppError {
+    AppError {
+        code,
+        message: message.to_string(),
+        recoverable: true,
+        suggested_action: Some(action.to_string()),
+        technical_details: Some(details),
+        correlation_id: Uuid::new_v4().to_string(),
     }
 }
 
