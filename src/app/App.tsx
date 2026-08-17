@@ -12,6 +12,7 @@ const ProjectCreatePage = lazy(() => import('../pages/ProjectCreatePage').then((
 const DocumentsPage = lazy(() => import('../pages/DocumentsPage').then((module) => ({ default: module.DocumentsPage })));
 const WorkflowPage = lazy(() => import('../pages/WorkflowPage').then((module) => ({ default: module.WorkflowPage })));
 const SettingsPage = lazy(() => import('../pages/SettingsPage').then((module) => ({ default: module.SettingsPage })));
+const ModelLabPage = lazy(() => import('../pages/ModelLabPage').then((module) => ({ default: module.ModelLabPage })));
 const PdfPreviewPage = lazy(() => import('../pages/PdfPreviewPage').then((module) => ({ default: module.PdfPreviewPage })));
 const ExamPackageCompatibilityRedirect = lazy(() => import('../pages/ExamPackageWorkspacePage').then((module) => ({ default: module.ExamPackageCompatibilityRedirect })));
 const ExamPackageWorkspacePage = lazy(() => import('../pages/ExamPackageWorkspacePage').then((module) => ({ default: module.ExamPackageWorkspacePage })));
@@ -87,7 +88,7 @@ function AppRoutes() {
           <Route path="/project/:projectId/analysis" element={<AnalysisPage kind="written" />} />
           <Route path="/project/:projectId/settings" element={<SettingsPage defaultTab="general" />} />
           <Route path="/project/:projectId/settings/general" element={<SettingsPage defaultTab="general" />} />
-          <Route path="/project/:projectId/settings/model" element={<SettingsPage defaultTab="models" />} />
+          <Route path="/project/:projectId/settings/model" element={<ModelLabPage />} />
           <Route path="/project/:projectId/settings/storage" element={<SettingsPage defaultTab="storage" />} />
           <Route path="/project/:projectId/settings/diagnostics" element={<SettingsPage defaultTab="diagnostics" />} />
           <Route path="/project/:projectId/speaking" element={<SpeechExamPage />} />
