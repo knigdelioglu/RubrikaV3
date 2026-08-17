@@ -15,6 +15,7 @@ pub mod graded_exam_review_service;
 pub mod integrity_recovery_service;
 pub mod llama_cpp_runtime_adapter;
 pub mod llama_server_gateway;
+pub mod model_capability_probe_service;
 pub mod model_config_service;
 pub mod model_gateway;
 pub mod model_input_image_service;
