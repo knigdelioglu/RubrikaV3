@@ -33,6 +33,17 @@ pub enum AppErrorCode {
     ModelPortBlocked,
     ModelProfileNotFound,
     ModelProfileNotManaged,
+    ModelRegistryEntryNotFound,
+    ModelCapabilityMismatch,
+    ModelCapabilityUnverified,
+    ModelBindingNotFound,
+    ModelBindingUnavailable,
+    ModelNotProductionApproved,
+    ModelProbeFailed,
+    ModelBenchmarkRequired,
+    ModelBenchmarkFailed,
+    ModelConfigMigrationFailed,
+    ModelRuntimeAdapterUnsupported,
     ModelServerPathMissing,
     ModelModelPathMissing,
     ModelMmprojPathMissing,
@@ -338,7 +349,6 @@ mod tests {
         assert!(serialized.contains("PROJECT_NOT_FOUND"));
         assert!(serialized.contains("Proje bulunamadı."));
         assert!(serialized.contains("test-id"));
-        // Internal payload must never cross the boundary.
         assert!(!serialized.contains("/Users/kadir"));
         assert!(!serialized.contains("serde error"));
         assert!(!serialized.contains("technicalDetails"));
