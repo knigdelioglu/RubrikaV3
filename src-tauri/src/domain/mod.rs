@@ -4,6 +4,7 @@ pub mod document;
 pub mod errors;
 pub mod job;
 pub mod model;
+pub mod model_platform;
 pub mod project;
 pub mod question;
 pub mod rubric;
