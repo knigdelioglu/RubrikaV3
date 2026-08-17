@@ -361,6 +361,7 @@ pub fn run() {
             commands::model_platform_commands::disable_model_task_binding,
             commands::model_platform_commands::set_model_lifecycle,
             commands::model_platform_commands::submit_model_benchmark,
+            commands::model_platform_commands::submit_golden_ocr_benchmark_report,
             commands::model_platform_commands::get_model_promotion_decision,
             commands::model_platform_commands::resolve_model_route_preview,
             commands::mobile_connection_commands::get_mobile_connection_info,
