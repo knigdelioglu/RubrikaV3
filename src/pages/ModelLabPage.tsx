@@ -12,6 +12,7 @@ import {
   type ModelDefinition,
   type ModelLifecycleState,
   type ModelPlatformConfig,
+  type PromotionDecision,
   type RuntimeDefinition,
 } from '../api/modelPlatform';
 
@@ -50,13 +51,14 @@ const defaultRuntime = (): RuntimeDefinition => ({
   port: 8080,
   contextSize: 8192,
   gpuLayers: 99,
-  flashAttention: 'on',
+  flashAttention: 'auto',
   parallel: 1,
-  batchSize: 1024,
-  ubatchSize: 512,
+  batchSize: 512,
+  ubatchSize: 256,
   kvCacheTypeK: 'q8_0',
   kvCacheTypeV: 'q8_0',
   reasoningMode: 'off',
+  multimodalProjectorMode: 'auto',
   imageMinTokens: 1120,
   imageMaxTokens: 1120,
   cacheRamMegabytes: 0,
@@ -90,6 +92,9 @@ export function ModelLabPage() {
   const [benchmarkTask, setBenchmarkTask] = useState('student_answer_ocr');
   const [benchmarkModel, setBenchmarkModel] = useState('');
   const [benchmarkRuntime, setBenchmarkRuntime] = useState('');
+  const [goldenCandidatePath, setGoldenCandidatePath] = useState('');
+  const [goldenBaselinePath, setGoldenBaselinePath] = useState('');
+  const [promotionDecision, setPromotionDecision] = useState<PromotionDecision | null>(null);
   const [benchmarkJson, setBenchmarkJson] = useState(
     JSON.stringify(
       [
@@ -118,6 +123,10 @@ export function ModelLabPage() {
       setRuntimeForm({ ...snapshot.runtimes[0] });
     }
   }, [snapshot, benchmarkModel, benchmarkRuntime, runtimeForm.serverPath]);
+
+  useEffect(() => {
+    setPromotionDecision(null);
+  }, [benchmarkModel]);
 
   const refresh = async () => {
     setError(null);
@@ -162,10 +171,34 @@ export function ModelLabPage() {
         benchmarkModel,
         benchmarkRuntime,
         parsed,
-        ['Model Laboratuvarı üzerinden kaydedildi.'],
+        ['Model Laboratuvarı gelişmiş metrik girişi üzerinden kaydedildi.'],
       );
     },
-    onSuccess: refresh,
+    onSuccess: async () => {
+      setPromotionDecision(await modelPlatformApi.promotionDecision(benchmarkModel));
+      await refresh();
+    },
+    onError: (value) => setError(normalizeAppError(value)),
+  });
+
+  const goldenMutation = useMutation({
+    mutationFn: () => modelPlatformApi.submitGoldenOcrBenchmark(
+      benchmarkTask,
+      benchmarkModel,
+      benchmarkRuntime,
+      goldenCandidatePath,
+      goldenBaselinePath,
+    ),
+    onSuccess: async () => {
+      setPromotionDecision(await modelPlatformApi.promotionDecision(benchmarkModel));
+      await refresh();
+    },
+    onError: (value) => setError(normalizeAppError(value)),
+  });
+
+  const promotionMutation = useMutation({
+    mutationFn: () => modelPlatformApi.promotionDecision(benchmarkModel),
+    onSuccess: setPromotionDecision,
     onError: (value) => setError(normalizeAppError(value)),
   });
 
@@ -198,6 +231,17 @@ export function ModelLabPage() {
     if (typeof selected === 'string') {
       setRuntimeForm((current) => ({ ...current, serverPath: selected }));
     }
+  };
+
+  const chooseGoldenReport = async (kind: 'candidate' | 'baseline') => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: 'Golden benchmark report', extensions: ['json'] }],
+    });
+    if (typeof selected !== 'string') return;
+    if (kind === 'candidate') setGoldenCandidatePath(selected);
+    else setGoldenBaselinePath(selected);
   };
 
   return (
@@ -270,8 +314,17 @@ export function ModelLabPage() {
           setModel={setBenchmarkModel}
           setRuntime={setBenchmarkRuntime}
           setJson={setBenchmarkJson}
-          pending={benchmarkMutation.isPending}
-          onSubmit={() => benchmarkMutation.mutate()}
+          candidatePath={goldenCandidatePath}
+          baselinePath={goldenBaselinePath}
+          chooseCandidate={() => chooseGoldenReport('candidate')}
+          chooseBaseline={() => chooseGoldenReport('baseline')}
+          goldenPending={goldenMutation.isPending}
+          onGoldenSubmit={() => goldenMutation.mutate()}
+          manualPending={benchmarkMutation.isPending}
+          onManualSubmit={() => benchmarkMutation.mutate()}
+          promotionDecision={promotionDecision}
+          promotionPending={promotionMutation.isPending}
+          onPromotionCheck={() => promotionMutation.mutate()}
         />
       )}
     </div>
@@ -402,6 +455,7 @@ function RuntimeTab({ snapshot, value, onChange, chooseServer, pending, onSave }
           <Field label="KV cache V"><input value={value.kvCacheTypeV} onChange={(e) => onChange({ ...value, kvCacheTypeV: e.target.value })} /></Field>
           <Field label="Reasoning"><select value={value.reasoningMode} onChange={(e) => onChange({ ...value, reasoningMode: e.target.value as RuntimeDefinition['reasoningMode'] })}><option value="off">Off</option><option value="auto">Auto</option><option value="on">On</option></select></Field>
           <Field label="Flash attention"><select value={value.flashAttention} onChange={(e) => onChange({ ...value, flashAttention: e.target.value as RuntimeDefinition['flashAttention'] })}><option value="on">On</option><option value="auto">Auto</option><option value="off">Off</option></select></Field>
+          <Field label="Multimodal projector"><select value={value.multimodalProjectorMode} onChange={(e) => onChange({ ...value, multimodalProjectorMode: e.target.value as RuntimeDefinition['multimodalProjectorMode'] })}><option value="auto">Auto</option><option value="enabled">Enabled</option><option value="disabled">Disabled / text-only</option></select></Field>
         </div>
         <FileRow label="llama-server" value={value.serverPath} onChoose={chooseServer} />
         <div style={{ display: 'flex', gap: '1rem', margin: '1rem 0' }}>
@@ -414,7 +468,7 @@ function RuntimeTab({ snapshot, value, onChange, chooseServer, pending, onSave }
         <h3 style={{ marginTop: 0 }}>Kayıtlı runtime’lar</h3>
         {snapshot.runtimes.map((runtime) => (
           <button key={runtime.id} type="button" onClick={() => onChange({ ...runtime })} style={{ display: 'block', width: '100%', textAlign: 'left', border: '1px solid #e2e8f0', background: '#f8fafc', padding: '0.8rem', borderRadius: '0.65rem', marginBottom: '0.6rem', cursor: 'pointer' }}>
-            <strong>{runtime.id}</strong> · {runtime.engine} · {runtime.host}:{runtime.port} · c={runtime.contextSize} · KV {runtime.kvCacheTypeK}/{runtime.kvCacheTypeV}
+            <strong>{runtime.id}</strong> · {runtime.engine} · {runtime.host}:{runtime.port} · c={runtime.contextSize} · KV {runtime.kvCacheTypeK}/{runtime.kvCacheTypeV} · projector={runtime.multimodalProjectorMode}
           </button>
         ))}
       </Panel>
@@ -471,7 +525,7 @@ function BindingsTab({ snapshot, onError, onRefresh }: { snapshot: ModelPlatform
   );
 }
 
-function BenchmarkTab({ snapshot, task, model, runtime, json, setTask, setModel, setRuntime, setJson, pending, onSubmit }: {
+function BenchmarkTab({ snapshot, task, model, runtime, json, setTask, setModel, setRuntime, setJson, candidatePath, baselinePath, chooseCandidate, chooseBaseline, goldenPending, onGoldenSubmit, manualPending, onManualSubmit, promotionDecision, promotionPending, onPromotionCheck }: {
   snapshot: ModelPlatformConfig;
   task: string;
   model: string;
@@ -481,20 +535,44 @@ function BenchmarkTab({ snapshot, task, model, runtime, json, setTask, setModel,
   setModel: (value: string) => void;
   setRuntime: (value: string) => void;
   setJson: (value: string) => void;
-  pending: boolean;
-  onSubmit: () => void;
+  candidatePath: string;
+  baselinePath: string;
+  chooseCandidate: () => Promise<void>;
+  chooseBaseline: () => Promise<void>;
+  goldenPending: boolean;
+  onGoldenSubmit: () => void;
+  manualPending: boolean;
+  onManualSubmit: () => void;
+  promotionDecision: PromotionDecision | null;
+  promotionPending: boolean;
+  onPromotionCheck: () => void;
 }) {
   return (
     <div style={{ display: 'grid', gap: '1.25rem' }}>
       <Panel>
-        <SectionTitle icon={<CheckCircle2 size={18} />} title="Golden benchmark gate" subtitle="Golden runner'ın ürettiği ölçümleri versioned policy ile değerlendirir. PASS olmayan model Production'a yükseltilemez." />
+        <SectionTitle icon={<CheckCircle2 size={18} />} title="Golden benchmark gate" subtitle="Candidate ve production baseline aynı golden corpus üzerinde ölçülmüş olmalıdır. Rapor fingerprint/policy gate'e kaydedilir; FAIL olan model Production'a yükseltilemez." />
         <div style={formGrid}>
           <Field label="Task"><select value={task} onChange={(e) => setTask(e.target.value)}>{snapshot.taskProfiles.map((item) => <option key={item.id} value={item.id}>{taskLabels[item.id] || item.id}</option>)}</select></Field>
           <Field label="Model"><select value={model} onChange={(e) => setModel(e.target.value)}>{snapshot.models.map((item) => <option key={item.id} value={item.id}>{item.displayName}</option>)}</select></Field>
           <Field label="Runtime"><select value={runtime} onChange={(e) => setRuntime(e.target.value)}>{snapshot.runtimes.map((item) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></Field>
         </div>
+        <FileRow label="Candidate report" value={candidatePath} onChoose={chooseCandidate} />
+        <FileRow label="Baseline report" value={baselinePath} onChoose={chooseBaseline} />
+        <div style={{ display: 'flex', gap: '0.65rem', flexWrap: 'wrap', marginTop: '1rem' }}>
+          <button className="button button--primary" type="button" disabled={goldenPending || !model || !runtime || !candidatePath || !baselinePath} onClick={onGoldenSubmit}>{goldenPending ? 'Golden gate değerlendiriliyor…' : 'Golden raporlarını değerlendir ve kaydet'}</button>
+          <button className="button button--secondary" type="button" disabled={promotionPending || !model} onClick={onPromotionCheck}>{promotionPending ? 'Kontrol ediliyor…' : 'Production uygunluğunu kontrol et'}</button>
+        </div>
+        {promotionDecision && (
+          <div style={{ marginTop: '1rem', padding: '0.9rem', borderRadius: '0.7rem', border: `1px solid ${promotionDecision.allowed ? '#86efac' : '#fca5a5'}`, background: promotionDecision.allowed ? '#f0fdf4' : '#fef2f2', color: promotionDecision.allowed ? '#166534' : '#991b1b' }}>
+            <strong>{promotionDecision.allowed ? '✓ Production gate hazır' : 'Production gate henüz kapalı'}</strong>
+            {promotionDecision.reasons.length > 0 && <div style={{ marginTop: '0.35rem', fontSize: '0.8rem' }}>{promotionDecision.reasons.join(' · ')}</div>}
+          </div>
+        )}
+      </Panel>
+      <Panel>
+        <SectionTitle icon={<FlaskConical size={18} />} title="Gelişmiş: manuel metrik girişi" subtitle="Otomatik golden raporu bulunmayan scoring/speaking gibi task'larda versioned policy gözlemleri elle içe aktarılabilir." />
         <Field label="Benchmark observations JSON"><textarea value={json} onChange={(e) => setJson(e.target.value)} rows={13} style={{ width: '100%', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }} /></Field>
-        <button className="button button--primary" type="button" disabled={pending || !model || !runtime} onClick={onSubmit}>{pending ? 'Değerlendiriliyor…' : 'Gate’i değerlendir ve kaydet'}</button>
+        <button className="button button--secondary" type="button" disabled={manualPending || !model || !runtime} onClick={onManualSubmit}>{manualPending ? 'Değerlendiriliyor…' : 'Manuel gate’i değerlendir ve kaydet'}</button>
       </Panel>
       <Panel>
         <h3 style={{ marginTop: 0 }}>Sonuçlar</h3>
