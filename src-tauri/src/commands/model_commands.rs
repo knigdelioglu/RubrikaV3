@@ -1,6 +1,7 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model::{ModelMode, ModelServerArgsPreview, ModelStatus};
 use crate::services::audit_service::AuditEntryInput;
+use crate::services::model_platform_service::ModelPlatformService;
 use crate::services::model_process_manager::{StartModelServerOutput, StopModelServerOutput};
 use crate::services::model_runtime_service::{
     ModelCapability, ModelRuntimeRequest, ModelRuntimeStatus, ModelUseCase,
@@ -63,6 +64,7 @@ pub async fn start_model_server(
     state: State<'_, AppState>,
     input: ProfileSelectionInput,
 ) -> Result<StartModelServerOutput, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     state
         .model_runtime_service
         .start_server(input.profile_id.as_deref())
@@ -74,6 +76,7 @@ pub async fn stop_model_server(
     state: State<'_, AppState>,
     input: ProfileSelectionInput,
 ) -> Result<StopModelServerOutput, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     state
         .model_runtime_service
         .stop_server(input.profile_id.as_deref())
@@ -85,6 +88,7 @@ pub async fn set_model_mode(
     state: State<'_, AppState>,
     input: SetModelModeInput,
 ) -> Result<ModelStatus, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     state
         .model_runtime_service
         .set_mode(input.profile_id.as_deref(), input.mode)
@@ -96,6 +100,7 @@ pub async fn enable_external_model(
     state: State<'_, AppState>,
     input: EnableExternalModelInput,
 ) -> Result<ModelStatus, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     if !input.confirm_external_data_transfer {
         return Err(AppError {
             code: AppErrorCode::ModelExternalConsentRequired,
@@ -143,6 +148,7 @@ pub async fn enable_external_model(
 
 #[tauri::command]
 pub async fn reset_model_profile(state: State<'_, AppState>) -> Result<ModelStatus, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     state.model_runtime_service.reset_profile(None).await
 }
 
@@ -151,6 +157,7 @@ pub async fn preview_model_server_args(
     state: State<'_, AppState>,
     input: ProfileSelectionInput,
 ) -> Result<ModelServerArgsPreview, AppError> {
+    ensure_legacy_model_mutation_allowed()?;
     state
         .model_runtime_service
         .preview_args(input.profile_id.as_deref())
@@ -180,4 +187,24 @@ pub async fn get_model_log_tail(
         .get_log_tail(None, input.lines)
         .await?;
     Ok(GetModelLogTailOutput { log_path, lines })
+}
+
+fn ensure_legacy_model_mutation_allowed() -> Result<(), AppError> {
+    let snapshot = ModelPlatformService::new().snapshot()?;
+    if snapshot.models.is_empty() && snapshot.bindings.is_empty() {
+        return Ok(());
+    }
+    Err(AppError {
+        code: AppErrorCode::ModelConfigMigrationFailed,
+        message: "Legacy model ayarı artık değiştirilemez; model platformu etkin.".to_string(),
+        recoverable: true,
+        suggested_action: Some(
+            "Ayarlar > Model Laboratuvarı üzerinden model, runtime ve görev atamalarını yönetin."
+                .to_string(),
+        ),
+        technical_details: Some(
+            "legacy model mutation command rejected after model_platform activation".to_string(),
+        ),
+        correlation_id: Uuid::new_v4().to_string(),
+    })
 }
