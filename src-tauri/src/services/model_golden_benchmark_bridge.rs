@@ -1,6 +1,8 @@
 use crate::domain::errors::{AppError, AppErrorCode};
 use crate::domain::model_platform::BenchmarkResultSummary;
-use crate::services::golden_ocr_metrics::{GoldenModelRuntimeStatus, GoldenOcrBenchmarkReport};
+use crate::services::golden_ocr_metrics::{
+    percentile_p50, percentile_p95, GoldenModelRuntimeStatus, GoldenOcrBenchmarkReport,
+};
 use crate::services::model_benchmark_service::{
     BenchmarkObservation, BenchmarkSubmission, ModelBenchmarkService,
 };
@@ -74,6 +76,12 @@ impl ModelGoldenBenchmarkBridge {
                 ),
                 observation("cer", candidate.cer, Some(base.cer)),
                 observation("wer", candidate.wer, Some(base.wer)),
+                observation("latency_p50_ms", candidate.latency_p50_ms, Some(base.latency_p50_ms)),
+                observation("latency_p95_ms", candidate.latency_p95_ms, Some(base.latency_p95_ms)),
+                observation("image_token_count", candidate.image_token_count, Some(base.image_token_count)),
+                observation("model_call_count", candidate.model_call_count, Some(base.model_call_count)),
+                observation("retry_count", candidate.retry_count, Some(base.retry_count)),
+                observation("peak_memory_bytes", candidate.peak_memory_bytes, Some(base.peak_memory_bytes)),
             ],
             notes: vec![
                 format!("golden_exam_id={}", report.exam_id),
@@ -95,6 +103,12 @@ struct OcrSummary {
     critical_token_missing: f64,
     printed_question_leakage: f64,
     schema_failure_rate: f64,
+    latency_p50_ms: f64,
+    latency_p95_ms: f64,
+    image_token_count: f64,
+    model_call_count: f64,
+    retry_count: f64,
+    peak_memory_bytes: f64,
 }
 
 fn summarize(report: &GoldenOcrBenchmarkReport) -> Result<OcrSummary, AppError> {
@@ -126,12 +140,30 @@ fn summarize(report: &GoldenOcrBenchmarkReport) -> Result<OcrSummary, AppError> 
     } else {
         structured.iter().filter(|value| !**value).count() as f64 / structured.len() as f64
     };
+    let p50_samples = report
+        .per_question
+        .iter()
+        .filter_map(|item| item.duration_ms_p50.map(|value| value as f64))
+        .collect::<Vec<_>>();
+    let p95_samples = report
+        .per_question
+        .iter()
+        .filter_map(|item| item.duration_ms_p95.map(|value| value as f64))
+        .collect::<Vec<_>>();
+    let latency_p50_ms = percentile_p50(&p50_samples).unwrap_or(0.0);
+    let latency_p95_ms = percentile_p95(&p95_samples).unwrap_or(0.0);
     Ok(OcrSummary {
         cer,
         wer,
         critical_token_missing,
         printed_question_leakage,
         schema_failure_rate,
+        latency_p50_ms,
+        latency_p95_ms,
+        image_token_count: report.aggregate.total_image_tokens.unwrap_or(0) as f64,
+        model_call_count: report.aggregate.total_model_calls.unwrap_or(0) as f64,
+        retry_count: report.aggregate.total_retries.unwrap_or(0) as f64,
+        peak_memory_bytes: report.aggregate.peak_memory_bytes.unwrap_or(0) as f64,
     })
 }
 
@@ -146,7 +178,7 @@ fn read_report(path: &str) -> Result<GoldenOcrBenchmarkReport, AppError> {
         correlation_id: Uuid::new_v4().to_string(),
     })?;
     serde_json::from_str(&content).map_err(|error| AppError {
-        code: AppErrorCode::ModelResponseInvalidJson,
+        code: AppErrorCode::ModelBenchmarkFailed,
         message: "Golden benchmark raporu geçerli Rubrika benchmark JSON'u değil.".to_string(),
         recoverable: true,
         suggested_action: Some("Golden benchmark runner çıktısını seçin.".to_string()),
@@ -175,10 +207,13 @@ fn observation(key: &str, value: f64, baseline_value: Option<f64>) -> BenchmarkO
 
 fn bridge_error(message: &str, technical_details: Option<String>) -> AppError {
     AppError {
-        code: AppErrorCode::ModelConfigMissing,
+        code: AppErrorCode::ModelBenchmarkFailed,
         message: message.to_string(),
         recoverable: true,
-        suggested_action: Some("Golden benchmark raporlarını yeniden seçin veya benchmark'ı yeniden çalıştırın.".to_string()),
+        suggested_action: Some(
+            "Golden benchmark raporlarını yeniden seçin veya benchmark'ı yeniden çalıştırın."
+                .to_string(),
+        ),
         technical_details,
         correlation_id: Uuid::new_v4().to_string(),
     }
