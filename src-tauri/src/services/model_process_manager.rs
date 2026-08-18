@@ -4,12 +4,17 @@ use crate::domain::model::{
     ManagedProcessIdentity, ModelMode, ModelProfile, ModelServerArgsPreview, ModelStatus,
     ModelSuggestedAction, SupportFlags,
 };
+use crate::domain::model_platform::fingerprint_runtime_definition;
 use crate::platform::file_access::atomic_write;
 use crate::platform::paths::{app_log_dir, model_server_log_path};
 use crate::platform::process_inspector::{fingerprint, ProcessInspector, SystemProcessInspector};
+use crate::services::llama_cpp_runtime_adapter::{
+    InferenceRuntimeAdapter, LlamaCppRuntimeAdapter, RuntimeLaunchSpec,
+};
 use crate::services::llama_server_gateway::{validate_base_url_for_privacy, LlamaServerGateway};
 use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_gateway::ModelGateway;
+use crate::services::platform_launch_registry;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
@@ -136,8 +141,6 @@ impl ModelProcessManager {
         idle_timeout: Duration,
     ) -> Self {
         let mut runtime = restore_runtime_state(&persisted_state_path);
-        // A process persisted by a previous application session is never
-        // trusted before live identity verification succeeds.
         for process in &mut runtime {
             process.unverified = true;
         }
@@ -223,7 +226,7 @@ impl ModelProcessManager {
         if let Some(running_profile) = self.running_profile_id()? {
             return Err(model_error(
                 AppErrorCode::ModelPortAlreadyInUse,
-                "Başka bir Gemma modeli şu anda RubrikaV3 tarafından kullanılıyor.",
+                "Başka bir yerel model runtime'ı şu anda RubrikaV3 tarafından kullanılıyor.",
                 Some(running_profile),
                 Some("Etkin model işi tamamlandığında tekrar deneyin.".to_string()),
             ));
@@ -250,7 +253,7 @@ impl ModelProcessManager {
 
             return Err(model_error(
                 AppErrorCode::ModelPortAlreadyInUse,
-                "8080 portu başka bir süreç tarafından kullanılıyor.",
+                &format!("{} portu başka bir süreç tarafından kullanılıyor.", profile.port),
                 Some(profile.base_url.clone()),
                 Some("RubrikaV3 başka bir süreci kapatmaz.".to_string()),
             ));
@@ -258,7 +261,8 @@ impl ModelProcessManager {
 
         let help_output = self.run_help(&profile.server_path).await?;
         let support_flags = SupportFlags::from_help_output(&help_output);
-        let args = build_model_server_args(&profile, &support_flags)?;
+        let launch_spec = launch_spec_for_profile(&profile, &support_flags)?;
+        let args = launch_spec.args.clone();
         let log_path = model_server_log_path(&profile.id);
         if let Some(parent) = log_path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
@@ -270,20 +274,21 @@ impl ModelProcessManager {
             })?;
         }
 
-        let mut command = Command::new(&profile.server_path);
+        let mut command = Command::new(&launch_spec.command);
         command
             .args(&args)
-            .current_dir(profile_workdir(&profile))
+            .current_dir(
+                PathBuf::from(&launch_spec.command)
+                    .parent()
+                    .map(|path| path.to_path_buf())
+                    .unwrap_or_else(|| profile_workdir(&profile)),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env(
                 "LLAMA_ARG_FLASH_ATTN",
-                if profile.requires_mmproj() {
-                    "off"
-                } else {
-                    "auto"
-                },
+                if launch_spec.requires_mmproj { "off" } else { "auto" },
             );
         #[cfg(unix)]
         command.process_group(0);
@@ -339,17 +344,17 @@ impl ModelProcessManager {
         }
 
         {
-            let mut runtime =
-                self.runtime
-                    .lock()
-                    .map_err(|err| crate::domain::errors::AppError {
-                        code: crate::domain::errors::AppErrorCode::ModelStateAccessFailed,
-                        message: "Model durumuna erişilemedi.".to_string(),
-                        recoverable: false,
-                        suggested_action: Some("Lütfen uygulamayı yeniden başlatın.".to_string()),
-                        technical_details: Some(format!("Mutex poison error: {}", err)),
-                        correlation_id: uuid::Uuid::new_v4().to_string(),
-                    })?;
+            let mut runtime = self
+                .runtime
+                .lock()
+                .map_err(|err| crate::domain::errors::AppError {
+                    code: crate::domain::errors::AppErrorCode::ModelStateAccessFailed,
+                    message: "Model durumuna erişilemedi.".to_string(),
+                    recoverable: false,
+                    suggested_action: Some("Lütfen uygulamayı yeniden başlatın.".to_string()),
+                    technical_details: Some(format!("Mutex poison error: {}", err)),
+                    correlation_id: uuid::Uuid::new_v4().to_string(),
+                })?;
             runtime.push(metadata.clone());
         }
         if let Err(err) = self.persist_runtime_state() {
@@ -404,7 +409,6 @@ impl ModelProcessManager {
         }
 
         let metadata = self.runtime_metadata(&profile.id)?;
-
         let Some(metadata) = metadata else {
             return Ok(StopModelServerOutput {
                 stopped: false,
@@ -465,6 +469,21 @@ impl ModelProcessManager {
     ) -> Result<ModelServerArgsPreview, AppError> {
         let profile = self.config_service.get_profile(profile_id)?;
         let help_output = self.run_help(&profile.server_path).await?;
+        if platform_launch_registry::get(&profile.id).is_some() {
+            let support_flags = SupportFlags::from_help_output(&help_output);
+            let launch_spec = launch_spec_for_profile(&profile, &support_flags)?;
+            return Ok(ModelServerArgsPreview {
+                profile_id: profile.id.clone(),
+                display_name: profile.display_name.clone(),
+                mode: profile.mode,
+                base_url: launch_spec.base_url,
+                command: launch_spec.command,
+                args: launch_spec.args,
+                supported_flags: vec![],
+                unsupported_flags: vec![],
+                log_path: model_server_log_path(&profile.id),
+            });
+        }
         let mut preview = preview_model_server_args(&profile, &help_output)?;
         preview.log_path = model_server_log_path(&profile.id);
         Ok(preview)
@@ -481,8 +500,7 @@ impl ModelProcessManager {
         let log_path = model_server_log_path(&profile.id);
         let server_path_exists = self.path_exists(&profile.server_path);
         let model_path_exists = self.path_exists(&profile.model_path);
-        let mmproj_path_exists =
-            !profile.requires_mmproj() || self.path_exists(&profile.mmproj_path);
+        let mmproj_path_exists = !profile.requires_mmproj() || self.path_exists(&profile.mmproj_path);
         let runtime = self
             .runtime
             .lock()
@@ -500,10 +518,7 @@ impl ModelProcessManager {
 
         let identity_verified = runtime
             .as_ref()
-            .map(|metadata| {
-                self.verify_process_identity(metadata, &profile)
-                    .unwrap_or(false)
-            })
+            .map(|metadata| self.verify_process_identity(metadata, &profile).unwrap_or(false))
             .unwrap_or(false);
         let runtime_unverified = runtime
             .as_ref()
@@ -569,18 +584,13 @@ impl ModelProcessManager {
             status.last_error = Some(model_error(
                 AppErrorCode::ModelProcessUnverified,
                 "Yerel model süreci güvenli biçimde doğrulanamadı.",
-                Some(format!(
-                    "profile_id={}; identity_verified=false",
-                    profile.id
-                )),
+                Some(format!("profile_id={}; identity_verified=false", profile.id)),
                 Some("Tanılama ayrıntılarını kontrol edin.".to_string()),
             ));
         }
 
         if status.started_by_app {
-            status
-                .warnings
-                .push("RubrikaV3 tarafından başlatıldı.".to_string());
+            status.warnings.push("RubrikaV3 tarafından başlatıldı.".to_string());
             status.server_running = true;
         }
 
@@ -647,9 +657,7 @@ impl ModelProcessManager {
         }
 
         if !status.server_running {
-            status
-                .warnings
-                .push("Model sunucusu kapalı görünüyor.".to_string());
+            status.warnings.push("Model sunucusu kapalı görünüyor.".to_string());
         }
 
         status.can_stop_from_app = status.started_by_app;
@@ -662,8 +670,7 @@ impl ModelProcessManager {
             || (profile.requires_mmproj() && !mmproj_path_exists)
         {
             status.can_start_from_app = false;
-            status.start_disabled_reason =
-                Some("Model, server veya mmproj dosyası eksik.".to_string());
+            status.start_disabled_reason = Some("Model, server veya mmproj dosyası eksik.".to_string());
             status.suggested_actions.push(ModelSuggestedAction {
                 code: "open_model_status_page".to_string(),
                 label: "Model durumunu aç".to_string(),
@@ -740,18 +747,17 @@ impl ModelProcessManager {
                     Some("Log dosyasını inceleyin.".to_string()),
                 ));
             }
-            let health =
-                match timeout(remaining, self.gateway.health_status(&profile.base_url)).await {
-                    Ok(result) => result?,
-                    Err(_) => {
-                        return Err(model_error(
-                            AppErrorCode::ModelServerReadyTimeout,
-                            "Model sunucusu zamanında hazır olmadı.",
-                            Some(format!("profile_id={}", profile.id)),
-                            Some("Log dosyasını inceleyin.".to_string()),
-                        ));
-                    }
-                };
+            let health = match timeout(remaining, self.gateway.health_status(&profile.base_url)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(model_error(
+                        AppErrorCode::ModelServerReadyTimeout,
+                        "Model sunucusu zamanında hazır olmadı.",
+                        Some(format!("profile_id={}", profile.id)),
+                        Some("Log dosyasını inceleyin.".to_string()),
+                    ));
+                }
+            };
             if health.server_running && health.health_ok {
                 return Ok(health);
             }
@@ -781,7 +787,7 @@ impl ModelProcessManager {
             AppErrorCode::ModelProfileNotManaged,
             "Bu profil yönetilen modda değil.",
             Some(format!("profile_id={}", profile.id)),
-            Some("Önce Model Status ekranından profili managed moduna alın.".to_string()),
+            Some("Önce Model Laboratuvarı'ndan profili managed moduna alın.".to_string()),
         ))
     }
 
@@ -860,9 +866,7 @@ impl ModelProcessManager {
         };
         Ok(metadata.started_by_app
             && !metadata.unverified
-            && self
-                .verify_process_identity(&metadata, &profile)
-                .unwrap_or(false))
+            && self.verify_process_identity(&metadata, &profile).unwrap_or(false))
     }
 
     fn running_profile_id(&self) -> Result<Option<String>, AppError> {
@@ -880,9 +884,7 @@ impl ModelProcessManager {
             };
             if metadata.started_by_app
                 && !metadata.unverified
-                && self
-                    .verify_process_identity(metadata, &profile)
-                    .unwrap_or(false)
+                && self.verify_process_identity(metadata, &profile).unwrap_or(false)
             {
                 return Ok(Some(metadata.profile_id.clone()));
             }
@@ -945,9 +947,7 @@ impl ModelProcessManager {
                     snapshot.owner_uid,
                     self.process_inspector.current_uid()
                 )),
-                Some(
-                    "Model sunucusunu mevcut kullanıcıyla yeniden başlatmayı deneyin.".to_string(),
-                ),
+                Some("Model sunucusunu mevcut kullanıcıyla yeniden başlatmayı deneyin.".to_string()),
             ));
         }
         let executable_fingerprint = fingerprint(&[snapshot
@@ -1058,10 +1058,7 @@ impl ModelProcessManager {
             self.persist_runtime_state()?;
             return Ok(());
         };
-        if self
-            .verify_process_identity(&metadata, profile)
-            .unwrap_or(false)
-        {
+        if self.verify_process_identity(&metadata, profile).unwrap_or(false) {
             self.mark_runtime_verified(&profile.id)?;
             return Ok(());
         }
@@ -1079,8 +1076,6 @@ impl ModelProcessManager {
                 ),
             )?;
         } else {
-            // A stale record with no matching listener is safe to remove. The
-            // live process is never signalled in this branch.
             self.remove_runtime_profile(&profile.id)?;
             self.persist_runtime_state()?;
         }
@@ -1096,10 +1091,7 @@ impl ModelProcessManager {
                 None,
             )
         })?;
-        if let Some(metadata) = runtime
-            .iter_mut()
-            .find(|item| item.profile_id == profile_id)
-        {
+        if let Some(metadata) = runtime.iter_mut().find(|item| item.profile_id == profile_id) {
             metadata.unverified = false;
         }
         Ok(())
@@ -1117,15 +1109,12 @@ impl ModelProcessManager {
         let mut runtime = self.runtime.lock().map_err(|err| {
             model_error(
                 AppErrorCode::ModelStateAccessFailed,
-                "Model durumuna erişilemedi.",
+                "Model durumuna erişilemedi.".to_string(),
                 Some(format!("Mutex poison error: {err}")),
                 None,
             )
         })?;
-        if let Some(metadata) = runtime
-            .iter_mut()
-            .find(|item| item.profile_id == profile_id)
-        {
+        if let Some(metadata) = runtime.iter_mut().find(|item| item.profile_id == profile_id) {
             metadata.unverified = true;
         }
         drop(runtime);
@@ -1199,9 +1188,7 @@ impl ModelProcessManager {
     }
 
     async fn stop_current_process(&self, metadata: &ManagedModelProcess) -> Result<(), AppError> {
-        let profile = self
-            .config_service
-            .get_profile(Some(&metadata.profile_id))?;
+        let profile = self.config_service.get_profile(Some(&metadata.profile_id))?;
         let Some(identity) = metadata.identity.as_ref() else {
             return Err(model_error(
                 AppErrorCode::ModelProcessUnverified,
@@ -1210,18 +1197,11 @@ impl ModelProcessManager {
                 Some("Tanılama ayrıntılarını kontrol edin.".to_string()),
             ));
         };
-        if identity.pid == 0
-            || !self
-                .verify_process_identity(metadata, &profile)
-                .unwrap_or(false)
-        {
+        if identity.pid == 0 || !self.verify_process_identity(metadata, &profile).unwrap_or(false) {
             return Err(model_error(
                 AppErrorCode::ModelProcessIdentityMismatch,
                 "Model süreci kimliği beklenen süreçle eşleşmiyor; sinyal gönderilmedi.",
-                Some(format!(
-                    "profile_id={}; pid={}",
-                    metadata.profile_id, identity.pid
-                )),
+                Some(format!("profile_id={}; pid={}", metadata.profile_id, identity.pid)),
                 Some("Tanılama ayrıntılarını kontrol edin.".to_string()),
             ));
         }
@@ -1243,10 +1223,7 @@ impl ModelProcessManager {
             send_verified_signal(&self.process_inspector, metadata, &profile, libc::SIGTERM)?;
             let wait_result = timeout(Duration::from_secs(8), child.wait()).await;
             if wait_result.is_err() {
-                if !self
-                    .verify_process_identity(metadata, &profile)
-                    .unwrap_or(false)
-                {
+                if !self.verify_process_identity(metadata, &profile).unwrap_or(false) {
                     return Err(model_error(
                         AppErrorCode::ModelProcessIdentityMismatch,
                         "Force kill öncesi model süreci kimliği değişti; sinyal gönderilmedi.",
@@ -1265,21 +1242,12 @@ impl ModelProcessManager {
         send_verified_signal(&self.process_inspector, metadata, &profile, libc::SIGTERM)?;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(8) {
-            if self
-                .process_inspector
-                .inspect(identity.pid)
-                .ok()
-                .flatten()
-                .is_none()
-            {
+            if self.process_inspector.inspect(identity.pid).ok().flatten().is_none() {
                 return Ok(());
             }
             sleep(Duration::from_millis(250)).await;
         }
-        if !self
-            .verify_process_identity(metadata, &profile)
-            .unwrap_or(false)
-        {
+        if !self.verify_process_identity(metadata, &profile).unwrap_or(false) {
             return Err(model_error(
                 AppErrorCode::ModelProcessIdentityMismatch,
                 "Force kill öncesi model süreci kimliği değişti; sinyal gönderilmedi.",
@@ -1678,8 +1646,6 @@ impl ModelProcessManager {
         let mut operation_kinds = Vec::new();
         let mut oldest_lease_age_seconds = None;
         for record in registry.leases.values() {
-            // Keep all ownership context available for diagnostics without
-            // exposing it in the teacher-facing status DTO.
             let _ownership_context = (
                 &record.profile_id,
                 &record.consumer_id,
@@ -1803,7 +1769,7 @@ impl ModelProcessManager {
             let mut error = status.last_error.clone().unwrap_or_else(|| {
                 model_error(
                     AppErrorCode::ModelServerNotRunning,
-                    "Gemma model sunucusu çalışmıyor.",
+                    "Yerel model sunucusu çalışmıyor.",
                     Some(format!(
                         "step={step_name}; profile_id={}",
                         status.profile_id
@@ -1811,8 +1777,7 @@ impl ModelProcessManager {
                     Some("Model sunucusunu manuel başlatın veya managed moda geçin.".to_string()),
                 )
             });
-            error.technical_details =
-                Some(model_step_details(step_name, &status, false, None, None));
+            error.technical_details = Some(model_step_details(step_name, &status, false, None, None));
             return Err(error);
         }
 
@@ -1830,22 +1795,18 @@ impl ModelProcessManager {
                     let mut error = ready_status.last_error.clone().unwrap_or_else(|| {
                         model_error(
                             AppErrorCode::ModelServerStartFailed,
-                            "Gemma model sunucusu başlatılamadı.",
+                            "Yerel model sunucusu başlatılamadı.",
                             Some(format!(
                                 "step={step_name}; profile_id={}",
                                 ready_status.profile_id
                             )),
-                            Some(
-                                "Model ayarlarını kontrol edin veya modeli elle başlatın."
-                                    .to_string(),
-                            ),
+                            Some("Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string()),
                         )
                     });
                     error.code = AppErrorCode::ModelServerStartFailed;
-                    error.message = "Gemma model sunucusu başlatılamadı.".to_string();
-                    error.suggested_action = Some(
-                        "Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string(),
-                    );
+                    error.message = "Yerel model sunucusu başlatılamadı.".to_string();
+                    error.suggested_action =
+                        Some("Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string());
                     error.technical_details = Some(model_step_details(
                         step_name,
                         &status,
@@ -1858,11 +1819,10 @@ impl ModelProcessManager {
             }
             Err(start_error) => {
                 let start_error_details = start_error.technical_details.clone().unwrap_or_default();
-                let step_details =
-                    model_step_details(step_name, &status, true, None, Some(&start_error));
+                let step_details = model_step_details(step_name, &status, true, None, Some(&start_error));
                 let mut error = AppError {
                     code: AppErrorCode::ModelServerStartFailed,
-                    message: "Gemma model sunucusu başlatılamadı.".to_string(),
+                    message: "Yerel model sunucusu başlatılamadı.".to_string(),
                     recoverable: true,
                     suggested_action: Some(
                         "Model ayarlarını kontrol edin veya modeli elle başlatın.".to_string(),
@@ -1882,6 +1842,27 @@ impl ModelProcessManager {
             }
         }
     }
+}
+
+fn launch_spec_for_profile(
+    profile: &ModelProfile,
+    support_flags: &SupportFlags,
+) -> Result<RuntimeLaunchSpec, AppError> {
+    if let Some(definition) = platform_launch_registry::get(&profile.id) {
+        return LlamaCppRuntimeAdapter.build_launch_spec(
+            &definition.runtime,
+            &definition.model,
+            support_flags,
+        );
+    }
+    Ok(RuntimeLaunchSpec {
+        engine: crate::domain::model_platform::RuntimeEngine::LlamaCpp,
+        command: profile.server_path.clone(),
+        args: build_model_server_args(profile, support_flags)?,
+        base_url: profile.base_url.clone(),
+        runtime_fingerprint: runtime_profile_fingerprint(profile),
+        requires_mmproj: profile.requires_mmproj(),
+    })
 }
 
 fn spawn_log_reader<R>(
@@ -1961,6 +1942,12 @@ fn model_process_state_path() -> PathBuf {
 }
 
 fn runtime_profile_fingerprint(profile: &ModelProfile) -> String {
+    if let Some(definition) = platform_launch_registry::get(&profile.id) {
+        return fingerprint(&[
+            definition.model.model_fingerprint,
+            fingerprint_runtime_definition(&definition.runtime),
+        ]);
+    }
     let canonical = |path: &str| {
         fs::canonicalize(path)
             .unwrap_or_else(|_| PathBuf::from(path))
@@ -1979,6 +1966,9 @@ fn runtime_profile_fingerprint(profile: &ModelProfile) -> String {
 }
 
 fn model_file_fingerprint(profile: &ModelProfile) -> Option<String> {
+    if let Some(definition) = platform_launch_registry::get(&profile.id) {
+        return Some(definition.model.model_fingerprint);
+    }
     if profile.model_path.trim().is_empty() {
         return None;
     }
@@ -2011,15 +2001,11 @@ fn send_verified_signal(
             Some("Tanılama ayrıntılarını kontrol edin.".to_string()),
         ));
     };
-    if identity.pid == 0 || identity.pid > i32::MAX as u32 || identity.expected_port != profile.port
-    {
+    if identity.pid == 0 || identity.pid > i32::MAX as u32 || identity.expected_port != profile.port {
         return Err(model_error(
             AppErrorCode::ModelProcessIdentityMismatch,
             "Geçersiz model süreç kimliği; sinyal gönderilmedi.",
-            Some(format!(
-                "pid={}; port={}",
-                identity.pid, identity.expected_port
-            )),
+            Some(format!("pid={}; port={}", identity.pid, identity.expected_port)),
             None,
         ));
     }
@@ -2066,9 +2052,6 @@ fn send_verified_signal(
     }
     #[cfg(unix)]
     {
-        // SAFETY: the process identity and expected listener were revalidated
-        // immediately before this signal. Managed children are launched in a
-        // dedicated process group whose PGID equals the child PID.
         if unsafe { libc::kill(-(identity.pid as i32), signal) } != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
@@ -2148,8 +2131,7 @@ fn model_step_details(
         model_mode: before.mode.clone(),
         health_ok_before_start: before.server_running && before.health_ok,
         attempted_managed_start,
-        health_ok_after_start: after
-            .is_some_and(|status| status.server_running && status.health_ok),
+        health_ok_after_start: after.is_some_and(|status| status.server_running && status.health_ok),
         model_log_path: before
             .log_path
             .as_ref()
@@ -2378,8 +2360,7 @@ HTTPServer((host, port), Handler).serve_forever()
     fn unsupported_kv_flags_error_from_preview_helper() {
         let profile = default_model_profile();
         let help = "--mmproj-offload";
-        let err =
-            build_model_server_args(&profile, &SupportFlags::from_help_output(help)).unwrap_err();
+        let err = build_model_server_args(&profile, &SupportFlags::from_help_output(help)).unwrap_err();
         assert_eq!(err.code, AppErrorCode::ModelServerUnsupportedFlags);
     }
 
@@ -2406,8 +2387,6 @@ HTTPServer((host, port), Handler).serve_forever()
             .arg("30")
             .spawn()
             .expect("sleep should be available");
-        // The coordinator never accepts a raw PID for termination. This
-        // fixture is cleaned up through its authoritative Child handle.
         child.kill().expect("test child should be killable");
         let _ = child.wait();
         assert!(child.try_wait().unwrap().is_some());
@@ -2482,8 +2461,7 @@ HTTPServer((host, port), Handler).serve_forever()
     #[test]
     #[ignore = "Requires loopback TCP bind; restricted sandboxes must run this with network permission."]
     fn releasing_one_lease_does_not_stop_runtime_used_by_another_job() {
-        let Some((base_url, host, port, completion_count, _handle)) = spawn_model_probe_server()
-        else {
+        let Some((base_url, host, port, completion_count, _handle)) = spawn_model_probe_server() else {
             return;
         };
         let config = test_service();
@@ -2589,9 +2567,7 @@ HTTPServer((host, port), Handler).serve_forever()
     #[test]
     fn manual_start_is_blocked_while_runtime_is_draining() {
         let service = test_service();
-        let _ = service
-            .set_mode(None, ModelMode::Managed)
-            .expect("managed mode");
+        let _ = service.set_mode(None, ModelMode::Managed).expect("managed mode");
         let manager = ModelProcessManager::new_with_state_path(
             service,
             Arc::new(LlamaServerGateway::default()),
@@ -2653,9 +2629,7 @@ HTTPServer((host, port), Handler).serve_forever()
                 }));
             }
             for task in tasks {
-                task.await
-                    .expect("lease release task")
-                    .expect("lease release");
+                task.await.expect("lease release task").expect("lease release");
             }
             assert_eq!(manager.active_lease_count().expect("lease count"), 0);
         });
@@ -2675,10 +2649,7 @@ HTTPServer((host, port), Handler).serve_forever()
                 .join("src/services")
                 .join(file);
             let source = std::fs::read_to_string(path).expect("service source");
-            assert!(
-                !source.contains("stop_server("),
-                "{file} must not own model lifecycle"
-            );
+            assert!(!source.contains("stop_server("), "{file} must not own model lifecycle");
             assert!(
                 !source.contains("ensure_ready(") && !source.contains("acquire_runtime("),
                 "{file} must use the single ready runtime lease contract"
@@ -2744,11 +2715,9 @@ HTTPServer((host, port), Handler).serve_forever()
     #[test]
     #[ignore = "Requires loopback TCP bind; restricted sandboxes must run this with network permission."]
     fn get_model_status_avoids_completion_probe() {
-        let Some((base_url, host, port, completion_count, _handle)) = spawn_model_probe_server()
-        else {
+        let Some((base_url, host, port, completion_count, _handle)) = spawn_model_probe_server() else {
             return;
         };
-
         let service = test_service();
         let mut profile = default_model_profile();
         profile.mode = ModelMode::External;
@@ -2759,7 +2728,6 @@ HTTPServer((host, port), Handler).serve_forever()
         profile.host = host;
         profile.port = port;
         service.update_profile(profile).unwrap();
-
         let manager = ModelProcessManager::new_with_state_path(
             service,
             Arc::new(LlamaServerGateway::default()),
@@ -2772,7 +2740,6 @@ HTTPServer((host, port), Handler).serve_forever()
             assert!(status.health_ok);
             assert!(!status.completion_probe_ok);
             assert_eq!(completion_count.load(Ordering::SeqCst), 0);
-
             let probed = manager.probe_model_server(None).await.unwrap();
             assert!(probed.server_running);
             assert!(probed.health_ok);
@@ -2784,11 +2751,9 @@ HTTPServer((host, port), Handler).serve_forever()
     #[test]
     #[ignore = "Requires loopback TCP bind; restricted sandboxes must run this with network permission."]
     fn ensure_model_ready_skips_start_when_server_is_already_healthy() {
-        let Some((base_url, host, port, _completion_count, _handle)) = spawn_model_probe_server()
-        else {
+        let Some((base_url, host, port, _completion_count, _handle)) = spawn_model_probe_server() else {
             return;
         };
-
         let service = test_service();
         let mut profile = default_model_profile();
         profile.mode = ModelMode::External;
@@ -2799,7 +2764,6 @@ HTTPServer((host, port), Handler).serve_forever()
         profile.host = host;
         profile.port = port;
         service.update_profile(profile).unwrap();
-
         let manager = ModelProcessManager::new_with_state_path(
             service,
             Arc::new(LlamaServerGateway::default()),
@@ -2821,7 +2785,6 @@ HTTPServer((host, port), Handler).serve_forever()
     fn ensure_model_ready_reports_start_failure() {
         let _model_runtime_guard = test_support::blocking_lock_model_runtime_test();
         let server_path = write_mock_llama_server_script("fail");
-
         let service = test_service();
         let mut profile = default_model_profile();
         profile.id = format!("managed-start-failure-{}", Uuid::new_v4());
@@ -2834,7 +2797,6 @@ HTTPServer((host, port), Handler).serve_forever()
         profile.port = test_support::available_loopback_port();
         profile.base_url = format!("http://127.0.0.1:{}", profile.port);
         service.update_profile(profile).unwrap();
-
         let manager = ModelProcessManager::new_with_state_path(
             service,
             Arc::new(LlamaServerGateway::default()),
