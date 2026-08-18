@@ -475,7 +475,7 @@ impl ModelProcessManager {
             return Ok(ModelServerArgsPreview {
                 profile_id: profile.id.clone(),
                 display_name: profile.display_name.clone(),
-                mode: profile.mode,
+                mode: profile.mode.clone(),
                 base_url: launch_spec.base_url,
                 command: launch_spec.command,
                 args: launch_spec.args,
@@ -1109,7 +1109,7 @@ impl ModelProcessManager {
         let mut runtime = self.runtime.lock().map_err(|err| {
             model_error(
                 AppErrorCode::ModelStateAccessFailed,
-                "Model durumuna erişilemedi.".to_string(),
+                "Model durumuna erişilemedi.",
                 Some(format!("Mutex poison error: {err}")),
                 None,
             )
