@@ -141,6 +141,23 @@ pub struct ModelRouteLeaseMetadata {
     pub runtime_fingerprint: String,
 }
 
+/// Resolved model/runtime identity without starting the inference process.
+///
+/// Production services use this when cache keys or provenance need to be
+/// computed before a runtime lease is acquired. Platform-backed identities
+/// carry model/runtime fingerprints; legacy profiles intentionally leave them
+/// empty so callers can use their existing compatibility fallback.
+#[derive(Debug, Clone)]
+pub struct ModelRuntimeIdentity {
+    pub profile_id: String,
+    pub base_url: String,
+    pub model_path: String,
+    pub model_display_name: String,
+    pub model_family: String,
+    pub model_fingerprint: Option<String>,
+    pub runtime_fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlatformRuntimeSelection {
     profile_id: String,
@@ -268,6 +285,36 @@ impl ModelRuntimeService {
     pub fn with_model_platform(mut self, platform_service: ModelPlatformService) -> Self {
         self.platform_service = Some(platform_service);
         self
+    }
+
+    pub fn resolve_runtime_identity(
+        &self,
+        profile_id: Option<&str>,
+        operation: &ModelRuntimeRequest,
+        correlation_id: &str,
+    ) -> Result<ModelRuntimeIdentity, AppError> {
+        let (effective_profile_id, profile, route) =
+            self.resolve_effective_profile(profile_id, operation, correlation_id)?;
+        if let Some(route) = route {
+            return Ok(ModelRuntimeIdentity {
+                profile_id: effective_profile_id.unwrap_or_else(|| profile.id.clone()),
+                base_url: profile.base_url,
+                model_path: route.model.model_path.clone(),
+                model_display_name: route.model.display_name.clone(),
+                model_family: route.model.family.clone(),
+                model_fingerprint: Some(route.model.model_fingerprint.clone()),
+                runtime_fingerprint: Some(fingerprint_runtime_definition(&route.runtime)),
+            });
+        }
+        Ok(ModelRuntimeIdentity {
+            profile_id: effective_profile_id.unwrap_or_else(|| profile.id.clone()),
+            base_url: profile.base_url,
+            model_path: profile.model_path,
+            model_display_name: profile.display_name,
+            model_family: "legacy".to_string(),
+            model_fingerprint: None,
+            runtime_fingerprint: None,
+        })
     }
 
     pub async fn acquire_ready_runtime_lease(
@@ -492,6 +539,23 @@ impl ModelRuntimeService {
     }
 
     pub fn get_profile(&self, profile_id: &str) -> Result<ModelProfile, AppError> {
+        let use_case = match profile_id {
+            "speaking_transcript_cleanup_12b" => Some(ModelUseCase::SpeakingTranscriptCleanup),
+            "speaking_rubric_evaluation_12b" => Some(ModelUseCase::SpeakingEvaluation),
+            _ => None,
+        };
+        if let Some(use_case) = use_case {
+            let request = ModelRuntimeRequest {
+                use_case,
+                capability: ModelCapability::Text,
+                requires_mmproj: false,
+                timeout_seconds: 60,
+            };
+            let correlation_id = uuid::Uuid::new_v4().to_string();
+            let (_, profile, _) =
+                self.resolve_effective_profile(Some(profile_id), &request, &correlation_id)?;
+            return Ok(profile);
+        }
         self.config_service.get_model_profile(profile_id)
     }
 
