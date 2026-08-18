@@ -103,7 +103,20 @@ impl ModelRouterService {
             ));
         }
 
-        enforce_lifecycle(&model, &binding, task, usage_mode)?;
+        // The caller requests the safe Production route by default. A binding
+        // can explicitly opt a non-production model into an experiment. This
+        // is not a fallback: the persisted binding is the user's explicit
+        // authorization and the resolved route records ExplicitExperiment.
+        let effective_usage_mode = if usage_mode == RouteUsageMode::Production
+            && binding.allow_experimental_student_data
+            && model.lifecycle_state != ModelLifecycleState::Production
+        {
+            RouteUsageMode::ExplicitExperiment
+        } else {
+            usage_mode
+        };
+
+        enforce_lifecycle(&model, &binding, task, effective_usage_mode)?;
 
         let runtime_fingerprint = fingerprint_runtime_definition(&runtime);
         let manifest = snapshot
@@ -148,7 +161,10 @@ impl ModelRouterService {
             .get("baselineVerified")
             .map(|value| value == "true")
             .unwrap_or(false);
-        if usage_mode == RouteUsageMode::Production && !benchmark_verified && !grandfathered {
+        if effective_usage_mode == RouteUsageMode::Production
+            && !benchmark_verified
+            && !grandfathered
+        {
             return Err(route_error(
                 AppErrorCode::ModelBenchmarkRequired,
                 "Seçili model bu görev için benchmark promotion gate'ini geçmemiş.",
@@ -164,7 +180,7 @@ impl ModelRouterService {
             runtime,
             capability_manifest: manifest,
             benchmark_verified: benchmark_verified || grandfathered,
-            usage_mode,
+            usage_mode: effective_usage_mode,
         })
     }
 }
