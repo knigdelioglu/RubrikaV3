@@ -67,6 +67,29 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Apply rustfmt for validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd src-tauri && cargo fmt --all)
+          git diff -- src-tauri > rustfmt.patch
+          git diff --name-only -- src-tauri > rustfmt-files.txt
+          if [ -s rustfmt-files.txt ]; then
+            tar -czf rustfmt-files.tar.gz $(cat rustfmt-files.txt)
+          else
+            tar -czf rustfmt-files.tar.gz --files-from /dev/null
+          fi
+
+      - name: Upload rustfmt output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfmt-output
+          path: |
+            rustfmt.patch
+            rustfmt-files.txt
+            rustfmt-files.tar.gz
+          if-no-files-found: error
+
       - name: Run quality gate
         shell: bash
         run: |
