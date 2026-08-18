@@ -359,7 +359,9 @@ impl ModelPlatformService {
                     AppErrorCode::ModelNotProductionApproved,
                     "Model production promotion gate'ini geçemedi.",
                     Some(decision.reasons.join("; ")),
-                    Some("Eksik capability probe veya benchmark adımlarını tamamlayın.".to_string()),
+                    Some(
+                        "Eksik capability probe veya benchmark adımlarını tamamlayın.".to_string(),
+                    ),
                 ));
             }
         }
@@ -681,28 +683,36 @@ fn require_model<'a>(
     store: &'a ModelPlatformConfig,
     id: &str,
 ) -> Result<&'a ModelDefinition, AppError> {
-    store.models.iter().find(|item| item.id == id).ok_or_else(|| {
-        platform_error(
-            AppErrorCode::ModelRegistryEntryNotFound,
-            "Model registry kaydı bulunamadı.",
-            Some(format!("model_definition_id={id}")),
-            Some("Modeli yeniden ekleyin.".to_string()),
-        )
-    })
+    store
+        .models
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| {
+            platform_error(
+                AppErrorCode::ModelRegistryEntryNotFound,
+                "Model registry kaydı bulunamadı.",
+                Some(format!("model_definition_id={id}")),
+                Some("Modeli yeniden ekleyin.".to_string()),
+            )
+        })
 }
 
 fn require_runtime<'a>(
     store: &'a ModelPlatformConfig,
     id: &str,
 ) -> Result<&'a RuntimeDefinition, AppError> {
-    store.runtimes.iter().find(|item| item.id == id).ok_or_else(|| {
-        platform_error(
-            AppErrorCode::ModelRegistryEntryNotFound,
-            "Runtime registry kaydı bulunamadı.",
-            Some(format!("runtime_definition_id={id}")),
-            Some("Runtime ayarını yeniden oluşturun.".to_string()),
-        )
-    })
+    store
+        .runtimes
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| {
+            platform_error(
+                AppErrorCode::ModelRegistryEntryNotFound,
+                "Runtime registry kaydı bulunamadı.",
+                Some(format!("runtime_definition_id={id}")),
+                Some("Runtime ayarını yeniden oluşturun.".to_string()),
+            )
+        })
 }
 
 fn is_grandfathered_baseline(model: &ModelDefinition) -> bool {

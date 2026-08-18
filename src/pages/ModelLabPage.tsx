@@ -570,9 +570,9 @@ function BenchmarkTab({ snapshot, task, model, runtime, json, setTask, setModel,
         )}
       </Panel>
       <Panel>
-        <SectionTitle icon={<FlaskConical size={18} />} title="Gelişmiş: manuel metrik girişi" subtitle="Otomatik golden raporu bulunmayan scoring/speaking gibi task'larda versioned policy gözlemleri elle içe aktarılabilir." />
+        <SectionTitle icon={<FlaskConical size={18} />} title="Gelişmiş: manuel tanılama metrikleri" subtitle="Scoring/speaking gibi task’larda manuel gözlem kaydedilebilir; bu kayıtlar yalnız tanılama içindir ve Production promotion gate’ini açmaz." />
         <Field label="Benchmark observations JSON"><textarea value={json} onChange={(e) => setJson(e.target.value)} rows={13} style={{ width: '100%', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }} /></Field>
-        <button className="button button--secondary" type="button" disabled={manualPending || !model || !runtime} onClick={onManualSubmit}>{manualPending ? 'Değerlendiriliyor…' : 'Manuel gate’i değerlendir ve kaydet'}</button>
+        <button className="button button--secondary" type="button" disabled={manualPending || !model || !runtime} onClick={onManualSubmit}>{manualPending ? 'Değerlendiriliyor…' : 'Manuel tanılamayı değerlendir ve kaydet'}</button>
       </Panel>
       <Panel>
         <h3 style={{ marginTop: 0 }}>Sonuçlar</h3>

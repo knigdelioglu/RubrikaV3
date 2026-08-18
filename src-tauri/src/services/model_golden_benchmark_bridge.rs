@@ -68,7 +68,11 @@ impl ModelGoldenBenchmarkBridge {
                 model_definition_id: input.model_definition_id,
                 runtime_definition_id: input.runtime_definition_id,
                 observations: vec![
-                    observation("critical_token_missing", candidate.critical_token_missing, None),
+                    observation(
+                        "critical_token_missing",
+                        candidate.critical_token_missing,
+                        None,
+                    ),
                     observation(
                         "printed_question_leakage",
                         candidate.printed_question_leakage,

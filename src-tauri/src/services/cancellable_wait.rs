@@ -33,11 +33,7 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
 
-        let result = await_with_cancellation(
-            Some(&token),
-            std::future::pending::<u32>(),
-        )
-        .await;
+        let result = await_with_cancellation(Some(&token), std::future::pending::<u32>()).await;
 
         assert_eq!(result, None);
     }

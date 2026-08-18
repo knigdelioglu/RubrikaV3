@@ -116,7 +116,10 @@ impl ModelLifecycleState {
     }
 
     pub fn may_receive_explicit_experiment_student_data(self) -> bool {
-        matches!(self, Self::Experimental | Self::BenchmarkVerified | Self::Production)
+        matches!(
+            self,
+            Self::Experimental | Self::BenchmarkVerified | Self::Production
+        )
     }
 }
 
@@ -522,7 +525,10 @@ pub fn migrate_legacy_profile(profile: &ModelProfile) -> LegacyProfileMigration 
         capabilities,
         context_limit: None,
         metadata: BTreeMap::from([
-            ("migrationSource".to_string(), "legacy_model_profile".to_string()),
+            (
+                "migrationSource".to_string(),
+                "legacy_model_profile".to_string(),
+            ),
             ("legacyProfileId".to_string(), profile.id.clone()),
         ]),
         model_fingerprint: String::new(),
@@ -573,7 +579,11 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
     vec![
         task_profile(
             ModelTaskKind::QuestionTextExtraction,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::Vision, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::Vision,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "question_text_extraction_typed_user_data",
             "question_text_extraction_v1",
             "model_policy_v1",
@@ -584,7 +594,10 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::RubricExtraction,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "rubric_extraction_typed_user_data",
             "rubric_extraction_v1",
             "model_policy_v1",
@@ -595,7 +608,11 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::StudentAnswerOcr,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::Vision, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::Vision,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "student_answer_ocr_v4_typed_user_data",
             "student_answer_ocr_v4",
             "ocr_review_policy_v1",
@@ -606,7 +623,11 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::StudentAnswerOcrIssueCorrection,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::Vision, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::Vision,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "student_answer_ocr_issue_correction_typed_user_data",
             "student_answer_ocr_issue_correction_v1",
             "ocr_review_policy_v1",
@@ -617,7 +638,10 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::SemanticScoring,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "scoring_v4_typed_user_data",
             "semantic_scoring_v4",
             "semantic_scoring_policy_v1",
@@ -628,7 +652,10 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::SpeakingTranscriptCleanup,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "speaking_transcript_cleanup_typed_user_data",
             "speaking_transcript_cleanup_v1",
             "speaking_cleanup_policy_v1",
@@ -639,7 +666,10 @@ pub fn default_task_profiles() -> Vec<TaskProfile> {
         ),
         task_profile(
             ModelTaskKind::SpeakingEvaluation,
-            &[ModelCapabilityKind::Text, ModelCapabilityKind::StructuredJson],
+            &[
+                ModelCapabilityKind::Text,
+                ModelCapabilityKind::StructuredJson,
+            ],
             "speaking_rubric_evidence_tr_v5_typed_user_data",
             "speaking_rubric_v5",
             "speaking_scoring_policy_v2",

@@ -178,7 +178,9 @@ impl ModelConfigService {
     /// `model_profiles.json` data. The synthetic profile is never persisted.
     pub fn get_model_profile(&self, profile_id: &str) -> Result<ModelProfile, AppError> {
         if let Some(task_profile_id) = legacy_alias_task(profile_id) {
-            if let Some(profile) = current_platform_compatibility_profile(profile_id, task_profile_id)? {
+            if let Some(profile) =
+                current_platform_compatibility_profile(profile_id, task_profile_id)?
+            {
                 return Ok(profile);
             }
         }
@@ -275,37 +277,47 @@ fn current_platform_compatibility_profile(
         .bindings
         .iter()
         .find(|binding| binding.enabled && binding.task_profile_id == task_profile_id)
-        .ok_or_else(|| compatibility_error(
-            AppErrorCode::ModelBindingNotFound,
-            "Legacy profil karşılığı olan etkin model ataması bulunamadı.",
-            format!("legacy_profile_id={legacy_profile_id}; task_profile_id={task_profile_id}"),
-            "Model Laboratuvarı > Görev Atamaları bölümünden bu göreve model atayın.",
-        ))?;
+        .ok_or_else(|| {
+            compatibility_error(
+                AppErrorCode::ModelBindingNotFound,
+                "Legacy profil karşılığı olan etkin model ataması bulunamadı.",
+                format!("legacy_profile_id={legacy_profile_id}; task_profile_id={task_profile_id}"),
+                "Model Laboratuvarı > Görev Atamaları bölümünden bu göreve model atayın.",
+            )
+        })?;
     let model = snapshot
         .models
         .iter()
         .find(|model| model.id == binding.model_definition_id)
-        .ok_or_else(|| compatibility_error(
-            AppErrorCode::ModelRegistryEntryNotFound,
-            "Göreve atanmış model registry'de bulunamadı.",
-            format!("model_definition_id={}", binding.model_definition_id),
-            "Görev atamasını geçerli bir modele değiştirin.",
-        ))?;
+        .ok_or_else(|| {
+            compatibility_error(
+                AppErrorCode::ModelRegistryEntryNotFound,
+                "Göreve atanmış model registry'de bulunamadı.",
+                format!("model_definition_id={}", binding.model_definition_id),
+                "Görev atamasını geçerli bir modele değiştirin.",
+            )
+        })?;
     let runtime = snapshot
         .runtimes
         .iter()
         .find(|runtime| runtime.id == binding.runtime_definition_id)
-        .ok_or_else(|| compatibility_error(
-            AppErrorCode::ModelRegistryEntryNotFound,
-            "Göreve atanmış runtime registry'de bulunamadı.",
-            format!("runtime_definition_id={}", binding.runtime_definition_id),
-            "Görev atamasını geçerli bir runtime'a değiştirin.",
-        ))?;
+        .ok_or_else(|| {
+            compatibility_error(
+                AppErrorCode::ModelRegistryEntryNotFound,
+                "Göreve atanmış runtime registry'de bulunamadı.",
+                format!("runtime_definition_id={}", binding.runtime_definition_id),
+                "Görev atamasını geçerli bir runtime'a değiştirin.",
+            )
+        })?;
     let uses_projector = runtime.uses_multimodal_projector(model);
     Ok(Some(ModelProfile {
         id: legacy_profile_id.to_string(),
         display_name: format!("{} — compatibility", model.display_name),
-        mode: if runtime.managed { ModelMode::Managed } else { ModelMode::External },
+        mode: if runtime.managed {
+            ModelMode::Managed
+        } else {
+            ModelMode::External
+        },
         server_path: runtime.server_path.clone(),
         model_path: model.model_path.clone(),
         mmproj_path: model.mmproj_path.clone().unwrap_or_default(),

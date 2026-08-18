@@ -1,5 +1,5 @@
 use crate::domain::errors::{AppError, AppErrorCode};
-use crate::domain::model::{ModelMode, ModelProfile, ModelRuntimePreset, PrivacyMode};
+use crate::domain::model::{ModelMode, ModelProfile, ModelRuntimePreset};
 use crate::domain::model_platform::{
     default_task_profiles, fingerprint_runtime_definition, migrate_legacy_profile,
     CapabilityManifest, CapabilityProbeResult, CapabilitySupport, ModelCapabilityKind,
@@ -14,7 +14,7 @@ use crate::services::platform_launch_registry;
 use chrono::Utc;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 pub const VISION_RUNTIME_ID: &str = "llama-local-vision";
@@ -64,7 +64,9 @@ impl ModelPlatformMigrationService {
                 model_count: 0,
                 runtime_count: 0,
                 binding_count: 0,
-                warnings: vec!["Legacy model profile bulunamadı; registry boş bırakıldı.".to_string()],
+                warnings: vec![
+                    "Legacy model profile bulunamadı; registry boş bırakıldı.".to_string()
+                ],
             });
         }
 
@@ -142,7 +144,9 @@ pub fn materialize_route_as_legacy_profile(
     Ok(profile_id)
 }
 
-fn build_platform_config_from_legacy(profiles: &[ModelProfile]) -> Result<ModelPlatformConfig, AppError> {
+fn build_platform_config_from_legacy(
+    profiles: &[ModelProfile],
+) -> Result<ModelPlatformConfig, AppError> {
     let mut config = ModelPlatformConfig {
         schema_version: MODEL_PLATFORM_SCHEMA_VERSION.to_string(),
         models: vec![],
@@ -190,25 +194,23 @@ fn build_platform_config_from_legacy(profiles: &[ModelProfile]) -> Result<ModelP
         }
     }
 
-    for profile in profiles.iter().filter(|profile| {
-        !LEGACY_GEMMA_PROFILE_IDS.contains(&profile.id.as_str())
-    }) {
+    for profile in profiles
+        .iter()
+        .filter(|profile| !LEGACY_GEMMA_PROFILE_IDS.contains(&profile.id.as_str()))
+    {
         let migration = migrate_legacy_profile(profile);
         let mut model = migration.model;
         model.lifecycle_state = ModelLifecycleState::Production;
-        model.metadata.insert("baselineVerified".to_string(), "true".to_string());
+        model
+            .metadata
+            .insert("baselineVerified".to_string(), "true".to_string());
         let mut runtime = migration.runtime;
         runtime.id = format!("legacy-runtime-{}", sanitize_id(&profile.id));
         let runtime_id = runtime.id.clone();
         let model_id = model.id.clone();
         upsert_model(&mut config, model.clone());
         upsert_runtime(&mut config, runtime.clone());
-        seed_baseline_manifest(
-            &mut config,
-            &model,
-            &runtime,
-            model.capabilities.vision,
-        );
+        seed_baseline_manifest(&mut config, &model, &runtime, model.capabilities.vision);
         for mut binding in migration.bindings {
             binding.model_definition_id = model_id.clone();
             binding.runtime_definition_id = runtime_id.clone();
@@ -253,7 +255,13 @@ fn merge_gemma_model(profiles: &[&ModelProfile]) -> ModelDefinition {
             migration.model_path = path.to_string();
         }
     }
-    if migration.mmproj_path.as_deref().unwrap_or_default().trim().is_empty() {
+    if migration
+        .mmproj_path
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
         migration.mmproj_path = profiles
             .iter()
             .map(|profile| profile.mmproj_path.trim())
@@ -261,7 +269,10 @@ fn merge_gemma_model(profiles: &[&ModelProfile]) -> ModelDefinition {
             .map(str::to_string);
     }
     migration.metadata = BTreeMap::from([
-        ("migrationSource".to_string(), "legacy_model_profiles".to_string()),
+        (
+            "migrationSource".to_string(),
+            "legacy_model_profiles".to_string(),
+        ),
         ("baselineVerified".to_string(), "true".to_string()),
         (
             "legacyAliases".to_string(),
@@ -298,7 +309,11 @@ fn append_canonical_bindings(config: &mut ModelPlatformConfig, profile: &ModelPr
     } else {
         VISION_RUNTIME_ID
     };
-    if !config.runtimes.iter().any(|runtime| runtime.id == runtime_id) {
+    if !config
+        .runtimes
+        .iter()
+        .any(|runtime| runtime.id == runtime_id)
+    {
         return;
     }
     for task in tasks {
@@ -373,7 +388,11 @@ fn upsert_model(config: &mut ModelPlatformConfig, model: ModelDefinition) {
 }
 
 fn upsert_runtime(config: &mut ModelPlatformConfig, runtime: RuntimeDefinition) {
-    if let Some(existing) = config.runtimes.iter_mut().find(|item| item.id == runtime.id) {
+    if let Some(existing) = config
+        .runtimes
+        .iter_mut()
+        .find(|item| item.id == runtime.id)
+    {
         *existing = runtime;
     } else {
         config.runtimes.push(runtime);
@@ -381,7 +400,11 @@ fn upsert_runtime(config: &mut ModelPlatformConfig, runtime: RuntimeDefinition) 
 }
 
 fn upsert_binding(config: &mut ModelPlatformConfig, binding: TaskModelBinding) {
-    if let Some(existing) = config.bindings.iter_mut().find(|item| item.id == binding.id) {
+    if let Some(existing) = config
+        .bindings
+        .iter_mut()
+        .find(|item| item.id == binding.id)
+    {
         *existing = binding;
     } else {
         config.bindings.push(binding);

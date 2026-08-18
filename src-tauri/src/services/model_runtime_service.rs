@@ -6,7 +6,9 @@ use crate::services::model_config_service::ModelConfigService;
 use crate::services::model_platform_migration_service::materialize_route_as_legacy_profile;
 use crate::services::model_platform_service::ModelPlatformService;
 use crate::services::model_process_manager::{ModelProcessManager, RuntimeLeaseGrant};
-use crate::services::model_router_service::{ModelRouterService, ResolvedModelRoute, RouteUsageMode};
+use crate::services::model_router_service::{
+    ModelRouterService, ResolvedModelRoute, RouteUsageMode,
+};
 use crate::services::platform_launch_registry;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -465,7 +467,8 @@ impl ModelRuntimeService {
                     error.correlation_id = correlation_id.to_string();
                     error
                 })?;
-            self.config_service.remove_ephemeral_profile(&current.profile_id)?;
+            self.config_service
+                .remove_ephemeral_profile(&current.profile_id)?;
             platform_launch_registry::remove(&current.profile_id);
             let mut guard = self
                 .platform_runtime_selection
@@ -509,14 +512,17 @@ impl ModelRuntimeService {
         route: &ResolvedModelRoute,
     ) -> Result<(), AppError> {
         let selection = platform_selection(profile_id, route);
-        let mut guard = self.platform_runtime_selection.lock().map_err(|error| AppError {
-            code: AppErrorCode::ModelStateAccessFailed,
-            message: "Model platform runtime seçimi kaydedilemedi.".to_string(),
-            recoverable: false,
-            suggested_action: Some("Uygulamayı yeniden başlatın.".to_string()),
-            technical_details: Some(error.to_string()),
-            correlation_id: uuid::Uuid::new_v4().to_string(),
-        })?;
+        let mut guard = self
+            .platform_runtime_selection
+            .lock()
+            .map_err(|error| AppError {
+                code: AppErrorCode::ModelStateAccessFailed,
+                message: "Model platform runtime seçimi kaydedilemedi.".to_string(),
+                recoverable: false,
+                suggested_action: Some("Uygulamayı yeniden başlatın.".to_string()),
+                technical_details: Some(error.to_string()),
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+            })?;
         *guard = Some(selection);
         Ok(())
     }
@@ -827,7 +833,10 @@ mod tests {
 
     #[test]
     fn step_name_matches_use_case() {
-        assert_eq!(ModelUseCase::StudentAnswerOcr.step_name(), "student_answer_ocr");
+        assert_eq!(
+            ModelUseCase::StudentAnswerOcr.step_name(),
+            "student_answer_ocr"
+        );
     }
 
     #[test]
@@ -837,8 +846,7 @@ mod tests {
             ModelTaskKind::SpeakingTranscriptCleanup
         );
         assert_eq!(
-            ModelUseCase::SpeakingEvaluation
-                .platform_task(Some("speaking_rubric_evaluation_12b")),
+            ModelUseCase::SpeakingEvaluation.platform_task(Some("speaking_rubric_evaluation_12b")),
             ModelTaskKind::SpeakingEvaluation
         );
     }
