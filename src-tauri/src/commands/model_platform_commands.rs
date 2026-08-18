@@ -111,7 +111,9 @@ pub fn get_model_promotion_decision(input: ModelIdInput) -> Result<PromotionDeci
 }
 
 #[tauri::command]
-pub fn resolve_model_route_preview(input: RoutePreviewInput) -> Result<ResolvedModelRoute, AppError> {
+pub fn resolve_model_route_preview(
+    input: RoutePreviewInput,
+) -> Result<ResolvedModelRoute, AppError> {
     let platform = ModelPlatformService::new();
     ModelRouterService::new(platform).resolve(input.task, input.usage_mode)
 }

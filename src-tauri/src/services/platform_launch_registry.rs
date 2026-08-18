@@ -13,12 +13,10 @@ fn registry() -> &'static RwLock<BTreeMap<String, PlatformLaunchDefinition>> {
     REGISTRY.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
 
-pub fn register(
-    profile_id: impl Into<String>,
-    model: ModelDefinition,
-    runtime: RuntimeDefinition,
-) {
-    let mut guard = registry().write().unwrap_or_else(|error| error.into_inner());
+pub fn register(profile_id: impl Into<String>, model: ModelDefinition, runtime: RuntimeDefinition) {
+    let mut guard = registry()
+        .write()
+        .unwrap_or_else(|error| error.into_inner());
     guard.insert(
         profile_id.into(),
         PlatformLaunchDefinition { model, runtime },

@@ -130,7 +130,10 @@ mod tests {
             .expect("corrupt snapshot must not block job history");
 
         assert!(result.is_empty());
-        assert!(!corrupt_path.exists(), "corrupt snapshot should be moved aside");
+        assert!(
+            !corrupt_path.exists(),
+            "corrupt snapshot should be moved aside"
+        );
         let quarantine_dir = root.join("logs").join("jobs").join("quarantine");
         let quarantined = std::fs::read_dir(&quarantine_dir)
             .expect("quarantine dir")

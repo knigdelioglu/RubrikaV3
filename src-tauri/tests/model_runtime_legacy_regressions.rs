@@ -38,14 +38,15 @@ fn strict_local_blocks_configured_public_external_student_runtime() {
         requires_mmproj: false,
         timeout_seconds: 1,
     };
-    let result = tokio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(runtime.acquire_ready_runtime_lease(
-            None,
-            "privacy_test",
-            request,
-            "privacy-correlation",
-        ));
+    let result =
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(runtime.acquire_ready_runtime_lease(
+                None,
+                "privacy_test",
+                request,
+                "privacy-correlation",
+            ));
     let error = match result {
         Ok(_) => panic!("public strict-local runtime must be blocked"),
         Err(error) => error,

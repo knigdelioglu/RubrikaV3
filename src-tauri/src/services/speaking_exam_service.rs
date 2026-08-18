@@ -3505,11 +3505,16 @@ fn speaking_runtime_identity_fingerprint(
 
 fn inferred_model_size(display_name: &str) -> String {
     display_name
-        .split(|character: char| character.is_whitespace() || matches!(character, '-' | '_' | '/' | '—'))
+        .split(|character: char| {
+            character.is_whitespace() || matches!(character, '-' | '_' | '/' | '—')
+        })
         .map(|token| token.trim_matches(|character: char| !character.is_ascii_alphanumeric()))
         .find(|token| {
             let upper = token.to_ascii_uppercase();
-            upper.ends_with('B') && upper[..upper.len().saturating_sub(1)].chars().any(|ch| ch.is_ascii_digit())
+            upper.ends_with('B')
+                && upper[..upper.len().saturating_sub(1)]
+                    .chars()
+                    .any(|ch| ch.is_ascii_digit())
         })
         .map(str::to_string)
         .unwrap_or_else(|| "unknown".to_string())
@@ -4428,15 +4433,31 @@ mod tests {
         assert_eq!(result.expected_ai_count, 3);
         assert!(result.unknown_criteria.is_empty());
         assert!(result.duplicate_criteria.is_empty());
-        let content = result.scores.iter().find(|s| s.criterion_id == "content_main_idea").unwrap();
+        let content = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "content_main_idea")
+            .unwrap();
         assert_eq!(content.ai_suggested_score, Some(10.0));
         assert_eq!(content.max_score, 20.0);
-        let turkish = result.scores.iter().find(|s| s.criterion_id == "turkish_language").unwrap();
+        let turkish = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "turkish_language")
+            .unwrap();
         assert_eq!(turkish.ai_suggested_score, Some(12.0));
-        let duration = result.scores.iter().find(|s| s.criterion_id == "duration_management").unwrap();
+        let duration = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "duration_management")
+            .unwrap();
         assert!(duration.ai_suggested_score.is_none());
         assert!(duration.automatic_score.is_some());
-        let body = result.scores.iter().find(|s| s.criterion_id == "body_language").unwrap();
+        let body = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "body_language")
+            .unwrap();
         assert!(body.ai_suggested_score.is_none());
     }
 
@@ -4472,12 +4493,24 @@ mod tests {
         assert!(result.scoring_applied);
         assert_eq!(result.matched_count, 3);
         assert!(result.unknown_criteria.is_empty());
-        let content = result.scores.iter().find(|s| s.criterion_id == "content_main_idea").unwrap();
+        let content = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "content_main_idea")
+            .unwrap();
         assert_eq!(content.ai_suggested_score, Some(18.0));
         assert_eq!(content.ai_summary, "Konu uyumu harika");
-        let speech = result.scores.iter().find(|s| s.criterion_id == "speech_structure").unwrap();
+        let speech = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "speech_structure")
+            .unwrap();
         assert_eq!(speech.ai_suggested_score, Some(12.0));
-        let turkish = result.scores.iter().find(|s| s.criterion_id == "turkish_language").unwrap();
+        let turkish = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "turkish_language")
+            .unwrap();
         assert_eq!(turkish.ai_suggested_score, Some(14.0));
     }
 
@@ -4490,8 +4523,14 @@ mod tests {
         let result = reconcile_speaking_scores(&test_exam(), &test_metrics(), ai_scores);
         assert!(result.scoring_applied);
         assert_eq!(result.matched_count, 1);
-        assert_eq!(result.unknown_criteria, vec!["unknown_criterion_xyz".to_string()]);
-        assert!(!result.scores.iter().any(|s| s.criterion_id == "unknown_criterion_xyz"));
+        assert_eq!(
+            result.unknown_criteria,
+            vec!["unknown_criterion_xyz".to_string()]
+        );
+        assert!(!result
+            .scores
+            .iter()
+            .any(|s| s.criterion_id == "unknown_criterion_xyz"));
     }
 
     #[test]
@@ -4502,8 +4541,15 @@ mod tests {
         ];
         let result = reconcile_speaking_scores(&test_exam(), &test_metrics(), ai_scores);
         assert!(result.scoring_applied);
-        assert_eq!(result.duplicate_criteria, vec!["content_main_idea".to_string()]);
-        let content = result.scores.iter().find(|s| s.criterion_id == "content_main_idea").unwrap();
+        assert_eq!(
+            result.duplicate_criteria,
+            vec!["content_main_idea".to_string()]
+        );
+        let content = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "content_main_idea")
+            .unwrap();
         assert_eq!(content.ai_suggested_score, Some(10.0));
     }
 
@@ -4514,16 +4560,27 @@ mod tests {
         assert!(result.scoring_applied);
         assert_eq!(result.matched_count, 1);
         assert_eq!(result.expected_ai_count, 3);
-        let speech = result.scores.iter().find(|s| s.criterion_id == "speech_structure").unwrap();
+        let speech = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "speech_structure")
+            .unwrap();
         assert!(speech.ai_suggested_score.is_none());
-        assert!(matches!(speech.ai_confidence, SpeakingConfidence::NotEvaluated));
+        assert!(matches!(
+            speech.ai_confidence,
+            SpeakingConfidence::NotEvaluated
+        ));
     }
 
     #[test]
     fn reconcile_score_clamped_to_max() {
         let ai_scores = vec![make_ai_score("content_main_idea", 999.0, "Over max")];
         let result = reconcile_speaking_scores(&test_exam(), &test_metrics(), ai_scores);
-        let content = result.scores.iter().find(|s| s.criterion_id == "content_main_idea").unwrap();
+        let content = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "content_main_idea")
+            .unwrap();
         assert_eq!(content.ai_suggested_score, Some(20.0));
     }
 
@@ -4534,12 +4591,20 @@ mod tests {
         assert_eq!(result.matched_count, 0);
         assert_eq!(result.expected_ai_count, 3);
         for score in &result.scores {
-            if score.criterion_id != "duration_management" && score.criterion_id != "body_language" {
+            if score.criterion_id != "duration_management" && score.criterion_id != "body_language"
+            {
                 assert!(score.ai_suggested_score.is_none());
-                assert!(matches!(score.ai_confidence, SpeakingConfidence::NotEvaluated));
+                assert!(matches!(
+                    score.ai_confidence,
+                    SpeakingConfidence::NotEvaluated
+                ));
             }
         }
-        let duration = result.scores.iter().find(|s| s.criterion_id == "duration_management").unwrap();
+        let duration = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "duration_management")
+            .unwrap();
         assert!(duration.automatic_score.is_some());
     }
 
@@ -4554,8 +4619,15 @@ mod tests {
             evidence_quote: None,
         }];
         let result = reconcile_speaking_scores(&test_exam(), &test_metrics(), ai_scores);
-        let content = result.scores.iter().find(|s| s.criterion_id == "content_main_idea").unwrap();
-        assert_eq!(content.criterion_label, "Konuya uygunluk, içerik ve ana düşünce");
+        let content = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "content_main_idea")
+            .unwrap();
+        assert_eq!(
+            content.criterion_label,
+            "Konuya uygunluk, içerik ve ana düşünce"
+        );
         assert_eq!(content.max_score, 20.0);
     }
 
@@ -4649,13 +4721,15 @@ mod tests {
         let cleaned = fixture
             .segments
             .iter()
-            .map(|segment| crate::domain::model::SpeakingTranscriptCleanupOutputSegment {
-                segment_id: segment.segment_id.clone(),
-                cleaned_text: segment.cleaned_text.clone(),
-                changes: vec![],
-                semantic_change_detected: false,
-                needs_review: false,
-            })
+            .map(
+                |segment| crate::domain::model::SpeakingTranscriptCleanupOutputSegment {
+                    segment_id: segment.segment_id.clone(),
+                    cleaned_text: segment.cleaned_text.clone(),
+                    changes: vec![],
+                    semantic_change_detected: false,
+                    needs_review: false,
+                },
+            )
             .collect::<Vec<_>>();
         let accepted = validate_speaking_cleanup_segments(&raw, &cleaned, Some("stop"))
             .expect("Marif -> Maarif cleanup must pass deterministic gates");
@@ -4669,26 +4743,50 @@ mod tests {
     fn all_strong_model_output_is_calibrated_to_teacher_gold_by_frozen_ceilings() {
         let fixture = calibration_fixture();
         let exam = new_exam(
-            "Kalibrasyon".to_string(), vec![], SpeakingExamType::Prepared,
-            "Konuşma sınavlarının yararlarını açıklayın.".to_string(), 180, 120, 240,
+            "Kalibrasyon".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Konuşma sınavlarının yararlarını açıklayın.".to_string(),
+            180,
+            120,
+            240,
         );
         let segments = calibration_segments(&fixture);
         let metrics = calculate_metrics(&fixture.cleaned_transcript, 42_000, &exam);
         let result = reconcile_speaking_evaluation(
-            &exam, &metrics, &calibration_evaluation_json(&fixture, true), &segments,
-        ).expect("all-strong output should be reconciled, not trusted");
+            &exam,
+            &metrics,
+            &calibration_evaluation_json(&fixture, true),
+            &segments,
+        )
+        .expect("all-strong output should be reconciled, not trusted");
         assert!(result.scoring_applied);
         assert!(!result.warnings.is_empty());
-        let ai_scores = result.scores.iter().filter_map(|score| {
-            score.ai_suggested_score.map(|value| (score.criterion_id.as_str(), value as i32))
-        }).collect::<std::collections::HashMap<_, _>>();
+        let ai_scores = result
+            .scores
+            .iter()
+            .filter_map(|score| {
+                score
+                    .ai_suggested_score
+                    .map(|value| (score.criterion_id.as_str(), value as i32))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(ai_scores["content_main_idea"], 12);
         assert_eq!(ai_scores["speech_structure"], 11);
         assert_eq!(ai_scores["turkish_language"], 11);
         assert_eq!(ai_scores.values().sum::<i32>(), fixture.gold_ai_total);
-        for forbidden in ["examples_reasons", "conclusion", "vocabulary_range", "repetition_control"] {
-            let score = result.scores.iter().flat_map(|criterion| criterion.subindicator_scores.iter())
-                .find(|score| score.subindicator_id == forbidden).expect("required calibration subindicator");
+        for forbidden in [
+            "examples_reasons",
+            "conclusion",
+            "vocabulary_range",
+            "repetition_control",
+        ] {
+            let score = result
+                .scores
+                .iter()
+                .flat_map(|criterion| criterion.subindicator_scores.iter())
+                .find(|score| score.subindicator_id == forbidden)
+                .expect("required calibration subindicator");
             assert_ne!(score.applied_level_id, "strong");
             assert!(score.ceiling_reason_code.is_some());
         }
@@ -4698,18 +4796,31 @@ mod tests {
     fn teacher_gold_calibration_is_within_criterion_and_total_tolerance() {
         let fixture = calibration_fixture();
         let exam = new_exam(
-            "Kalibrasyon".to_string(), vec![], SpeakingExamType::Prepared,
-            "Konuşma sınavlarının yararlarını açıklayın.".to_string(), 180, 120, 240,
+            "Kalibrasyon".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Konuşma sınavlarının yararlarını açıklayın.".to_string(),
+            180,
+            120,
+            240,
         );
         let segments = calibration_segments(&fixture);
         let metrics = calculate_metrics(&fixture.cleaned_transcript, 42_000, &exam);
         let result = reconcile_speaking_evaluation(
-            &exam, &metrics, &calibration_evaluation_json(&fixture, false), &segments,
-        ).expect("teacher gold fixture must reconcile");
+            &exam,
+            &metrics,
+            &calibration_evaluation_json(&fixture, false),
+            &segments,
+        )
+        .expect("teacher gold fixture must reconcile");
         let mut total = 0i32;
         for (criterion_id, gold) in &fixture.gold_criterion_scores {
-            let actual = result.scores.iter().find(|score| &score.criterion_id == criterion_id)
-                .and_then(|score| score.ai_suggested_score).expect("gold criterion score") as i32;
+            let actual = result
+                .scores
+                .iter()
+                .find(|score| &score.criterion_id == criterion_id)
+                .and_then(|score| score.ai_suggested_score)
+                .expect("gold criterion score") as i32;
             assert!((actual - gold).abs() <= 1);
             total += actual;
         }
@@ -4718,29 +4829,59 @@ mod tests {
 
     #[test]
     fn short_sample_marks_fluency_measurement_low_confidence() {
-        let exam = new_exam("Kısa kayıt".to_string(), vec![], SpeakingExamType::Prepared,
-            "Görev".to_string(), 180, 120, 240);
+        let exam = new_exam(
+            "Kısa kayıt".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Görev".to_string(),
+            180,
+            120,
+            240,
+        );
         let metrics = calculate_metrics("Kısa bir konuşma.", 42_000, &exam);
         assert!(!metrics.sample_duration_sufficient);
         assert_eq!(metrics.expected_min_duration_ms, 120_000);
-        assert!(matches!(metrics.measurement_confidence, SpeakingConfidence::Low));
-        assert!(metrics.warnings.iter().any(|warning| warning.contains("sınırlı güvenilirlikte")));
+        assert!(matches!(
+            metrics.measurement_confidence,
+            SpeakingConfidence::Low
+        ));
+        assert!(metrics
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("sınırlı güvenilirlikte")));
         assert_eq!(fluency_automatic_score(&metrics), Some(4.0));
     }
 
     #[test]
     fn calibration_harness_reports_five_zero_variance_backend_runs() {
         let fixture = calibration_fixture();
-        let exam = new_exam("Kalibrasyon".to_string(), vec![], SpeakingExamType::Prepared,
-            "Konuşma sınavlarının yararlarını açıklayın.".to_string(), 180, 120, 240);
+        let exam = new_exam(
+            "Kalibrasyon".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Konuşma sınavlarının yararlarını açıklayın.".to_string(),
+            180,
+            120,
+            240,
+        );
         let segments = calibration_segments(&fixture);
         let metrics = calculate_metrics(&fixture.cleaned_transcript, 42_000, &exam);
         let mut totals = Vec::new();
         for _ in 0..5 {
             let result = reconcile_speaking_evaluation(
-                &exam, &metrics, &calibration_evaluation_json(&fixture, true), &segments,
-            ).expect("calibration bypass run");
-            totals.push(result.scores.iter().filter_map(|score| score.ai_suggested_score).sum::<f32>() as i32);
+                &exam,
+                &metrics,
+                &calibration_evaluation_json(&fixture, true),
+                &segments,
+            )
+            .expect("calibration bypass run");
+            totals.push(
+                result
+                    .scores
+                    .iter()
+                    .filter_map(|score| score.ai_suggested_score)
+                    .sum::<f32>() as i32,
+            );
         }
         assert_eq!(totals, vec![34, 34, 34, 34, 34]);
     }
@@ -4748,38 +4889,87 @@ mod tests {
     #[test]
     fn evaluation_hash_is_repeatable_and_invalidates_on_model_runtime_or_policy_change() {
         let fixture = calibration_fixture();
-        let exam = new_exam("Hash".to_string(), vec![], SpeakingExamType::Prepared,
-            "Görev".to_string(), 180, 120, 240);
+        let exam = new_exam(
+            "Hash".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Görev".to_string(),
+            180,
+            120,
+            240,
+        );
         let mut attempt = SpeakingAttempt {
-            id: "attempt".to_string(), assessment_activity_id: None, class_application_id: None,
-            school_class_id: None, exam_id: exam.id.clone(), student_id: "anonymous".to_string(),
-            attempt_number: 1, state: SpeakingAttemptState::TeacherReview, started_at: String::new(),
-            ended_at: None, audio_path: None, engine_session_id: None, source_history_id: None,
-            raw_transcript: fixture.raw_transcript, readable_transcript: fixture.cleaned_transcript.clone(),
-            cleanup_candidate: Some(fixture.cleaned_transcript.clone()), transcript_for_scoring: Some(fixture.cleaned_transcript),
-            approved_transcript: None, cleanup_status: SpeakingTranscriptCleanupStatus::Accepted,
-            cleanup_changes: vec![], cleanup_diagnostics: None, cleanup_model_provenance: None,
-            evaluation_model_provenance: None, evaluation_input_hash: None, frozen_min_duration_seconds: None,
-            frozen_max_duration_seconds: None, duration_scoring_policy_version: None,
+            id: "attempt".to_string(),
+            assessment_activity_id: None,
+            class_application_id: None,
+            school_class_id: None,
+            exam_id: exam.id.clone(),
+            student_id: "anonymous".to_string(),
+            attempt_number: 1,
+            state: SpeakingAttemptState::TeacherReview,
+            started_at: String::new(),
+            ended_at: None,
+            audio_path: None,
+            engine_session_id: None,
+            source_history_id: None,
+            raw_transcript: fixture.raw_transcript,
+            readable_transcript: fixture.cleaned_transcript.clone(),
+            cleanup_candidate: Some(fixture.cleaned_transcript.clone()),
+            transcript_for_scoring: Some(fixture.cleaned_transcript),
+            approved_transcript: None,
+            cleanup_status: SpeakingTranscriptCleanupStatus::Accepted,
+            cleanup_changes: vec![],
+            cleanup_diagnostics: None,
+            cleanup_model_provenance: None,
+            evaluation_model_provenance: None,
+            evaluation_input_hash: None,
+            frozen_min_duration_seconds: None,
+            frozen_max_duration_seconds: None,
+            duration_scoring_policy_version: None,
             scoring_policy_version: SPEAKING_SCORING_POLICY_VERSION.to_string(),
             evaluation_prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
-            transcript_cleanup: Default::default(), transcript_segments: calibration_segments(&calibration_fixture()),
-            metrics: SpeakingMetrics::default(), criterion_scores: vec![], evaluation_job_id: None,
-            evaluation_error: None, teacher_note: None, final_score: None, teacher_approved_at: None,
-            model_id: String::new(), prompt_version: String::new(), rubric_version: exam.rubric_version.clone(),
+            transcript_cleanup: Default::default(),
+            transcript_segments: calibration_segments(&calibration_fixture()),
+            metrics: SpeakingMetrics::default(),
+            criterion_scores: vec![],
+            evaluation_job_id: None,
+            evaluation_error: None,
+            teacher_note: None,
+            final_score: None,
+            teacher_approved_at: None,
+            model_id: String::new(),
+            prompt_version: String::new(),
+            rubric_version: exam.rubric_version.clone(),
             speaking_config_snapshot: None,
         };
         let policy = default_speaking_scoring_policy();
-        let first = speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a");
-        let repeated = speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a");
+        let first =
+            speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a");
+        let repeated =
+            speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a");
         assert_eq!(first, repeated);
-        assert_ne!(first, speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-b"), "runtime-a"));
-        assert_ne!(first, speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-b"));
-        attempt.cleanup_changes.push(crate::domain::speaking::SpeakingCleanupChange {
-            segment_id: "segment-4".to_string(), original: "Marif".to_string(), replacement: "Maarif".to_string(),
-            change_type: "asr_correction".to_string(), meaning_changed: false, confidence: Some(1.0),
-        });
-        assert_ne!(first, speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a"));
+        assert_ne!(
+            first,
+            speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-b"), "runtime-a")
+        );
+        assert_ne!(
+            first,
+            speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-b")
+        );
+        attempt
+            .cleanup_changes
+            .push(crate::domain::speaking::SpeakingCleanupChange {
+                segment_id: "segment-4".to_string(),
+                original: "Marif".to_string(),
+                replacement: "Maarif".to_string(),
+                change_type: "asr_correction".to_string(),
+                meaning_changed: false,
+                confidence: Some(1.0),
+            });
+        assert_ne!(
+            first,
+            speaking_evaluation_input_hash(&exam, &attempt, &policy, Some("model-a"), "runtime-a")
+        );
     }
 
     #[test]
@@ -4790,21 +4980,51 @@ mod tests {
         let baseline_runtime = speaking_runtime_identity_fingerprint(&cleanup, &scoring);
         let cleanup_changed = sample_runtime_identity("cleanup-b", "runtime-a");
         let scoring_runtime_changed = sample_runtime_identity("scoring-a", "runtime-b");
-        assert_ne!(baseline_model, speaking_model_identity_fingerprint(&cleanup_changed, &scoring));
-        assert_ne!(baseline_runtime, speaking_runtime_identity_fingerprint(&cleanup, &scoring_runtime_changed));
+        assert_ne!(
+            baseline_model,
+            speaking_model_identity_fingerprint(&cleanup_changed, &scoring)
+        );
+        assert_ne!(
+            baseline_runtime,
+            speaking_runtime_identity_fingerprint(&cleanup, &scoring_runtime_changed)
+        );
     }
 
     #[test]
     fn canonical_duration_score_calculates_exact_percentage_tiers() {
         assert_eq!(calculate_duration_score_from_seconds(0, 120, 180), None);
-        assert_eq!(calculate_duration_score_from_seconds(150, 120, 180), Some(5.0));
-        assert_eq!(calculate_duration_score_from_seconds(120, 120, 180), Some(5.0));
-        assert_eq!(calculate_duration_score_from_seconds(180, 120, 180), Some(5.0));
-        assert_eq!(calculate_duration_score_from_seconds(114, 120, 180), Some(4.0));
-        assert_eq!(calculate_duration_score_from_seconds(100, 120, 180), Some(3.0));
-        assert_eq!(calculate_duration_score_from_seconds(72, 120, 180), Some(2.0));
-        assert_eq!(calculate_duration_score_from_seconds(50, 120, 180), Some(1.0));
-        assert_eq!(calculate_duration_score_from_seconds(195, 120, 180), Some(4.0));
+        assert_eq!(
+            calculate_duration_score_from_seconds(150, 120, 180),
+            Some(5.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(120, 120, 180),
+            Some(5.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(180, 120, 180),
+            Some(5.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(114, 120, 180),
+            Some(4.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(100, 120, 180),
+            Some(3.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(72, 120, 180),
+            Some(2.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(50, 120, 180),
+            Some(1.0)
+        );
+        assert_eq!(
+            calculate_duration_score_from_seconds(195, 120, 180),
+            Some(4.0)
+        );
     }
 
     #[test]
@@ -4813,11 +5033,26 @@ mod tests {
         assert_eq!(metrics.duration_ms, 0);
         assert_eq!(fluency_automatic_score(&metrics), None);
         assert_eq!(calculate_duration_score_from_seconds(0, 120, 180), None);
-        let exam = new_exam("Deneme".to_string(), vec![], SpeakingExamType::Prepared,
-            "Görev".to_string(), 180, 120, 240);
+        let exam = new_exam(
+            "Deneme".to_string(),
+            vec![],
+            SpeakingExamType::Prepared,
+            "Görev".to_string(),
+            180,
+            120,
+            240,
+        );
         let result = reconcile_speaking_scores(&exam, &metrics, vec![]);
-        let fluency = result.scores.iter().find(|s| s.criterion_id == "fluency_automatic").unwrap();
-        let duration = result.scores.iter().find(|s| s.criterion_id == "duration_management").unwrap();
+        let fluency = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "fluency_automatic")
+            .unwrap();
+        let duration = result
+            .scores
+            .iter()
+            .find(|s| s.criterion_id == "duration_management")
+            .unwrap();
         assert_eq!(fluency.automatic_score, None);
         assert_eq!(duration.automatic_score, None);
     }
@@ -4841,15 +5076,33 @@ mod tests {
         use crate::domain::speaking::SpeakingPerformanceLevel;
         assert_eq!(SpeakingPerformanceLevel::VeryGood.score_for(5.0), Some(5.0));
         assert_eq!(SpeakingPerformanceLevel::Good.score_for(5.0), Some(4.0));
-        assert_eq!(SpeakingPerformanceLevel::Developing.score_for(5.0), Some(2.0));
-        assert_eq!(SpeakingPerformanceLevel::PerformanceNotShown.score_for(5.0), Some(0.0));
+        assert_eq!(
+            SpeakingPerformanceLevel::Developing.score_for(5.0),
+            Some(2.0)
+        );
+        assert_eq!(
+            SpeakingPerformanceLevel::PerformanceNotShown.score_for(5.0),
+            Some(0.0)
+        );
         assert_eq!(SpeakingPerformanceLevel::NotObserved.score_for(5.0), None);
-        assert_eq!(SpeakingPerformanceLevel::VeryGood.score_for(10.0), Some(10.0));
+        assert_eq!(
+            SpeakingPerformanceLevel::VeryGood.score_for(10.0),
+            Some(10.0)
+        );
         assert_eq!(SpeakingPerformanceLevel::Good.score_for(10.0), Some(7.0));
-        assert_eq!(SpeakingPerformanceLevel::Developing.score_for(10.0), Some(4.0));
-        assert_eq!(SpeakingPerformanceLevel::VeryGood.score_for(15.0), Some(15.0));
+        assert_eq!(
+            SpeakingPerformanceLevel::Developing.score_for(10.0),
+            Some(4.0)
+        );
+        assert_eq!(
+            SpeakingPerformanceLevel::VeryGood.score_for(15.0),
+            Some(15.0)
+        );
         assert_eq!(SpeakingPerformanceLevel::Good.score_for(15.0), Some(11.0));
-        assert_eq!(SpeakingPerformanceLevel::Developing.score_for(15.0), Some(6.0));
+        assert_eq!(
+            SpeakingPerformanceLevel::Developing.score_for(15.0),
+            Some(6.0)
+        );
     }
 
     #[tokio::test]
@@ -4860,52 +5113,109 @@ mod tests {
         use crate::services::model_process_manager::ModelProcessManager;
         use crate::services::model_runtime_service::ModelRuntimeService;
 
-        let root_path_buf = std::env::temp_dir().join(format!("rubrika-test-p8-{}", uuid::Uuid::new_v4()));
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-p8-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root_path_buf).unwrap();
         let store = ProjectStore::new();
-        let mut project = store.create_project("proj_p8".into(), root_path_buf.to_string_lossy().to_string()).unwrap();
+        let mut project = store
+            .create_project(
+                "proj_p8".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
         let mut exam = test_exam();
         exam.id = "exam_p8".to_string();
         exam.title = "Speaking Exam P8".to_string();
         exam.rubric_version = "v1".to_string();
         let attempt = SpeakingAttempt {
-            id: "att_p8".to_string(), assessment_activity_id: None, class_application_id: None,
-            school_class_id: None, exam_id: "exam_p8".to_string(), student_id: "s1".to_string(),
-            attempt_number: 1, state: SpeakingAttemptState::TeacherReview, started_at: Utc::now().to_rfc3339(),
-            ended_at: None, audio_path: Some("audio.wav".to_string()), engine_session_id: None,
-            source_history_id: None, raw_transcript: "Original teacher raw transcript".to_string(),
-            readable_transcript: "Original teacher readable transcript".to_string(), cleanup_candidate: None,
-            transcript_for_scoring: None, approved_transcript: None, cleanup_status: SpeakingTranscriptCleanupStatus::NotStarted,
-            cleanup_changes: vec![], cleanup_diagnostics: None, cleanup_model_provenance: None,
-            evaluation_model_provenance: None, evaluation_input_hash: None, frozen_min_duration_seconds: None,
-            frozen_max_duration_seconds: None, duration_scoring_policy_version: None,
+            id: "att_p8".to_string(),
+            assessment_activity_id: None,
+            class_application_id: None,
+            school_class_id: None,
+            exam_id: "exam_p8".to_string(),
+            student_id: "s1".to_string(),
+            attempt_number: 1,
+            state: SpeakingAttemptState::TeacherReview,
+            started_at: Utc::now().to_rfc3339(),
+            ended_at: None,
+            audio_path: Some("audio.wav".to_string()),
+            engine_session_id: None,
+            source_history_id: None,
+            raw_transcript: "Original teacher raw transcript".to_string(),
+            readable_transcript: "Original teacher readable transcript".to_string(),
+            cleanup_candidate: None,
+            transcript_for_scoring: None,
+            approved_transcript: None,
+            cleanup_status: SpeakingTranscriptCleanupStatus::NotStarted,
+            cleanup_changes: vec![],
+            cleanup_diagnostics: None,
+            cleanup_model_provenance: None,
+            evaluation_model_provenance: None,
+            evaluation_input_hash: None,
+            frozen_min_duration_seconds: None,
+            frozen_max_duration_seconds: None,
+            duration_scoring_policy_version: None,
             scoring_policy_version: SPEAKING_SCORING_POLICY_VERSION.to_string(),
-            evaluation_prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(), transcript_cleanup: Default::default(),
-            transcript_segments: vec![], metrics: SpeakingMetrics::default(), criterion_scores: vec![],
-            evaluation_job_id: None, evaluation_error: None, teacher_note: Some("Teacher note preserved".to_string()),
-            final_score: Some(85.0), teacher_approved_at: None, model_id: "Legacy local model".to_string(),
-            prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(), rubric_version: "v1".to_string(),
+            evaluation_prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
+            transcript_cleanup: Default::default(),
+            transcript_segments: vec![],
+            metrics: SpeakingMetrics::default(),
+            criterion_scores: vec![],
+            evaluation_job_id: None,
+            evaluation_error: None,
+            teacher_note: Some("Teacher note preserved".to_string()),
+            final_score: Some(85.0),
+            teacher_approved_at: None,
+            model_id: "Legacy local model".to_string(),
+            prompt_version: SPEAKING_RUBRIC_PROMPT_VERSION.to_string(),
+            rubric_version: "v1".to_string(),
             speaking_config_snapshot: None,
         };
         exam.attempts.push(attempt);
         project.speaking_exams.push(exam);
         store.save_project(&project).unwrap();
         let jm = std::sync::Arc::new(JobManager::new());
-        let app = tauri::test::mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets())).unwrap().handle().clone();
-        let reg = jm.register_or_get_active_job(&app, JobRegistrationInput {
-            project_id: project.id.clone(), project_root_path: Some(project.root_path.clone()), kind: JobKind::SpeakingEvaluation,
-            display_label: Some("Speaking Evaluation".into()), total: 1, message: "Evaluating".into(),
-            correlation_id: Some("corr-p8".into()), idempotency_key: Some("key-p8".into()),
-            duplicate_policy: DuplicatePolicy::ReturnExisting, cancellable: true, retry_of_job_id: None,
-        }).unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap()
+            .handle()
+            .clone();
+        let reg = jm
+            .register_or_get_active_job(
+                &app,
+                JobRegistrationInput {
+                    project_id: project.id.clone(),
+                    project_root_path: Some(project.root_path.clone()),
+                    kind: JobKind::SpeakingEvaluation,
+                    display_label: Some("Speaking Evaluation".into()),
+                    total: 1,
+                    message: "Evaluating".into(),
+                    correlation_id: Some("corr-p8".into()),
+                    idempotency_key: Some("key-p8".into()),
+                    duplicate_policy: DuplicatePolicy::ReturnExisting,
+                    cancellable: true,
+                    retry_of_job_id: None,
+                },
+            )
+            .unwrap();
         jm.cancel_job(&app, &reg.snapshot.id).unwrap();
-        let model_gateway_impl = std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_gateway_impl =
+            std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
         let model_config = ModelConfigService::new();
-        let model_process_manager = ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
+        let model_process_manager =
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
         let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
         let speaking_engine = std::sync::Arc::new(speakoflow_engine::SpeakoflowEngine::new());
-        let service = SpeakingExamService::new(store.clone(), model_gateway_impl, model_runtime_service, jm.clone(), speaking_engine);
-        let res = service.evaluate_attempt_inner(&app, &project.id, "exam_p8", "att_p8", &reg.snapshot.id).await;
+        let service = SpeakingExamService::new(
+            store.clone(),
+            model_gateway_impl,
+            model_runtime_service,
+            jm.clone(),
+            speaking_engine,
+        );
+        let res = service
+            .evaluate_attempt_inner(&app, &project.id, "exam_p8", "att_p8", &reg.snapshot.id)
+            .await;
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, AppErrorCode::JobCancelled);
         let snap = jm.get_job_snapshot(&reg.snapshot.id).unwrap();
@@ -4914,7 +5224,10 @@ mod tests {
         let att = &updated.speaking_exams[0].attempts[0];
         assert_eq!(att.teacher_note.as_deref(), Some("Teacher note preserved"));
         assert_eq!(att.final_score, Some(85.0));
-        assert_eq!(att.readable_transcript, "Original teacher readable transcript");
+        assert_eq!(
+            att.readable_transcript,
+            "Original teacher readable transcript"
+        );
     }
 
     #[test]
@@ -4932,25 +5245,43 @@ mod tests {
         use crate::services::model_config_service::ModelConfigService;
         use crate::services::model_process_manager::ModelProcessManager;
         use crate::services::model_runtime_service::ModelRuntimeService;
-        let root_path_buf = std::env::temp_dir().join(format!("rubrika-test-commit-fail-{}", uuid::Uuid::new_v4()));
+        let root_path_buf =
+            std::env::temp_dir().join(format!("rubrika-test-commit-fail-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root_path_buf).unwrap();
         let store = ProjectStore::new();
-        let project = store.create_project("proj_commit_fail".into(), root_path_buf.to_string_lossy().to_string()).unwrap();
+        let project = store
+            .create_project(
+                "proj_commit_fail".into(),
+                root_path_buf.to_string_lossy().to_string(),
+            )
+            .unwrap();
         let jm = std::sync::Arc::new(JobManager::new());
-        let model_gateway_impl = std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
+        let model_gateway_impl =
+            std::sync::Arc::new(LlamaServerGateway::new("http://localhost:8080".to_string()));
         let model_config = ModelConfigService::new();
-        let model_process_manager = ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
+        let model_process_manager =
+            ModelProcessManager::new(model_config.clone(), model_gateway_impl.clone());
         let model_runtime_service = ModelRuntimeService::new(model_config, model_process_manager);
         let speaking_engine = std::sync::Arc::new(speakoflow_engine::SpeakoflowEngine::new());
-        let audit_service = std::sync::Arc::new(crate::services::audit_service::AuditService::new());
-        let service = SpeakingExamService::new(store.clone(), model_gateway_impl, model_runtime_service, jm.clone(), speaking_engine)
-            .with_audit_service(audit_service.clone());
+        let audit_service =
+            std::sync::Arc::new(crate::services::audit_service::AuditService::new());
+        let service = SpeakingExamService::new(
+            store.clone(),
+            model_gateway_impl,
+            model_runtime_service,
+            jm.clone(),
+            speaking_engine,
+        )
+        .with_audit_service(audit_service.clone());
         let current = store.get_project_snapshot(project.id.clone()).unwrap();
         let mut stale = current.clone();
         stale.storage_revision = current.storage_revision + 10_000;
         service.commit_recovery_snapshot(&stale, "speaking_engine_failure", "attempt-commit-fail");
-        let audit_path = crate::services::audit_service::AuditService::audit_path(std::path::Path::new(&project.root_path));
-        let content = std::fs::read_to_string(&audit_path).expect("audit file must exist after a failed recovery commit");
+        let audit_path = crate::services::audit_service::AuditService::audit_path(
+            std::path::Path::new(&project.root_path),
+        );
+        let content = std::fs::read_to_string(&audit_path)
+            .expect("audit file must exist after a failed recovery commit");
         assert!(content.contains("speaking_engine_failure"));
         let persisted = store.get_project_snapshot(project.id.clone()).unwrap();
         assert_eq!(persisted.storage_revision, current.storage_revision);

@@ -4,9 +4,7 @@ use crate::domain::model_platform::{
     fingerprint_runtime_definition, CapabilityManifest, CapabilityProbeResult, CapabilitySupport,
     ModelCapabilityKind, RuntimeEngine,
 };
-use crate::services::llama_cpp_runtime_adapter::{
-    InferenceRuntimeAdapter, LlamaCppRuntimeAdapter,
-};
+use crate::services::llama_cpp_runtime_adapter::{InferenceRuntimeAdapter, LlamaCppRuntimeAdapter};
 use crate::services::model_platform_service::ModelPlatformService;
 use chrono::Utc;
 use reqwest::redirect::Policy;
@@ -31,12 +29,14 @@ impl ModelCapabilityProbeService {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .build()
-            .map_err(|error| probe_error(
-                AppErrorCode::ModelHealthFailed,
-                "Capability probe HTTP istemcisi oluşturulamadı.",
-                Some(error.to_string()),
-                None,
-            ))?;
+            .map_err(|error| {
+                probe_error(
+                    AppErrorCode::ModelHealthFailed,
+                    "Capability probe HTTP istemcisi oluşturulamadı.",
+                    Some(error.to_string()),
+                    None,
+                )
+            })?;
         Ok(Self { platform, client })
     }
 
@@ -74,23 +74,27 @@ impl ModelCapabilityProbeService {
             .iter()
             .find(|item| item.id == model_definition_id)
             .cloned()
-            .ok_or_else(|| probe_error(
-                AppErrorCode::ModelProfileNotFound,
-                "Capability probe için model bulunamadı.",
-                Some(format!("model_definition_id={model_definition_id}")),
-                Some("Modeli registry'ye yeniden ekleyin.".to_string()),
-            ))?;
+            .ok_or_else(|| {
+                probe_error(
+                    AppErrorCode::ModelProfileNotFound,
+                    "Capability probe için model bulunamadı.",
+                    Some(format!("model_definition_id={model_definition_id}")),
+                    Some("Modeli registry'ye yeniden ekleyin.".to_string()),
+                )
+            })?;
         let runtime = snapshot
             .runtimes
             .iter()
             .find(|item| item.id == runtime_definition_id)
             .cloned()
-            .ok_or_else(|| probe_error(
-                AppErrorCode::ModelProfileNotFound,
-                "Capability probe için runtime bulunamadı.",
-                Some(format!("runtime_definition_id={runtime_definition_id}")),
-                Some("Runtime ayarını yeniden oluşturun.".to_string()),
-            ))?;
+            .ok_or_else(|| {
+                probe_error(
+                    AppErrorCode::ModelProfileNotFound,
+                    "Capability probe için runtime bulunamadı.",
+                    Some(format!("runtime_definition_id={runtime_definition_id}")),
+                    Some("Runtime ayarını yeniden oluşturun.".to_string()),
+                )
+            })?;
 
         if runtime.engine != RuntimeEngine::LlamaCpp {
             return Err(probe_error(
@@ -124,12 +128,14 @@ impl ModelCapabilityProbeService {
                 .kill_on_drop(true);
             #[cfg(unix)]
             command.process_group(0);
-            let child = command.spawn().map_err(|error| probe_error(
-                AppErrorCode::ModelServerStartFailed,
-                "Capability probe için llama-server başlatılamadı.",
-                Some(error.to_string()),
-                Some("Runtime binary/model yollarını kontrol edin.".to_string()),
-            ))?;
+            let child = command.spawn().map_err(|error| {
+                probe_error(
+                    AppErrorCode::ModelServerStartFailed,
+                    "Capability probe için llama-server başlatılamadı.",
+                    Some(error.to_string()),
+                    Some("Runtime binary/model yollarını kontrol edin.".to_string()),
+                )
+            })?;
             owned_child = Some(child);
             if let Err(error) = self.wait_for_health(&launch.base_url).await {
                 stop_owned_child(&mut owned_child).await;
@@ -160,7 +166,12 @@ impl ModelCapabilityProbeService {
             if model.capabilities.multimodal_projector_required {
                 results.push(CapabilityProbeResult {
                     capability: ModelCapabilityKind::MultimodalProjector,
-                    support: if model.mmproj_path.as_deref().map(|path| !path.trim().is_empty()).unwrap_or(false) {
+                    support: if model
+                        .mmproj_path
+                        .as_deref()
+                        .map(|path| !path.trim().is_empty())
+                        .unwrap_or(false)
+                    {
                         CapabilitySupport::Pass
                     } else {
                         CapabilitySupport::Fail
@@ -330,7 +341,8 @@ impl ModelCapabilityProbeService {
                     support: match parsed {
                         Some(value)
                             if value.get("ok").and_then(Value::as_bool) == Some(true)
-                                && value.get("label").and_then(Value::as_str) == Some("rubrika") =>
+                                && value.get("label").and_then(Value::as_str)
+                                    == Some("rubrika") =>
                         {
                             CapabilitySupport::Pass
                         }
@@ -393,27 +405,36 @@ impl ModelCapabilityProbeService {
 
     async fn chat_completion(&self, base_url: &str, body: Value) -> Result<String, AppError> {
         let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-        let response = timeout(Duration::from_secs(45), self.client.post(url).json(&body).send())
-            .await
-            .map_err(|_| probe_error(
+        let response = timeout(
+            Duration::from_secs(45),
+            self.client.post(url).json(&body).send(),
+        )
+        .await
+        .map_err(|_| {
+            probe_error(
                 AppErrorCode::ModelTimeout,
                 "Capability probe model yanıt süresini aştı.",
                 None,
                 Some("Model/runtime ayarlarını kontrol edip yeniden deneyin.".to_string()),
-            ))?
-            .map_err(|error| probe_error(
+            )
+        })?
+        .map_err(|error| {
+            probe_error(
                 AppErrorCode::ModelHealthFailed,
                 "Capability probe model isteği başarısız oldu.",
                 Some(error.to_string()),
                 Some("Model sunucusu durumunu kontrol edin.".to_string()),
-            ))?;
+            )
+        })?;
         let status = response.status();
-        let payload: Value = response.json().await.map_err(|error| probe_error(
-            AppErrorCode::ModelResponseInvalidJson,
-            "Capability probe yanıtı JSON değil.",
-            Some(error.to_string()),
-            None,
-        ))?;
+        let payload: Value = response.json().await.map_err(|error| {
+            probe_error(
+                AppErrorCode::ModelResponseInvalidJson,
+                "Capability probe yanıtı JSON değil.",
+                Some(error.to_string()),
+                None,
+            )
+        })?;
         if !status.is_success() {
             return Err(probe_error(
                 AppErrorCode::ModelHealthFailed,
@@ -426,12 +447,14 @@ impl ModelCapabilityProbeService {
             .pointer("/choices/0/message/content")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| probe_error(
-                AppErrorCode::ModelResponseEmpty,
-                "Capability probe model yanıtı boş.",
-                None,
-                None,
-            ))
+            .ok_or_else(|| {
+                probe_error(
+                    AppErrorCode::ModelResponseEmpty,
+                    "Capability probe model yanıtı boş.",
+                    None,
+                    None,
+                )
+            })
     }
 }
 
@@ -449,18 +472,22 @@ async fn run_help(server_path: &str) -> Result<String, AppError> {
         Command::new(server_path).arg("--help").output(),
     )
     .await
-    .map_err(|_| probe_error(
-        AppErrorCode::ModelTimeout,
-        "llama-server --help zaman aşımına uğradı.",
-        None,
-        None,
-    ))?
-    .map_err(|error| probe_error(
-        AppErrorCode::ModelServerStartFailed,
-        "llama-server capability bilgisi okunamadı.",
-        Some(error.to_string()),
-        Some("Runtime binary yolunu ve çalıştırma iznini kontrol edin.".to_string()),
-    ))?;
+    .map_err(|_| {
+        probe_error(
+            AppErrorCode::ModelTimeout,
+            "llama-server --help zaman aşımına uğradı.",
+            None,
+            None,
+        )
+    })?
+    .map_err(|error| {
+        probe_error(
+            AppErrorCode::ModelServerStartFailed,
+            "llama-server capability bilgisi okunamadı.",
+            Some(error.to_string()),
+            Some("Runtime binary yolunu ve çalıştırma iznini kontrol edin.".to_string()),
+        )
+    })?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(text)

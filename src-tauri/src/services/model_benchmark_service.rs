@@ -86,32 +86,44 @@ impl ModelBenchmarkService {
             .task_profiles
             .iter()
             .find(|item| item.id == submission.task_profile_id)
-            .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelRegistryEntryNotFound,
-                "Benchmark task profile bulunamadı.",
-                Some(format!("task_profile_id={}", submission.task_profile_id)),
-                None,
-            ))?;
+            .ok_or_else(|| {
+                benchmark_error(
+                    AppErrorCode::ModelRegistryEntryNotFound,
+                    "Benchmark task profile bulunamadı.",
+                    Some(format!("task_profile_id={}", submission.task_profile_id)),
+                    None,
+                )
+            })?;
         let model = snapshot
             .models
             .iter()
             .find(|item| item.id == submission.model_definition_id)
-            .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelRegistryEntryNotFound,
-                "Benchmark modeli registry'de bulunamadı.",
-                Some(format!("model_definition_id={}", submission.model_definition_id)),
-                None,
-            ))?;
+            .ok_or_else(|| {
+                benchmark_error(
+                    AppErrorCode::ModelRegistryEntryNotFound,
+                    "Benchmark modeli registry'de bulunamadı.",
+                    Some(format!(
+                        "model_definition_id={}",
+                        submission.model_definition_id
+                    )),
+                    None,
+                )
+            })?;
         let runtime = snapshot
             .runtimes
             .iter()
             .find(|item| item.id == submission.runtime_definition_id)
-            .ok_or_else(|| benchmark_error(
-                AppErrorCode::ModelRegistryEntryNotFound,
-                "Benchmark runtime'ı registry'de bulunamadı.",
-                Some(format!("runtime_definition_id={}", submission.runtime_definition_id)),
-                None,
-            ))?;
+            .ok_or_else(|| {
+                benchmark_error(
+                    AppErrorCode::ModelRegistryEntryNotFound,
+                    "Benchmark runtime'ı registry'de bulunamadı.",
+                    Some(format!(
+                        "runtime_definition_id={}",
+                        submission.runtime_definition_id
+                    )),
+                    None,
+                )
+            })?;
 
         let observed: BTreeMap<&str, &BenchmarkObservation> = submission
             .observations
@@ -182,7 +194,11 @@ impl ModelBenchmarkService {
         let result = BenchmarkResultSummary {
             id: format!(
                 "{}-{}",
-                if promotion_eligible { "verified" } else { "diagnostic" },
+                if promotion_eligible {
+                    "verified"
+                } else {
+                    "diagnostic"
+                },
                 base_id
             ),
             task_profile_id: task.id.clone(),

@@ -134,10 +134,12 @@ impl JobManager {
             .correlation_id
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let caller_key = input
-            .idempotency_key
-            .clone()
-            .unwrap_or_else(|| input.display_label.clone().unwrap_or_else(|| input.message.clone()));
+        let caller_key = input.idempotency_key.clone().unwrap_or_else(|| {
+            input
+                .display_label
+                .clone()
+                .unwrap_or_else(|| input.message.clone())
+        });
         let key = crate::jobs::idempotency::scoped_idempotency_key(
             &input.project_id,
             &input.kind,
@@ -905,21 +907,19 @@ pub fn job_snapshot_path(
 }
 
 fn quarantine_job_snapshot(trusted_root: &TrustedProjectRoot, path: &Path, reason: &str) {
-    let quarantine_managed = match trusted_root.managed(&format!(
-        "logs/jobs/quarantine/{}.json",
-        Uuid::new_v4()
-    )) {
-        Ok(managed) => managed,
-        Err(error) => {
-            log::warn!(
+    let quarantine_managed =
+        match trusted_root.managed(&format!("logs/jobs/quarantine/{}.json", Uuid::new_v4())) {
+            Ok(managed) => managed,
+            Err(error) => {
+                log::warn!(
                 "Bozuk job snapshot karantina yolu oluşturulamadı: path={}; reason={}; error={}",
                 path.display(),
                 reason,
                 error
             );
-            return;
-        }
-    };
+                return;
+            }
+        };
     let quarantine_path = match trusted_root.prepare_write_target(&quarantine_managed) {
         Ok(path) => path,
         Err(error) => {
@@ -1048,7 +1048,10 @@ mod tests {
         let jobs = reader.list_jobs("proj_mixed_history").unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, valid_job_id);
-        assert!(!corrupt_path.exists(), "corrupt snapshot should be quarantined");
+        assert!(
+            !corrupt_path.exists(),
+            "corrupt snapshot should be quarantined"
+        );
 
         let quarantine_dir = root.join("logs").join("jobs").join("quarantine");
         let quarantined = std::fs::read_dir(&quarantine_dir)
@@ -1094,8 +1097,14 @@ mod tests {
         }
 
         let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
-        let successful: Vec<_> = results.iter().filter_map(|result| result.as_ref().ok()).collect();
-        let rejected: Vec<_> = results.iter().filter_map(|result| result.as_ref().err()).collect();
+        let successful: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        let rejected: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
 
         assert_eq!(
             successful.len(),
@@ -1274,13 +1283,7 @@ mod tests {
                     Ok(reg) => {
                         assert!(reg.is_new);
                         m.set_running(&h, &reg.snapshot.id)?;
-                        m.update_progress(
-                            &h,
-                            &reg.snapshot.id,
-                            50,
-                            100,
-                            "Halfway".to_string(),
-                        )?;
+                        m.update_progress(&h, &reg.snapshot.id, 50, 100, "Halfway".to_string())?;
                         if i % 3 == 0 {
                             m.partial(&h, &reg.snapshot.id, None)?;
                         } else {

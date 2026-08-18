@@ -77,12 +77,14 @@ impl LlamaCppRuntimeAdapter {
                 .mmproj_path
                 .as_deref()
                 .filter(|path| !path.trim().is_empty())
-                .ok_or_else(|| model_error(
-                    AppErrorCode::ModelMmprojMissing,
-                    "Bu runtime vision kullanımı için multimodal projector gerektiriyor.",
-                    Some(format!("model_definition_id={}", model.id)),
-                    Some("Model için doğru mmproj dosyasını seçin.".to_string()),
-                ))?;
+                .ok_or_else(|| {
+                    model_error(
+                        AppErrorCode::ModelMmprojMissing,
+                        "Bu runtime vision kullanımı için multimodal projector gerektiriyor.",
+                        Some(format!("model_definition_id={}", model.id)),
+                        Some("Model için doğru mmproj dosyasını seçin.".to_string()),
+                    )
+                })?;
             args.push("--mmproj".to_string());
             args.push(mmproj.to_string());
             if support_flags.mmproj_offload {
@@ -120,12 +122,18 @@ impl LlamaCppRuntimeAdapter {
                 ReasoningMode::On => args.extend(["--reasoning".to_string(), "on".to_string()]),
                 ReasoningMode::Auto => {}
             }
-        } else if matches!(runtime.reasoning_mode, ReasoningMode::Off | ReasoningMode::On) {
+        } else if matches!(
+            runtime.reasoning_mode,
+            ReasoningMode::Off | ReasoningMode::On
+        ) {
             return Err(model_error(
                 AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Seçili llama-server reasoning kontrolünü desteklemiyor.",
                 Some("missing --reasoning support".to_string()),
-                Some("Güncel llama-server binary kullanın veya reasoning ayarını Auto yapın.".to_string()),
+                Some(
+                    "Güncel llama-server binary kullanın veya reasoning ayarını Auto yapın."
+                        .to_string(),
+                ),
             ));
         }
 
@@ -187,7 +195,10 @@ impl LlamaCppRuntimeAdapter {
             return Err(model_error(
                 AppErrorCode::ModelRuntimeAdapterUnsupported,
                 "Ubatch değeri batch değerinden büyük olamaz.",
-                Some(format!("batch={}; ubatch={}", runtime.batch_size, runtime.ubatch_size)),
+                Some(format!(
+                    "batch={}; ubatch={}",
+                    runtime.batch_size, runtime.ubatch_size
+                )),
                 Some("Ubatch değerini batch değerinden küçük veya eşit yapın.".to_string()),
             ));
         }
@@ -226,15 +237,19 @@ fn append_kv_cache_args(
 ) -> Result<(), AppError> {
     if support_flags.cache_short_flags {
         args.extend([
-            "-ctk".to_string(), runtime.kv_cache_type_k.clone(),
-            "-ctv".to_string(), runtime.kv_cache_type_v.clone(),
+            "-ctk".to_string(),
+            runtime.kv_cache_type_k.clone(),
+            "-ctv".to_string(),
+            runtime.kv_cache_type_v.clone(),
         ]);
         return Ok(());
     }
     if support_flags.cache_type_flags {
         args.extend([
-            "--cache-type-k".to_string(), runtime.kv_cache_type_k.clone(),
-            "--cache-type-v".to_string(), runtime.kv_cache_type_v.clone(),
+            "--cache-type-k".to_string(),
+            runtime.kv_cache_type_k.clone(),
+            "--cache-type-v".to_string(),
+            runtime.kv_cache_type_v.clone(),
         ]);
         return Ok(());
     }
@@ -256,15 +271,37 @@ fn flash_attention_value(value: FlashAttentionMode) -> &'static str {
 
 fn validate_and_normalize_extra_args(extra_args: &[String]) -> Result<Vec<String>, AppError> {
     let allowed_flags: BTreeSet<&'static str> = [
-        "--threads", "--threads-batch", "--mlock", "--no-mmap", "--cont-batching",
-        "--no-cont-batching", "--prio", "--poll", "--temp", "--top-p", "--top-k",
-        "--repeat-penalty", "-n", "--no-cache-prompt", "-cram", "-ctxcp",
+        "--threads",
+        "--threads-batch",
+        "--mlock",
+        "--no-mmap",
+        "--cont-batching",
+        "--no-cont-batching",
+        "--prio",
+        "--poll",
+        "--temp",
+        "--top-p",
+        "--top-k",
+        "--repeat-penalty",
+        "-n",
+        "--no-cache-prompt",
+        "-cram",
+        "-ctxcp",
     ]
     .into_iter()
     .collect();
     let forbidden_flags: BTreeSet<&'static str> = [
-        "-m", "--model", "--mmproj", "--host", "--port", "--api-key", "--api-key-file",
-        "--ssl-key-file", "--ssl-cert-file", "--chat-template-file", "--rpc",
+        "-m",
+        "--model",
+        "--mmproj",
+        "--host",
+        "--port",
+        "--api-key",
+        "--api-key-file",
+        "--ssl-key-file",
+        "--ssl-cert-file",
+        "--chat-template-file",
+        "--rpc",
     ]
     .into_iter()
     .collect();
