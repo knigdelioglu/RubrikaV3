@@ -200,8 +200,12 @@ impl ModelPlatformService {
             let fingerprint_changed = existing.model_fingerprint != model.model_fingerprint;
             *existing = model.clone();
             if fingerprint_changed {
-                store.capability_manifests.retain(|item| item.model_definition_id != model.id);
-                store.benchmark_results.retain(|item| item.model_definition_id != model.id);
+                store
+                    .capability_manifests
+                    .retain(|item| item.model_definition_id != model.id);
+                store
+                    .benchmark_results
+                    .retain(|item| item.model_definition_id != model.id);
             }
         } else {
             store.models.push(model);
@@ -282,12 +286,14 @@ impl ModelPlatformService {
             .bindings
             .iter_mut()
             .find(|item| item.id == binding_id)
-            .ok_or_else(|| platform_error(
-                AppErrorCode::ModelBindingNotFound,
-                "Model görev ataması bulunamadı.",
-                Some(format!("binding_id={binding_id}")),
-                Some("Görev atamalarını yenileyin.".to_string()),
-            ))?;
+            .ok_or_else(|| {
+                platform_error(
+                    AppErrorCode::ModelBindingNotFound,
+                    "Model görev ataması bulunamadı.",
+                    Some(format!("binding_id={binding_id}")),
+                    Some("Görev atamalarını yenileyin.".to_string()),
+                )
+            })?;
         binding.enabled = false;
         self.save_locked(&store)
     }
@@ -302,7 +308,10 @@ impl ModelPlatformService {
             return Err(platform_error(
                 AppErrorCode::ModelCapabilityUnverified,
                 "Capability sonucu güncel model/runtime fingerprint'i ile eşleşmiyor.",
-                Some(format!("model_definition_id={}", manifest.model_definition_id)),
+                Some(format!(
+                    "model_definition_id={}",
+                    manifest.model_definition_id
+                )),
                 Some("Capability probe'u yeniden çalıştırın.".to_string()),
             ));
         }
@@ -360,12 +369,14 @@ impl ModelPlatformService {
             .models
             .iter_mut()
             .find(|item| item.id == model_definition_id)
-            .ok_or_else(|| platform_error(
-                AppErrorCode::ModelRegistryEntryNotFound,
-                "Model registry kaydı bulunamadı.",
-                Some(format!("model_definition_id={model_definition_id}")),
-                Some("Modeli yeniden ekleyin.".to_string()),
-            ))?;
+            .ok_or_else(|| {
+                platform_error(
+                    AppErrorCode::ModelRegistryEntryNotFound,
+                    "Model registry kaydı bulunamadı.",
+                    Some(format!("model_definition_id={model_definition_id}")),
+                    Some("Modeli yeniden ekleyin.".to_string()),
+                )
+            })?;
         model.lifecycle_state = target;
         let output = model.clone();
         self.save_locked(&store)?;
@@ -440,14 +451,16 @@ impl ModelPlatformService {
         model_definition_id: &str,
         manifest: &CapabilityManifest,
     ) -> Result<(), AppError> {
-        let any_fail = manifest
-            .results
-            .iter()
-            .any(|item| item.support == CapabilitySupport::Fail);
-        let target = if any_fail {
-            ModelLifecycleState::Unsupported
-        } else {
+        // Compatibility is a model-level statement only about the minimum
+        // inference contract: the runtime can produce text. Vision/JSON/etc.
+        // failures stay in the manifest and are enforced per TaskProfile by
+        // CapabilityManifest::satisfies. A healthy text-only model therefore
+        // remains usable for text tasks instead of becoming globally
+        // Unsupported merely because its Vision probe failed.
+        let target = if manifest.result_for(ModelCapabilityKind::Text) == CapabilitySupport::Pass {
             ModelLifecycleState::Compatible
+        } else {
+            ModelLifecycleState::Unsupported
         };
         self.force_lifecycle(model_definition_id, target)
     }
@@ -466,38 +479,46 @@ impl ModelPlatformService {
             .models
             .iter_mut()
             .find(|item| item.id == model_definition_id)
-            .ok_or_else(|| platform_error(
-                AppErrorCode::ModelRegistryEntryNotFound,
-                "Model registry kaydı bulunamadı.",
-                Some(format!("model_definition_id={model_definition_id}")),
-                Some("Modeli yeniden ekleyin.".to_string()),
-            ))?;
+            .ok_or_else(|| {
+                platform_error(
+                    AppErrorCode::ModelRegistryEntryNotFound,
+                    "Model registry kaydı bulunamadı.",
+                    Some(format!("model_definition_id={model_definition_id}")),
+                    Some("Modeli yeniden ekleyin.".to_string()),
+                )
+            })?;
         model.lifecycle_state = target;
         self.save_locked(&store)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ModelPlatformConfig>, AppError> {
-        self.store.lock().map_err(|error| platform_error(
-            AppErrorCode::ModelStateAccessFailed,
-            "Model platform durumuna erişilemedi.",
-            Some(error.to_string()),
-            Some("Uygulamayı yeniden başlatmayı deneyin.".to_string()),
-        ))
+        self.store.lock().map_err(|error| {
+            platform_error(
+                AppErrorCode::ModelStateAccessFailed,
+                "Model platform durumuna erişilemedi.",
+                Some(error.to_string()),
+                Some("Uygulamayı yeniden başlatmayı deneyin.".to_string()),
+            )
+        })
     }
 
     fn save_locked(&self, config: &ModelPlatformConfig) -> Result<(), AppError> {
-        let content = serde_json::to_string_pretty(config).map_err(|error| platform_error(
-            AppErrorCode::FileWriteFailed,
-            "Model platform ayarları serileştirilemedi.",
-            Some(error.to_string()),
-            Some("Ayarları yeniden kaydetmeyi deneyin.".to_string()),
-        ))?;
-        atomic_write(&self.config_path, &content).map_err(|error| platform_error(
-            AppErrorCode::FileWriteFailed,
-            "Model platform ayarları kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Disk izinlerini ve boş alanı kontrol edin.".to_string()),
-        ))
+        let content = serde_json::to_string_pretty(config).map_err(|error| {
+            platform_error(
+                AppErrorCode::FileWriteFailed,
+                "Model platform ayarları serileştirilemedi.",
+                Some(error.to_string()),
+                Some("Ayarları yeniden kaydetmeyi deneyin.".to_string()),
+            )
+        })?;
+        atomic_write(&self.config_path, &content).map_err(|error| {
+            platform_error(
+                AppErrorCode::FileWriteFailed,
+                "Model platform ayarları kaydedilemedi.",
+                Some(error.to_string()),
+                Some("Disk izinlerini ve boş alanı kontrol edin.".to_string()),
+            )
+        })
     }
 }
 
@@ -511,18 +532,24 @@ fn load_store(path: &Path) -> Result<ModelPlatformConfig, AppError> {
     if !path.exists() {
         return Ok(ModelPlatformConfig::default());
     }
-    let content = std::fs::read_to_string(path).map_err(|error| platform_error(
-        AppErrorCode::FileReadFailed,
-        "Model platform ayarları okunamadı.",
-        Some(error.to_string()),
-        Some("Ayar dosyasını kontrol edin.".to_string()),
-    ))?;
-    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|error| platform_error(
-        AppErrorCode::ModelConfigMigrationFailed,
-        "Model platform ayar dosyası bozuk.",
-        Some(error.to_string()),
-        Some("Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string()),
-    ))?;
+    let content = std::fs::read_to_string(path).map_err(|error| {
+        platform_error(
+            AppErrorCode::FileReadFailed,
+            "Model platform ayarları okunamadı.",
+            Some(error.to_string()),
+            Some("Ayar dosyasını kontrol edin.".to_string()),
+        )
+    })?;
+    let mut value: serde_json::Value = serde_json::from_str(&content).map_err(|error| {
+        platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Model platform ayar dosyası bozuk.",
+            Some(error.to_string()),
+            Some(
+                "Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string(),
+            ),
+        )
+    })?;
     let original_schema = value
         .get("schemaVersion")
         .and_then(serde_json::Value::as_str)
@@ -531,12 +558,16 @@ fn load_store(path: &Path) -> Result<ModelPlatformConfig, AppError> {
     if original_schema == MODEL_PLATFORM_SCHEMA_V1 {
         migrate_v1_to_v2(&mut value)?;
     }
-    let config: ModelPlatformConfig = serde_json::from_value(value).map_err(|error| platform_error(
-        AppErrorCode::ModelConfigMigrationFailed,
-        "Model platform ayarları yeni şemaya dönüştürülemedi.",
-        Some(error.to_string()),
-        Some("Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string()),
-    ))?;
+    let config: ModelPlatformConfig = serde_json::from_value(value).map_err(|error| {
+        platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Model platform ayarları yeni şemaya dönüştürülemedi.",
+            Some(error.to_string()),
+            Some(
+                "Yedekten geri dönün veya model platform ayarlarını yeniden oluşturun.".to_string(),
+            ),
+        )
+    })?;
     if config.schema_version != MODEL_PLATFORM_SCHEMA_VERSION {
         return Err(platform_error(
             AppErrorCode::ModelConfigMigrationFailed,
@@ -546,38 +577,46 @@ fn load_store(path: &Path) -> Result<ModelPlatformConfig, AppError> {
         ));
     }
     if original_schema == MODEL_PLATFORM_SCHEMA_V1 {
-        let migrated = serde_json::to_string_pretty(&config).map_err(|error| platform_error(
-            AppErrorCode::ModelConfigMigrationFailed,
-            "Dönüştürülen model platform ayarları serileştirilemedi.",
-            Some(error.to_string()),
-            None,
-        ))?;
-        atomic_write(path, &migrated).map_err(|error| platform_error(
-            AppErrorCode::ModelConfigMigrationFailed,
-            "Dönüştürülen model platform ayarları kaydedilemedi.",
-            Some(error.to_string()),
-            Some("Disk izinlerini kontrol edin.".to_string()),
-        ))?;
+        let migrated = serde_json::to_string_pretty(&config).map_err(|error| {
+            platform_error(
+                AppErrorCode::ModelConfigMigrationFailed,
+                "Dönüştürülen model platform ayarları serileştirilemedi.",
+                Some(error.to_string()),
+                None,
+            )
+        })?;
+        atomic_write(path, &migrated).map_err(|error| {
+            platform_error(
+                AppErrorCode::ModelConfigMigrationFailed,
+                "Dönüştürülen model platform ayarları kaydedilemedi.",
+                Some(error.to_string()),
+                Some("Disk izinlerini kontrol edin.".to_string()),
+            )
+        })?;
     }
     Ok(config)
 }
 
 fn migrate_v1_to_v2(value: &mut serde_json::Value) -> Result<(), AppError> {
-    let object = value.as_object_mut().ok_or_else(|| platform_error(
-        AppErrorCode::ModelConfigMigrationFailed,
-        "Model platform config kökü nesne değil.",
-        None,
-        None,
-    ))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        platform_error(
+            AppErrorCode::ModelConfigMigrationFailed,
+            "Model platform config kökü nesne değil.",
+            None,
+            None,
+        )
+    })?;
     let runtimes = object
         .get_mut("runtimes")
         .and_then(serde_json::Value::as_array_mut)
-        .ok_or_else(|| platform_error(
-            AppErrorCode::ModelConfigMigrationFailed,
-            "Model platform runtime listesi okunamadı.",
-            None,
-            None,
-        ))?;
+        .ok_or_else(|| {
+            platform_error(
+                AppErrorCode::ModelConfigMigrationFailed,
+                "Model platform runtime listesi okunamadı.",
+                None,
+                None,
+            )
+        })?;
     for runtime in runtimes {
         let Some(runtime_object) = runtime.as_object_mut() else {
             continue;
@@ -624,36 +663,46 @@ fn require_task_profile<'a>(
     store: &'a ModelPlatformConfig,
     id: &str,
 ) -> Result<&'a TaskProfile, AppError> {
-    store.task_profiles.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelRegistryEntryNotFound,
-        "Task profile bulunamadı.",
-        Some(format!("task_profile_id={id}")),
-        Some("Model platform ayarlarını yenileyin.".to_string()),
-    ))
+    store
+        .task_profiles
+        .iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| {
+            platform_error(
+                AppErrorCode::ModelRegistryEntryNotFound,
+                "Task profile bulunamadı.",
+                Some(format!("task_profile_id={id}")),
+                Some("Model platform ayarlarını yenileyin.".to_string()),
+            )
+        })
 }
 
 fn require_model<'a>(
     store: &'a ModelPlatformConfig,
     id: &str,
 ) -> Result<&'a ModelDefinition, AppError> {
-    store.models.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelRegistryEntryNotFound,
-        "Model registry kaydı bulunamadı.",
-        Some(format!("model_definition_id={id}")),
-        Some("Modeli yeniden ekleyin.".to_string()),
-    ))
+    store.models.iter().find(|item| item.id == id).ok_or_else(|| {
+        platform_error(
+            AppErrorCode::ModelRegistryEntryNotFound,
+            "Model registry kaydı bulunamadı.",
+            Some(format!("model_definition_id={id}")),
+            Some("Modeli yeniden ekleyin.".to_string()),
+        )
+    })
 }
 
 fn require_runtime<'a>(
     store: &'a ModelPlatformConfig,
     id: &str,
 ) -> Result<&'a RuntimeDefinition, AppError> {
-    store.runtimes.iter().find(|item| item.id == id).ok_or_else(|| platform_error(
-        AppErrorCode::ModelRegistryEntryNotFound,
-        "Runtime registry kaydı bulunamadı.",
-        Some(format!("runtime_definition_id={id}")),
-        Some("Runtime ayarını yeniden oluşturun.".to_string()),
-    ))
+    store.runtimes.iter().find(|item| item.id == id).ok_or_else(|| {
+        platform_error(
+            AppErrorCode::ModelRegistryEntryNotFound,
+            "Runtime registry kaydı bulunamadı.",
+            Some(format!("runtime_definition_id={id}")),
+            Some("Runtime ayarını yeniden oluşturun.".to_string()),
+        )
+    })
 }
 
 fn is_grandfathered_baseline(model: &ModelDefinition) -> bool {
@@ -685,18 +734,22 @@ pub fn required_capabilities_for_task(task: &TaskProfile) -> BTreeSet<ModelCapab
 }
 
 fn fingerprint_file(path: &Path) -> Result<String, AppError> {
-    let mut file = File::open(path).map_err(|error| platform_error(
-        AppErrorCode::FileReadFailed,
-        "Model dosyası fingerprint için açılamadı.",
-        Some(error.to_string()),
-        Some("Model dosyası izinlerini kontrol edin.".to_string()),
-    ))?;
-    let metadata = file.metadata().map_err(|error| platform_error(
-        AppErrorCode::FileReadFailed,
-        "Model dosyası bilgileri okunamadı.",
-        Some(error.to_string()),
-        Some("Model dosyası izinlerini kontrol edin.".to_string()),
-    ))?;
+    let mut file = File::open(path).map_err(|error| {
+        platform_error(
+            AppErrorCode::FileReadFailed,
+            "Model dosyası fingerprint için açılamadı.",
+            Some(error.to_string()),
+            Some("Model dosyası izinlerini kontrol edin.".to_string()),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        platform_error(
+            AppErrorCode::FileReadFailed,
+            "Model dosyası bilgileri okunamadı.",
+            Some(error.to_string()),
+            Some("Model dosyası izinlerini kontrol edin.".to_string()),
+        )
+    })?;
 
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
@@ -709,29 +762,36 @@ fn fingerprint_file(path: &Path) -> Result<String, AppError> {
     let sample = 1024 * 1024usize;
     let mut buffer = vec![0u8; sample.min(metadata.len() as usize)];
     if !buffer.is_empty() {
-        file.read_exact(&mut buffer).map_err(|error| platform_error(
-            AppErrorCode::FileReadFailed,
-            "Model fingerprint başlangıç örneği okunamadı.",
-            Some(error.to_string()),
-            None,
-        ))?;
+        file.read_exact(&mut buffer).map_err(|error| {
+            platform_error(
+                AppErrorCode::FileReadFailed,
+                "Model fingerprint başlangıç örneği okunamadı.",
+                Some(error.to_string()),
+                None,
+            )
+        })?;
         hasher.update(&buffer);
     }
     if metadata.len() > sample as u64 {
         let tail_len = sample.min(metadata.len() as usize);
-        file.seek(SeekFrom::End(-(tail_len as i64))).map_err(|error| platform_error(
-            AppErrorCode::FileReadFailed,
-            "Model fingerprint son örneğine erişilemedi.",
-            Some(error.to_string()),
-            None,
-        ))?;
+        file.seek(SeekFrom::End(-(tail_len as i64)))
+            .map_err(|error| {
+                platform_error(
+                    AppErrorCode::FileReadFailed,
+                    "Model fingerprint son örneğine erişilemedi.",
+                    Some(error.to_string()),
+                    None,
+                )
+            })?;
         let mut tail = vec![0u8; tail_len];
-        file.read_exact(&mut tail).map_err(|error| platform_error(
-            AppErrorCode::FileReadFailed,
-            "Model fingerprint son örneği okunamadı.",
-            Some(error.to_string()),
-            None,
-        ))?;
+        file.read_exact(&mut tail).map_err(|error| {
+            platform_error(
+                AppErrorCode::FileReadFailed,
+                "Model fingerprint son örneği okunamadı.",
+                Some(error.to_string()),
+                None,
+            )
+        })?;
         hasher.update(&tail);
     }
     Ok(hex::encode(hasher.finalize()))
