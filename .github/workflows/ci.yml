@@ -68,4 +68,15 @@ jobs:
         run: npm ci
 
       - name: Run quality gate
-        run: npm run quality
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run quality 2>&1 | tee quality.log
+
+      - name: Upload quality log
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: quality-log
+          path: quality.log
+          if-no-files-found: warn
