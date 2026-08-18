@@ -55,9 +55,31 @@ impl ModelBenchmarkService {
         Self { platform }
     }
 
+    /// Records observations entered by a user or another untrusted caller.
+    /// These results are useful for side-by-side diagnostics, but can never
+    /// satisfy the Production promotion gate even if every metric is within
+    /// policy. Promotion evidence must come from a trusted measured bridge.
     pub fn evaluate_and_record(
         &self,
         submission: BenchmarkSubmission,
+    ) -> Result<BenchmarkResultSummary, AppError> {
+        self.evaluate_and_record_with_trust(submission, false)
+    }
+
+    /// Records a measured benchmark produced by an application-owned bridge
+    /// (for example the golden OCR report importer). Only this path may emit a
+    /// PASS result or advance a model to BenchmarkVerified.
+    pub fn evaluate_verified_and_record(
+        &self,
+        submission: BenchmarkSubmission,
+    ) -> Result<BenchmarkResultSummary, AppError> {
+        self.evaluate_and_record_with_trust(submission, true)
+    }
+
+    fn evaluate_and_record_with_trust(
+        &self,
+        submission: BenchmarkSubmission,
+        promotion_eligible: bool,
     ) -> Result<BenchmarkResultSummary, AppError> {
         let snapshot = self.platform.snapshot()?;
         let task = snapshot
@@ -149,34 +171,52 @@ impl ModelBenchmarkService {
             });
         }
 
+        let policy_pass = all_pass;
+        if !promotion_eligible {
+            notes.push(
+                "diagnostic_only: manual/untrusted benchmark observations cannot satisfy Production promotion"
+                    .to_string(),
+            );
+        }
+        let base_id = new_benchmark_result_id(&task.id, &model.id);
         let result = BenchmarkResultSummary {
-            id: new_benchmark_result_id(&task.id, &model.id),
+            id: format!(
+                "{}-{}",
+                if promotion_eligible { "verified" } else { "diagnostic" },
+                base_id
+            ),
             task_profile_id: task.id.clone(),
             model_definition_id: model.id.clone(),
             runtime_definition_id: runtime.id.clone(),
             model_fingerprint: model.model_fingerprint.clone(),
             runtime_fingerprint: fingerprint_runtime_definition(runtime),
             policy_version: BENCHMARK_POLICY_VERSION.to_string(),
-            state: if all_pass { BenchmarkGateState::Pass } else { BenchmarkGateState::Fail },
+            state: if promotion_eligible && policy_pass {
+                BenchmarkGateState::Pass
+            } else {
+                BenchmarkGateState::Fail
+            },
             generated_at: Utc::now().to_rfc3339(),
             metrics,
             notes,
         };
 
         self.platform.record_benchmark_result(result.clone())?;
-        if all_pass
-            && matches!(
-                model.lifecycle_state,
-                ModelLifecycleState::Experimental | ModelLifecycleState::Compatible
-            )
-        {
-            let _ = self
-                .platform
-                .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkVerified);
-        } else if !all_pass && model.lifecycle_state != ModelLifecycleState::Production {
-            let _ = self
-                .platform
-                .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkFailed);
+        if promotion_eligible {
+            if policy_pass
+                && matches!(
+                    model.lifecycle_state,
+                    ModelLifecycleState::Experimental | ModelLifecycleState::Compatible
+                )
+            {
+                let _ = self
+                    .platform
+                    .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkVerified);
+            } else if !policy_pass && model.lifecycle_state != ModelLifecycleState::Production {
+                let _ = self
+                    .platform
+                    .set_model_lifecycle(&model.id, ModelLifecycleState::BenchmarkFailed);
+            }
         }
         Ok(result)
     }
@@ -227,11 +267,21 @@ fn policy_for_task(task_profile_id: &str) -> Vec<MetricRule> {
 }
 
 fn rule(key: &'static str, compare: Compare, threshold: f64) -> MetricRule {
-    MetricRule { key, compare, threshold, required: true }
+    MetricRule {
+        key,
+        compare,
+        threshold,
+        required: true,
+    }
 }
 
 fn regression_rule(key: &'static str, threshold: f64) -> MetricRule {
-    MetricRule { key, compare: Compare::RegressionLessOrEqual, threshold, required: true }
+    MetricRule {
+        key,
+        compare: Compare::RegressionLessOrEqual,
+        threshold,
+        required: true,
+    }
 }
 
 fn benchmark_error(
