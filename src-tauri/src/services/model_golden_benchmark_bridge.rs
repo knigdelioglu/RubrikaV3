@@ -62,37 +62,62 @@ impl ModelGoldenBenchmarkBridge {
 
         let candidate = summarize(&report)?;
         let base = summarize(&baseline)?;
-        self.benchmark.evaluate_and_record(BenchmarkSubmission {
-            task_profile_id: input.task_profile_id,
-            model_definition_id: input.model_definition_id,
-            runtime_definition_id: input.runtime_definition_id,
-            observations: vec![
-                observation("critical_token_missing", candidate.critical_token_missing, None),
-                observation("printed_question_leakage", candidate.printed_question_leakage, None),
-                observation(
-                    "schema_failure_rate",
-                    candidate.schema_failure_rate,
-                    Some(base.schema_failure_rate),
-                ),
-                observation("cer", candidate.cer, Some(base.cer)),
-                observation("wer", candidate.wer, Some(base.wer)),
-                observation("latency_p50_ms", candidate.latency_p50_ms, Some(base.latency_p50_ms)),
-                observation("latency_p95_ms", candidate.latency_p95_ms, Some(base.latency_p95_ms)),
-                observation("image_token_count", candidate.image_token_count, Some(base.image_token_count)),
-                observation("model_call_count", candidate.model_call_count, Some(base.model_call_count)),
-                observation("retry_count", candidate.retry_count, Some(base.retry_count)),
-                observation("peak_memory_bytes", candidate.peak_memory_bytes, Some(base.peak_memory_bytes)),
-            ],
-            notes: vec![
-                format!("golden_exam_id={}", report.exam_id),
-                format!("candidate_report={}", input.report_path),
-                format!("baseline_report={}", input.baseline_report_path),
-                format!(
-                    "corpus_manifest_sha256={}",
-                    report.corpus_manifest_sha256.unwrap_or_default()
-                ),
-            ],
-        })
+        self.benchmark
+            .evaluate_verified_and_record(BenchmarkSubmission {
+                task_profile_id: input.task_profile_id,
+                model_definition_id: input.model_definition_id,
+                runtime_definition_id: input.runtime_definition_id,
+                observations: vec![
+                    observation("critical_token_missing", candidate.critical_token_missing, None),
+                    observation(
+                        "printed_question_leakage",
+                        candidate.printed_question_leakage,
+                        None,
+                    ),
+                    observation(
+                        "schema_failure_rate",
+                        candidate.schema_failure_rate,
+                        Some(base.schema_failure_rate),
+                    ),
+                    observation("cer", candidate.cer, Some(base.cer)),
+                    observation("wer", candidate.wer, Some(base.wer)),
+                    observation(
+                        "latency_p50_ms",
+                        candidate.latency_p50_ms,
+                        Some(base.latency_p50_ms),
+                    ),
+                    observation(
+                        "latency_p95_ms",
+                        candidate.latency_p95_ms,
+                        Some(base.latency_p95_ms),
+                    ),
+                    observation(
+                        "image_token_count",
+                        candidate.image_token_count,
+                        Some(base.image_token_count),
+                    ),
+                    observation(
+                        "model_call_count",
+                        candidate.model_call_count,
+                        Some(base.model_call_count),
+                    ),
+                    observation("retry_count", candidate.retry_count, Some(base.retry_count)),
+                    observation(
+                        "peak_memory_bytes",
+                        candidate.peak_memory_bytes,
+                        Some(base.peak_memory_bytes),
+                    ),
+                ],
+                notes: vec![
+                    format!("golden_exam_id={}", report.exam_id),
+                    format!("candidate_report={}", input.report_path),
+                    format!("baseline_report={}", input.baseline_report_path),
+                    format!(
+                        "corpus_manifest_sha256={}",
+                        report.corpus_manifest_sha256.unwrap_or_default()
+                    ),
+                ],
+            })
     }
 }
 
@@ -191,7 +216,10 @@ fn require_measured_report(report: &GoldenOcrBenchmarkReport, label: &str) -> Re
     if report.model_runtime != GoldenModelRuntimeStatus::Available {
         return Err(bridge_error(
             "Model runtime olmadan üretilmiş preview raporu promotion gate için kullanılamaz.",
-            Some(format!("report={label}; model_runtime={:?}", report.model_runtime)),
+            Some(format!(
+                "report={label}; model_runtime={:?}",
+                report.model_runtime
+            )),
         ));
     }
     Ok(())
